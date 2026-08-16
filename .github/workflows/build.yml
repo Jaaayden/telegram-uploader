@@ -3,6 +3,7 @@ name: Build
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
   workflow_dispatch:
 
@@ -102,3 +103,78 @@ jobs:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.upload }}
           if-no-files-found: error
+
+  publish-release:
+    name: Publish GitHub Release
+    needs: test-and-build
+    if: >-
+      success() &&
+      github.event_name == 'push' &&
+      (
+        github.ref == 'refs/heads/main' ||
+        startsWith(github.ref, 'refs/tags/v')
+      )
+    runs-on: ubuntu-latest
+    concurrency:
+      group: release-${{ github.ref }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v5
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Verify release assets and generate checksums
+        working-directory: release-assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f TelegramVideoUploader-macos-arm64.zip
+          test -f TelegramVideoUploader-macos-x86_64.zip
+          test -f TelegramVideoUploader-windows-amd64.exe
+          sha256sum TelegramVideoUploader-* > SHA256SUMS
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "$GITHUB_REF" == "refs/heads/main" ]]; then
+            tag="main-${GITHUB_SHA:0:12}"
+            title="Main build ${GITHUB_SHA:0:12}"
+            release_kind="prerelease"
+          else
+            tag="$GITHUB_REF_NAME"
+            title="Telegram Video Uploader ${GITHUB_REF_NAME}"
+            release_kind="stable"
+          fi
+
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $tag already exists; nothing to publish."
+            exit 0
+          fi
+
+          if [[ "$release_kind" == "prerelease" ]]; then
+            gh release create "$tag" \
+              release-assets/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "$title" \
+              --notes "Automated build from main commit ${GITHUB_SHA}. Actions run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+              --prerelease \
+              --latest=false
+          else
+            gh release create "$tag" \
+              release-assets/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --title "$title" \
+              --generate-notes \
+              --latest
+          fi
