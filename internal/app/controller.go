@@ -98,6 +98,9 @@ func (c *Controller) Load() error {
 		return err
 	}
 	changed := reconcileMovingJobs(jobs)
+	if reindexJobs(jobs) {
+		changed = true
+	}
 	c.mu.Lock()
 	c.jobs = append([]model.Job(nil), jobs...)
 	c.channel = channel
@@ -203,50 +206,87 @@ func (c *Controller) AddJobs(candidates []model.Job) error {
 	}
 	defer c.opMu.Unlock()
 
-	for _, candidate := range candidates {
-		if strings.TrimSpace(candidate.Path) == "" {
-			return errors.New("追加任务失败：文件路径不能为空")
-		}
-	}
-
 	c.mu.Lock()
 	if c.running {
 		c.mu.Unlock()
 		return errors.New("上传进行中，不能追加队列")
 	}
 
+	nextJobs := append([]model.Job(nil), c.jobs...)
 	paths := make(map[string]struct{}, len(c.jobs)+len(candidates))
+	ids := make(map[string]struct{}, len(c.jobs)+len(candidates))
+	randomIDs := make(map[int64]struct{}, len(c.jobs)+len(candidates))
 	for _, job := range c.jobs {
 		if key := jobPathKey(job.Path); key != "" {
 			paths[key] = struct{}{}
 		}
+		if job.ID != "" {
+			ids[job.ID] = struct{}{}
+		}
+		if job.RandomID != 0 {
+			randomIDs[job.RandomID] = struct{}{}
+		}
 	}
 	added := 0
 	for _, candidate := range candidates {
+		if strings.TrimSpace(candidate.Path) == "" {
+			c.mu.Unlock()
+			return errors.New("追加任务失败：文件路径不能为空")
+		}
 		key := jobPathKey(candidate.Path)
 		if _, exists := paths[key]; exists {
 			continue
 		}
+		if strings.TrimSpace(candidate.ID) == "" {
+			c.mu.Unlock()
+			return fmt.Errorf("追加任务 %q 失败：Job ID 不能为空", candidate.Name)
+		}
+		if _, exists := ids[candidate.ID]; exists {
+			c.mu.Unlock()
+			return fmt.Errorf("追加任务 %q 失败：Job ID 重复", candidate.Name)
+		}
+		if candidate.RandomID == 0 {
+			c.mu.Unlock()
+			return fmt.Errorf("追加任务 %q 失败：Telegram RandomID 不能为空", candidate.Name)
+		}
+		if _, exists := randomIDs[candidate.RandomID]; exists {
+			c.mu.Unlock()
+			return fmt.Errorf("追加任务 %q 失败：Telegram RandomID 重复", candidate.Name)
+		}
+		if strings.TrimSpace(candidate.Name) == "" || candidate.Size < 0 {
+			c.mu.Unlock()
+			return errors.New("追加任务失败：文件名或大小无效")
+		}
 		if candidate.State == "" {
 			candidate.State = model.JobQueued
 		}
-		c.jobs = append(c.jobs, candidate)
+		if candidate.State != model.JobQueued && candidate.State != model.JobOversize {
+			c.mu.Unlock()
+			return fmt.Errorf("追加任务 %q 失败：不允许的初始状态 %q", candidate.Name, candidate.State)
+		}
+		nextJobs = append(nextJobs, candidate)
 		paths[key] = struct{}{}
+		ids[candidate.ID] = struct{}{}
+		randomIDs[candidate.RandomID] = struct{}{}
 		added++
 	}
 	if added == 0 {
 		c.mu.Unlock()
 		return nil
 	}
-	reindexJobs(c.jobs)
-	c.lastError = ""
-	c.notifyLocked()
+	reindexJobs(nextJobs)
+	channel := c.channel
 	c.mu.Unlock()
 
-	if err := c.persist(); err != nil {
+	if err := c.saveSnapshot(nextJobs, channel); err != nil {
 		c.setPersistenceError(err)
 		return err
 	}
+	c.mu.Lock()
+	c.jobs = nextJobs
+	c.lastError = ""
+	c.notifyLocked()
+	c.mu.Unlock()
 	return nil
 }
 
@@ -277,7 +317,7 @@ func (c *Controller) RemoveJobs(ids []string) error {
 		c.mu.Unlock()
 		return errors.New("上传进行中，不能删除队列任务")
 	}
-	removed := c.removeJobsLocked(func(job model.Job) bool {
+	nextJobs, removed := filteredJobs(c.jobs, func(job model.Job) bool {
 		_, ok := selected[job.ID]
 		return ok
 	})
@@ -285,14 +325,21 @@ func (c *Controller) RemoveJobs(ids []string) error {
 		c.mu.Unlock()
 		return nil
 	}
-	c.lastError = ""
-	c.notifyLocked()
+	channel := c.channel
 	c.mu.Unlock()
 
-	if err := c.persist(); err != nil {
+	if err := c.saveSnapshot(nextJobs, channel); err != nil {
 		c.setPersistenceError(err)
 		return err
 	}
+	c.mu.Lock()
+	c.jobs = nextJobs
+	if len(nextJobs) == 0 {
+		c.folder = ""
+	}
+	c.lastError = ""
+	c.notifyLocked()
+	c.mu.Unlock()
 	return nil
 }
 
@@ -313,15 +360,19 @@ func (c *Controller) ClearQueue() error {
 		c.mu.Unlock()
 		return nil
 	}
-	c.jobs = nil
-	c.lastError = ""
-	c.notifyLocked()
+	channel := c.channel
 	c.mu.Unlock()
 
-	if err := c.persist(); err != nil {
+	if err := c.saveSnapshot(nil, channel); err != nil {
 		c.setPersistenceError(err)
 		return err
 	}
+	c.mu.Lock()
+	c.jobs = nil
+	c.folder = ""
+	c.lastError = ""
+	c.notifyLocked()
+	c.mu.Unlock()
 	return nil
 }
 
@@ -339,45 +390,56 @@ func (c *Controller) RemoveCompleted() error {
 		c.mu.Unlock()
 		return errors.New("上传进行中，不能删除已完成任务")
 	}
-	removed := c.removeJobsLocked(func(job model.Job) bool {
+	nextJobs, removed := filteredJobs(c.jobs, func(job model.Job) bool {
 		return job.State == model.JobSent || job.State == model.JobMoved
 	})
 	if removed == 0 {
 		c.mu.Unlock()
 		return nil
 	}
-	c.lastError = ""
-	c.notifyLocked()
+	channel := c.channel
 	c.mu.Unlock()
 
-	if err := c.persist(); err != nil {
+	if err := c.saveSnapshot(nextJobs, channel); err != nil {
 		c.setPersistenceError(err)
 		return err
 	}
+	c.mu.Lock()
+	c.jobs = nextJobs
+	if len(nextJobs) == 0 {
+		c.folder = ""
+	}
+	c.lastError = ""
+	c.notifyLocked()
+	c.mu.Unlock()
 	return nil
 }
 
-func (c *Controller) removeJobsLocked(remove func(model.Job) bool) int {
-	kept := c.jobs[:0]
+func filteredJobs(jobs []model.Job, remove func(model.Job) bool) ([]model.Job, int) {
+	kept := make([]model.Job, 0, len(jobs))
 	removed := 0
-	for _, job := range c.jobs {
+	for _, job := range jobs {
 		if remove(job) {
 			removed++
 			continue
 		}
 		kept = append(kept, job)
 	}
-	c.jobs = kept
 	if removed > 0 {
-		reindexJobs(c.jobs)
+		reindexJobs(kept)
 	}
-	return removed
+	return kept, removed
 }
 
-func reindexJobs(jobs []model.Job) {
+func reindexJobs(jobs []model.Job) bool {
+	changed := false
 	for index := range jobs {
+		if jobs[index].Position != index {
+			changed = true
+		}
 		jobs[index].Position = index
 	}
+	return changed
 }
 
 func jobPathKey(path string) string {
@@ -387,6 +449,9 @@ func jobPathKey(path string) string {
 	absPath, err := filepath.Abs(path)
 	if err == nil {
 		path = absPath
+	}
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		path = resolved
 	}
 	path = filepath.Clean(path)
 	if runtime.GOOS == "windows" {
@@ -1061,16 +1126,20 @@ func safeMoveDestination(destinationDir, name string) (string, error) {
 }
 
 func (c *Controller) persist() error {
+	c.mu.RLock()
+	jobs := append([]model.Job(nil), c.jobs...)
+	channel := c.channel
+	c.mu.RUnlock()
+	return c.saveSnapshot(jobs, channel)
+}
+
+func (c *Controller) saveSnapshot(jobs []model.Job, channel model.Channel) error {
 	if c.store == nil {
 		return nil
 	}
 	c.persistMu.Lock()
 	defer c.persistMu.Unlock()
-	c.mu.RLock()
-	jobs := append([]model.Job(nil), c.jobs...)
-	channel := c.channel
-	c.mu.RUnlock()
-	return c.store.Save(jobs, channel)
+	return c.store.Save(append([]model.Job(nil), jobs...), channel)
 }
 
 func (c *Controller) notifyLocked() {

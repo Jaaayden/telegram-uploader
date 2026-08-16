@@ -151,6 +151,7 @@ func TestControllerAddJobsDeduplicatesPathsAndReindexes(t *testing.T) {
 		{Name: "waiting.mp4", RandomID: 8102, State: model.JobQueued},
 	})
 	candidates, _ := fixtureJobs(t, []fixtureJob{{Name: "from-another-folder.mp4", RandomID: 8103}})
+	candidates[0].ID = "job-from-another-folder"
 
 	store := &memoryQueueStore{jobs: existing, channel: testChannel()}
 	controller := newLoadedController(t, store, &fakeGateway{})
@@ -267,6 +268,82 @@ func TestControllerQueueRemovalRequiresIdleQueue(t *testing.T) {
 		t.Fatalf("CancelAll() error = %v", err)
 	}
 	waitForSnapshot(t, controller, func(snapshot Snapshot) bool { return !snapshot.Running })
+}
+
+func TestControllerQueueMutationsPublishOnlyAfterPersistenceSucceeds(t *testing.T) {
+	jobs, _ := fixtureJobs(t, []fixtureJob{
+		{Name: "sent.mp4", RandomID: 8401, State: model.JobSent, Uploaded: 4},
+		{Name: "queued.mp4", RandomID: 8402, State: model.JobQueued},
+	})
+	candidates, _ := fixtureJobs(t, []fixtureJob{{Name: "candidate.mp4", RandomID: 8403}})
+	candidates[0].ID = "candidate-job"
+	saveFailure := errors.New("simulated queue write failure")
+
+	tests := []struct {
+		name string
+		run  func(*Controller) error
+	}{
+		{name: "add", run: func(controller *Controller) error { return controller.AddJobs(candidates) }},
+		{name: "remove selected", run: func(controller *Controller) error { return controller.RemoveJobs([]string{jobs[1].ID}) }},
+		{name: "remove completed", run: func(controller *Controller) error { return controller.RemoveCompleted() }},
+		{name: "clear", run: func(controller *Controller) error { return controller.ClearQueue() }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := &memoryQueueStore{jobs: cloneJobs(jobs), channel: testChannel()}
+			controller := newLoadedController(t, store, &fakeGateway{})
+			before := controller.Snapshot().Jobs
+			store.saveErr = saveFailure
+			if err := test.run(controller); !errors.Is(err, saveFailure) {
+				t.Fatalf("queue operation error = %v, want %v", err, saveFailure)
+			}
+			after := controller.Snapshot().Jobs
+			assertSameJobSequence(t, after, before)
+			assertSameJobSequence(t, store.SnapshotJobs(), before)
+		})
+	}
+}
+
+func TestControllerAddJobsRejectsInvalidOrDuplicateIdentity(t *testing.T) {
+	existing, _ := fixtureJobs(t, []fixtureJob{{Name: "existing.mp4", RandomID: 8501}})
+	baseCandidates, _ := fixtureJobs(t, []fixtureJob{{Name: "candidate.mp4", RandomID: 8502}})
+	baseCandidates[0].ID = "candidate-job"
+
+	tests := []struct {
+		name   string
+		mutate func(*model.Job)
+	}{
+		{name: "empty ID", mutate: func(job *model.Job) { job.ID = "" }},
+		{name: "duplicate ID", mutate: func(job *model.Job) { job.ID = existing[0].ID }},
+		{name: "zero RandomID", mutate: func(job *model.Job) { job.RandomID = 0 }},
+		{name: "duplicate RandomID", mutate: func(job *model.Job) { job.RandomID = existing[0].RandomID }},
+		{name: "invalid state", mutate: func(job *model.Job) { job.State = model.JobSent }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := &memoryQueueStore{jobs: cloneJobs(existing), channel: testChannel()}
+			controller := newLoadedController(t, store, &fakeGateway{})
+			candidate := baseCandidates[0]
+			test.mutate(&candidate)
+			if err := controller.AddJobs([]model.Job{candidate}); err == nil {
+				t.Fatal("AddJobs() error = nil, want identity validation failure")
+			}
+			assertSameJobSequence(t, controller.Snapshot().Jobs, existing)
+			assertSameJobSequence(t, store.SnapshotJobs(), existing)
+		})
+	}
+}
+
+func assertSameJobSequence(t *testing.T, got, want []model.Job) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("job count = %d, want %d", len(got), len(want))
+	}
+	for index := range want {
+		if got[index].ID != want[index].ID || got[index].State != want[index].State || got[index].Path != want[index].Path || got[index].Position != want[index].Position {
+			t.Fatalf("job %d = %+v, want %+v", index, got[index], want[index])
+		}
+	}
 }
 
 func TestSnapshotProgressUsesStableQueueTotal(t *testing.T) {
@@ -797,10 +874,16 @@ type memoryQueueStore struct {
 	saves    int
 	history  [][]model.Job
 	saveHook func([]model.Job)
+	saveErr  error
 }
 
 func (s *memoryQueueStore) Save(jobs []model.Job, channel model.Channel) error {
 	s.mu.Lock()
+	if s.saveErr != nil {
+		err := s.saveErr
+		s.mu.Unlock()
+		return err
+	}
 	s.jobs = cloneJobs(jobs)
 	s.channel = channel
 	s.saves++
