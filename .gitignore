@@ -1,0 +1,21 @@
+# Build output
+/build/
+/dist/
+*.app/
+*.dmg
+
+# Go tooling
+coverage.out
+*.test
+
+# Local credentials and development configuration
+.env
+.env.*
+!.env.example
+*.session
+*.session-journal
+
+# Operating-system metadata
+.DS_Store
+Thumbs.db
+

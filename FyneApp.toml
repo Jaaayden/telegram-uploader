@@ -1,0 +1,7 @@
+# Metadata used by the optional `fyne package` command.
+[Details]
+Name = "Telegram Video Uploader"
+ID = "com.jayden.telegramvideouploader"
+Version = "0.1.0"
+Build = 1
+

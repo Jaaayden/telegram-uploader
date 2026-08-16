@@ -1,0 +1,104 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    env:
+      CGO_ENABLED: 1
+      MACOSX_DEPLOYMENT_TARGET: ${{ matrix.deployment_target }}
+      CGO_CFLAGS: ${{ matrix.cgo_cflags }}
+      CGO_CXXFLAGS: ${{ matrix.cgo_cflags }}
+      CGO_LDFLAGS: ${{ matrix.cgo_ldflags }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS arm64
+            os: macos-15
+            artifact: TelegramVideoUploader-macos-arm64
+            extension: ""
+            ldflags: -s -w
+            upload: build/TelegramVideoUploader-macos-arm64.zip
+            deployment_target: '11.0'
+            cgo_cflags: -O2 -g -mmacosx-version-min=11.0
+            cgo_ldflags: -mmacosx-version-min=11.0
+          - name: macOS x86_64
+            os: macos-15-intel
+            artifact: TelegramVideoUploader-macos-x86_64
+            extension: ""
+            ldflags: -s -w
+            upload: build/TelegramVideoUploader-macos-x86_64.zip
+            deployment_target: '11.0'
+            cgo_cflags: -O2 -g -mmacosx-version-min=11.0
+            cgo_ldflags: -mmacosx-version-min=11.0
+          - name: Windows amd64
+            os: windows-latest
+            artifact: TelegramVideoUploader-windows-amd64
+            extension: .exe
+            ldflags: -s -w -H=windowsgui
+            upload: build/TelegramVideoUploader-windows-amd64.exe
+            deployment_target: ""
+            cgo_cflags: -O2 -g
+            cgo_ldflags: ""
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.25.x'
+          cache: true
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Check native C compiler
+        shell: bash
+        run: gcc --version
+
+      - name: Run tests
+        run: go test ./...
+
+      - name: Build standalone application
+        shell: bash
+        env:
+          OUTPUT: build/${{ matrix.artifact }}${{ matrix.extension }}
+          LDFLAGS: ${{ matrix.ldflags }}
+        run: |
+          mkdir -p build
+          go build -trimpath -ldflags="$LDFLAGS" -o "$OUTPUT" ./cmd/tg-video-uploader
+
+      - name: Package macOS application bundle
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          BINARY: build/${{ matrix.artifact }}
+          ARCHIVE: build/${{ matrix.artifact }}.zip
+        run: |
+          APP_BUNDLE="build/TelegramVideoUploader.app"
+          mkdir -p "$APP_BUNDLE/Contents/MacOS" "$APP_BUNDLE/Contents/Resources"
+          cp "$BINARY" "$APP_BUNDLE/Contents/MacOS/TelegramVideoUploader"
+          cp packaging/macos/Info.plist "$APP_BUNDLE/Contents/Info.plist"
+          plutil -lint "$APP_BUNDLE/Contents/Info.plist"
+          codesign --force --deep --sign - "$APP_BUNDLE"
+          codesign --verify --deep --strict "$APP_BUNDLE"
+          ditto -c -k --sequesterRsrc --keepParent "$APP_BUNDLE" "$ARCHIVE"
+
+      - name: Upload application artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.upload }}
+          if-no-files-found: error
