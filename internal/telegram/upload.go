@@ -19,8 +19,24 @@ import (
 
 type progressFunc func(context.Context, uploader.ProgressState) error
 
+const (
+	// Telegram recommends 512 KiB parts to reduce protocol overhead. Four
+	// dedicated connections then keep up to 2 MiB in flight without making
+	// files concurrent.
+	uploadPartSize              = uploader.MaximumPartSize
+	uploadConnectionCount int64 = 4
+	uploadThreads               = int(uploadConnectionCount)
+)
+
 func (f progressFunc) Chunk(ctx context.Context, state uploader.ProgressState) error {
 	return f(ctx, state)
+}
+
+func newUploadEngine(api uploader.Client, progress uploader.Progress) *uploader.Uploader {
+	return uploader.NewUploader(api).
+		WithPartSize(uploadPartSize).
+		WithThreads(uploadThreads).
+		WithProgress(progress)
 }
 
 func (c *Client) UploadVideo(ctx context.Context, request UploadRequest, onProgress func(model.Progress)) (int, error) {
@@ -31,6 +47,10 @@ func (c *Client) UploadVideo(ctx context.Context, request UploadRequest, onProgr
 		return 0, errors.New("random_id 不能为空")
 	}
 	api, err := c.connectedAPI()
+	if err != nil {
+		return 0, err
+	}
+	uploadAPI, err := c.connectedUploadAPI()
 	if err != nil {
 		return 0, err
 	}
@@ -86,7 +106,7 @@ func (c *Client) UploadVideo(ctx context.Context, request UploadRequest, onProgr
 		}
 		return nil
 	})
-	uploadEngine := uploader.NewUploader(api).WithThreads(4).WithProgress(progress)
+	uploadEngine := newUploadEngine(uploadAPI, progress)
 	var inputFile tg.InputFileClass
 	if request.File != nil {
 		inputFile, err = uploadEngine.FromFile(ctx, request.File)

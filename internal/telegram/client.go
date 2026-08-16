@@ -33,13 +33,14 @@ type Client struct {
 	gaps        *updates.Manager
 	flood       *floodGate
 
-	mu       sync.RWMutex
-	api      *tg.Client
-	runCtx   context.Context
-	identity Identity
-	runErr   error
-	running  bool
-	started  bool
+	mu        sync.RWMutex
+	api       *tg.Client
+	uploadAPI *tg.Client
+	runCtx    context.Context
+	identity  Identity
+	runErr    error
+	running   bool
+	started   bool
 
 	ready     chan struct{}
 	runDone   chan struct{}
@@ -187,6 +188,7 @@ func (c *Client) Run(ctx context.Context) (retErr error) {
 		c.mu.Lock()
 		c.runErr = retErr
 		c.api = nil
+		c.uploadAPI = nil
 		c.runCtx = nil
 		c.running = false
 		c.mu.Unlock()
@@ -219,9 +221,16 @@ func (c *Client) Run(ctx context.Context) (retErr error) {
 		}
 
 		maxBytes, maxUploadExact := c.queryMaxUploadBytes(runCtx)
+		uploadPool, err := c.raw.Pool(uploadConnectionCount)
+		if err != nil {
+			return fmt.Errorf("创建上传连接池失败：%w", err)
+		}
+		defer func() { _ = uploadPool.Close() }()
+
 		username, _ := status.User.GetUsername()
 		c.mu.Lock()
 		c.api = c.raw.API()
+		c.uploadAPI = tg.NewClient(uploadPool)
 		c.runCtx = runCtx
 		c.identity = Identity{BotID: status.User.ID, Username: username, MaxUploadBytes: maxBytes, MaxUploadExact: maxUploadExact}
 		c.mu.Unlock()
@@ -241,7 +250,7 @@ func (c *Client) WaitReady(ctx context.Context) (Identity, error) {
 	case <-c.ready:
 		c.mu.RLock()
 		defer c.mu.RUnlock()
-		if !c.running || c.api == nil {
+		if !c.running || c.api == nil || c.uploadAPI == nil {
 			if c.runErr != nil {
 				return Identity{}, c.runErr
 			}
@@ -267,6 +276,15 @@ func (c *Client) connectedAPI() (*tg.Client, error) {
 		return nil, ErrNotConnected
 	}
 	return c.api, nil
+}
+
+func (c *Client) connectedUploadAPI() (*tg.Client, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.uploadAPI == nil {
+		return nil, ErrNotConnected
+	}
+	return c.uploadAPI, nil
 }
 
 func (c *Client) BeginChannelBinding() (string, error) {

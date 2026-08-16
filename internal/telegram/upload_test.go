@@ -3,9 +3,89 @@ package telegram
 import (
 	"context"
 	"errors"
+	"io"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/gotd/td/telegram/uploader"
+	"github.com/gotd/td/tg"
 )
+
+type zeroReader struct{}
+
+func (zeroReader) Read(p []byte) (int, error) {
+	return len(p), nil
+}
+
+type recordingUploadClient struct {
+	mu         sync.Mutex
+	partSizes  map[int]int
+	totalParts map[int]int
+}
+
+func (c *recordingUploadClient) UploadSaveFilePart(context.Context, *tg.UploadSaveFilePartRequest) (bool, error) {
+	return true, nil
+}
+
+func (c *recordingUploadClient) UploadSaveBigFilePart(_ context.Context, request *tg.UploadSaveBigFilePartRequest) (bool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.partSizes == nil {
+		c.partSizes = make(map[int]int)
+		c.totalParts = make(map[int]int)
+	}
+	c.partSizes[request.FilePart] = len(request.Bytes)
+	c.totalParts[request.FilePart] = request.FileTotalParts
+	return true, nil
+}
+
+type blockingUploadClient struct {
+	started chan struct{}
+	release <-chan struct{}
+
+	mu        sync.Mutex
+	active    int
+	maxActive int
+}
+
+func (c *blockingUploadClient) UploadSaveFilePart(context.Context, *tg.UploadSaveFilePartRequest) (bool, error) {
+	return true, nil
+}
+
+func (c *blockingUploadClient) UploadSaveBigFilePart(ctx context.Context, _ *tg.UploadSaveBigFilePartRequest) (bool, error) {
+	c.mu.Lock()
+	c.active++
+	if c.active > c.maxActive {
+		c.maxActive = c.active
+	}
+	c.mu.Unlock()
+
+	select {
+	case c.started <- struct{}{}:
+	default:
+	}
+
+	select {
+	case <-c.release:
+	case <-ctx.Done():
+		c.mu.Lock()
+		c.active--
+		c.mu.Unlock()
+		return false, ctx.Err()
+	}
+
+	c.mu.Lock()
+	c.active--
+	c.mu.Unlock()
+	return true, nil
+}
+
+func (c *blockingUploadClient) maximumActive() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.maxActive
+}
 
 func TestPrepareUploadRequestPreservesExplicitEmptyCaption(t *testing.T) {
 	request := prepareUploadRequest(UploadRequest{Path: "/videos/.mp4", Caption: ""})
@@ -14,6 +94,83 @@ func TestPrepareUploadRequestPreservesExplicitEmptyCaption(t *testing.T) {
 	}
 	if request.Caption != "" {
 		t.Fatalf("Caption = %q, want explicit empty caption", request.Caption)
+	}
+}
+
+func TestUploadEngineUsesRecommendedMaximumPartSize(t *testing.T) {
+	const total = int64(10*1024*1024 + uploadPartSize + 1)
+	client := &recordingUploadClient{}
+	engine := newUploadEngine(client, nil)
+
+	if _, err := engine.Upload(context.Background(), uploader.NewUpload(
+		"video.mp4",
+		io.LimitReader(zeroReader{}, total),
+		total,
+	)); err != nil {
+		t.Fatalf("Upload() error = %v", err)
+	}
+
+	wantParts := int((total + int64(uploadPartSize) - 1) / int64(uploadPartSize))
+	if len(client.partSizes) != wantParts {
+		t.Fatalf("uploaded parts = %d, want %d", len(client.partSizes), wantParts)
+	}
+	for part := 0; part < wantParts; part++ {
+		wantSize := uploadPartSize
+		if part == wantParts-1 {
+			wantSize = int(total - int64(part*uploadPartSize))
+		}
+		if got := client.partSizes[part]; got != wantSize {
+			t.Fatalf("part %d size = %d, want %d", part, got, wantSize)
+		}
+		if got := client.totalParts[part]; got != wantParts {
+			t.Fatalf("part %d total parts = %d, want %d", part, got, wantParts)
+		}
+	}
+}
+
+func TestUploadEngineKeepsConfiguredPartsInFlight(t *testing.T) {
+	const total = int64(10*1024*1024 + uploadPartSize + 1)
+	started := make(chan struct{}, uploadThreads)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseAll := func() {
+		releaseOnce.Do(func() { close(release) })
+	}
+	defer releaseAll()
+
+	client := &blockingUploadClient{started: started, release: release}
+	engine := newUploadEngine(client, nil)
+	done := make(chan error, 1)
+	go func() {
+		_, err := engine.Upload(context.Background(), uploader.NewUpload(
+			"video.mp4",
+			io.LimitReader(zeroReader{}, total),
+			total,
+		))
+		done <- err
+	}()
+
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+	for i := 0; i < uploadThreads; i++ {
+		select {
+		case <-started:
+		case <-timer.C:
+			t.Fatalf("timed out waiting for %d concurrent upload parts", uploadThreads)
+		}
+	}
+	if got := client.maximumActive(); got != uploadThreads {
+		t.Fatalf("maximum active upload parts = %d, want %d", got, uploadThreads)
+	}
+
+	releaseAll()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Upload() error = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Upload() did not finish after releasing part RPCs")
 	}
 }
 
