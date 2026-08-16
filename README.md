@@ -33,6 +33,10 @@
 
 建议第一次先用两个很小的 MP4 验证顺序、Caption 和频道权限，再上传大文件。
 
+## 下载版本
+
+请从 [GitHub Releases](https://github.com/Jaaayden/telegram-uploader/releases) 下载构建好的 Windows 或 macOS 应用。`v*` 版本是正式版本；`main-*` 是每次合并到主分支后自动生成的开发预览版。每个 Release 都附带 `SHA256SUMS`，可用于核对下载文件完整性。
+
 ## 安全与恢复语义
 
 - `Bot Token`、`API Hash` 和代理密码存入 macOS Keychain 或 Windows Credential Manager。

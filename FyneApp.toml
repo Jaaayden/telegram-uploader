@@ -2,6 +2,5 @@
 [Details]
 Name = "Telegram Video Uploader"
 ID = "com.jayden.telegramvideouploader"
-Version = "0.1.0"
+Version = "1.0.0"
 Build = 1
-

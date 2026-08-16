@@ -119,7 +119,7 @@ func NewClient(cfg Config, events Events) (*Client, error) {
 		Device: gotdtelegram.DeviceConfig{
 			DeviceModel:    "Desktop",
 			SystemVersion:  "Windows/macOS",
-			AppVersion:     "0.1.0",
+			AppVersion:     "1.0.0",
 			SystemLangCode: "zh-Hans",
 			LangCode:       "zh-Hans",
 		},
