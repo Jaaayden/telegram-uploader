@@ -145,6 +145,130 @@ func TestApplyUploadLimitPreservesHistoryAndJobIdentity(t *testing.T) {
 	}
 }
 
+func TestControllerAddJobsDeduplicatesPathsAndReindexes(t *testing.T) {
+	existing, _ := fixtureJobs(t, []fixtureJob{
+		{Name: "already-sent.mp4", RandomID: 8101, State: model.JobSent, Uploaded: 4},
+		{Name: "waiting.mp4", RandomID: 8102, State: model.JobQueued},
+	})
+	candidates, _ := fixtureJobs(t, []fixtureJob{{Name: "from-another-folder.mp4", RandomID: 8103}})
+
+	store := &memoryQueueStore{jobs: existing, channel: testChannel()}
+	controller := newLoadedController(t, store, &fakeGateway{})
+	duplicate := existing[0]
+	duplicate.ID = "new-duplicate-id"
+	duplicate.RandomID = 9999
+	duplicate.State = model.JobQueued
+	duplicate.Path = filepath.Join(filepath.Dir(existing[0].Path), ".", filepath.Base(existing[0].Path))
+
+	if err := controller.AddJobs([]model.Job{duplicate, candidates[0], candidates[0]}); err != nil {
+		t.Fatalf("AddJobs() error = %v", err)
+	}
+
+	got := controller.Snapshot().Jobs
+	if len(got) != 3 {
+		t.Fatalf("queue length = %d, want 3 after path de-duplication", len(got))
+	}
+	if got[0].ID != existing[0].ID || got[0].RandomID != existing[0].RandomID || got[0].State != model.JobSent {
+		t.Fatalf("existing history was replaced: %+v, want %+v", got[0], existing[0])
+	}
+	if got[2].ID != candidates[0].ID || got[2].RandomID != candidates[0].RandomID {
+		t.Fatalf("new candidate identity changed: %+v, want %+v", got[2], candidates[0])
+	}
+	for i, job := range got {
+		if job.Position != i {
+			t.Errorf("job %d Position = %d, want %d", i, job.Position, i)
+		}
+	}
+	if saved := store.SnapshotJobs(); len(saved) != 3 || saved[2].Path != candidates[0].Path {
+		t.Fatalf("persisted queue = %#v, want appended candidate", saved)
+	}
+}
+
+func TestControllerQueueRemovalOperationsReindexAndPersist(t *testing.T) {
+	jobs, _ := fixtureJobs(t, []fixtureJob{
+		{Name: "sent.mp4", RandomID: 8201, State: model.JobSent, Uploaded: 4},
+		{Name: "moved.mp4", RandomID: 8202, State: model.JobMoved, Uploaded: 4},
+		{Name: "failed.mp4", RandomID: 8203, State: model.JobFailed, Error: "failed"},
+		{Name: "queued.mp4", RandomID: 8204, State: model.JobQueued},
+		{Name: "cancelled.mp4", RandomID: 8205, State: model.JobCancelled},
+	})
+	store := &memoryQueueStore{jobs: jobs, channel: testChannel()}
+	controller := newLoadedController(t, store, &fakeGateway{})
+
+	if err := controller.RemoveCompleted(); err != nil {
+		t.Fatalf("RemoveCompleted() error = %v", err)
+	}
+	got := controller.Snapshot().Jobs
+	if len(got) != 3 {
+		t.Fatalf("queue length after RemoveCompleted() = %d, want 3", len(got))
+	}
+	for i, job := range got {
+		if job.State == model.JobSent || job.State == model.JobMoved {
+			t.Errorf("completed job %d remained in queue: %+v", i, job)
+		}
+		if job.Position != i {
+			t.Errorf("job %d Position = %d, want %d", i, job.Position, i)
+		}
+	}
+
+	if err := controller.RemoveJobs([]string{jobs[3].ID, "does-not-exist"}); err != nil {
+		t.Fatalf("RemoveJobs() error = %v", err)
+	}
+	got = controller.Snapshot().Jobs
+	if len(got) != 2 || got[0].Name != "failed.mp4" || got[1].Name != "cancelled.mp4" {
+		t.Fatalf("queue after RemoveJobs() = %#v, want failed/cancelled", got)
+	}
+	for i, job := range got {
+		if job.Position != i {
+			t.Errorf("remaining job %d Position = %d, want %d", i, job.Position, i)
+		}
+	}
+
+	if err := controller.ClearQueue(); err != nil {
+		t.Fatalf("ClearQueue() error = %v", err)
+	}
+	if got := controller.Snapshot(); len(got.Jobs) != 0 {
+		t.Fatalf("snapshot after ClearQueue() = %+v, want empty queue", got)
+	}
+	if saved := store.SnapshotJobs(); len(saved) != 0 {
+		t.Fatalf("persisted queue after ClearQueue() = %#v, want empty", saved)
+	}
+}
+
+func TestControllerQueueRemovalRequiresIdleQueue(t *testing.T) {
+	jobs, _ := fixtureJobs(t, []fixtureJob{{Name: "active.mp4", RandomID: 8301}})
+	store := &memoryQueueStore{jobs: jobs, channel: testChannel()}
+	gateway := &fakeGateway{}
+	started := make(chan struct{})
+	gateway.upload = func(ctx context.Context, _ tgtransport.UploadRequest, _ func(model.Progress)) (int, error) {
+		close(started)
+		<-ctx.Done()
+		return 0, ctx.Err()
+	}
+	controller := newLoadedController(t, store, gateway)
+	if err := controller.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	select {
+	case <-started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for active upload")
+	}
+	if err := controller.RemoveJobs([]string{jobs[0].ID}); err == nil {
+		t.Fatal("RemoveJobs() error = nil while queue is running")
+	}
+	if err := controller.RemoveCompleted(); err == nil {
+		t.Fatal("RemoveCompleted() error = nil while queue is running")
+	}
+	if err := controller.ClearQueue(); err == nil {
+		t.Fatal("ClearQueue() error = nil while queue is running")
+	}
+	if err := controller.CancelAll(); err != nil {
+		t.Fatalf("CancelAll() error = %v", err)
+	}
+	waitForSnapshot(t, controller, func(snapshot Snapshot) bool { return !snapshot.Running })
+}
+
 func TestSnapshotProgressUsesStableQueueTotal(t *testing.T) {
 	controller := NewController(nil, nil)
 	controller.jobs = []model.Job{

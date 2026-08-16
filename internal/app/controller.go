@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -181,6 +183,216 @@ func (c *Controller) Scan(folder string, maxBytes int64) error {
 	c.notifyLocked()
 	c.mu.Unlock()
 	return c.persist()
+}
+
+// AddJobs appends scanned candidates to the durable queue while the queue is
+// idle. Candidates are de-duplicated by their normalized absolute path. An
+// existing path always wins, so a previously sent/failed job keeps its ID,
+// RandomID and state instead of being replaced by a newly scanned copy.
+//
+// The scanner already returns candidates in natural filename order. When
+// adding candidates from another folder, their order is preserved and the
+// new group is appended after the existing queue. Positions are rebuilt for
+// the complete queue after every successful append.
+func (c *Controller) AddJobs(candidates []model.Job) error {
+	if len(candidates) == 0 {
+		return nil
+	}
+	if !c.opMu.TryLock() {
+		return errors.New("上传、扫描或移动操作正在进行，请稍后重试")
+	}
+	defer c.opMu.Unlock()
+
+	for _, candidate := range candidates {
+		if strings.TrimSpace(candidate.Path) == "" {
+			return errors.New("追加任务失败：文件路径不能为空")
+		}
+	}
+
+	c.mu.Lock()
+	if c.running {
+		c.mu.Unlock()
+		return errors.New("上传进行中，不能追加队列")
+	}
+
+	paths := make(map[string]struct{}, len(c.jobs)+len(candidates))
+	for _, job := range c.jobs {
+		if key := jobPathKey(job.Path); key != "" {
+			paths[key] = struct{}{}
+		}
+	}
+	added := 0
+	for _, candidate := range candidates {
+		key := jobPathKey(candidate.Path)
+		if _, exists := paths[key]; exists {
+			continue
+		}
+		if candidate.State == "" {
+			candidate.State = model.JobQueued
+		}
+		c.jobs = append(c.jobs, candidate)
+		paths[key] = struct{}{}
+		added++
+	}
+	if added == 0 {
+		c.mu.Unlock()
+		return nil
+	}
+	reindexJobs(c.jobs)
+	c.lastError = ""
+	c.notifyLocked()
+	c.mu.Unlock()
+
+	if err := c.persist(); err != nil {
+		c.setPersistenceError(err)
+		return err
+	}
+	return nil
+}
+
+// RemoveJobs removes the specified local queue entries while the queue is
+// idle. This only changes the local queue; it never deletes a message from
+// Telegram. Unknown IDs are ignored so repeated UI actions are safe.
+func (c *Controller) RemoveJobs(ids []string) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	if !c.opMu.TryLock() {
+		return errors.New("上传、扫描或移动操作正在进行，请稍后重试")
+	}
+	defer c.opMu.Unlock()
+
+	selected := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		if id != "" {
+			selected[id] = struct{}{}
+		}
+	}
+	if len(selected) == 0 {
+		return nil
+	}
+
+	c.mu.Lock()
+	if c.running {
+		c.mu.Unlock()
+		return errors.New("上传进行中，不能删除队列任务")
+	}
+	removed := c.removeJobsLocked(func(job model.Job) bool {
+		_, ok := selected[job.ID]
+		return ok
+	})
+	if removed == 0 {
+		c.mu.Unlock()
+		return nil
+	}
+	c.lastError = ""
+	c.notifyLocked()
+	c.mu.Unlock()
+
+	if err := c.persist(); err != nil {
+		c.setPersistenceError(err)
+		return err
+	}
+	return nil
+}
+
+// ClearQueue removes every local queue entry while idle. It does not affect
+// already uploaded Telegram messages.
+func (c *Controller) ClearQueue() error {
+	if !c.opMu.TryLock() {
+		return errors.New("上传、扫描或移动操作正在进行，请稍后重试")
+	}
+	defer c.opMu.Unlock()
+
+	c.mu.Lock()
+	if c.running {
+		c.mu.Unlock()
+		return errors.New("上传进行中，不能清空队列")
+	}
+	if len(c.jobs) == 0 {
+		c.mu.Unlock()
+		return nil
+	}
+	c.jobs = nil
+	c.lastError = ""
+	c.notifyLocked()
+	c.mu.Unlock()
+
+	if err := c.persist(); err != nil {
+		c.setPersistenceError(err)
+		return err
+	}
+	return nil
+}
+
+// RemoveCompleted removes jobs whose local terminal state means the file was
+// already handled: sent to Telegram or moved as an oversize file. Failed,
+// skipped and cancelled entries remain available for recovery or inspection.
+func (c *Controller) RemoveCompleted() error {
+	if !c.opMu.TryLock() {
+		return errors.New("上传、扫描或移动操作正在进行，请稍后重试")
+	}
+	defer c.opMu.Unlock()
+
+	c.mu.Lock()
+	if c.running {
+		c.mu.Unlock()
+		return errors.New("上传进行中，不能删除已完成任务")
+	}
+	removed := c.removeJobsLocked(func(job model.Job) bool {
+		return job.State == model.JobSent || job.State == model.JobMoved
+	})
+	if removed == 0 {
+		c.mu.Unlock()
+		return nil
+	}
+	c.lastError = ""
+	c.notifyLocked()
+	c.mu.Unlock()
+
+	if err := c.persist(); err != nil {
+		c.setPersistenceError(err)
+		return err
+	}
+	return nil
+}
+
+func (c *Controller) removeJobsLocked(remove func(model.Job) bool) int {
+	kept := c.jobs[:0]
+	removed := 0
+	for _, job := range c.jobs {
+		if remove(job) {
+			removed++
+			continue
+		}
+		kept = append(kept, job)
+	}
+	c.jobs = kept
+	if removed > 0 {
+		reindexJobs(c.jobs)
+	}
+	return removed
+}
+
+func reindexJobs(jobs []model.Job) {
+	for index := range jobs {
+		jobs[index].Position = index
+	}
+}
+
+func jobPathKey(path string) string {
+	if strings.TrimSpace(path) == "" {
+		return ""
+	}
+	absPath, err := filepath.Abs(path)
+	if err == nil {
+		path = absPath
+	}
+	path = filepath.Clean(path)
+	if runtime.GOOS == "windows" {
+		path = strings.ToLower(path)
+	}
+	return path
 }
 
 // ApplyUploadLimit updates only jobs whose eligibility can still change. It
