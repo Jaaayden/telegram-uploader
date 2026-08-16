@@ -57,12 +57,7 @@ func (c *Client) UploadVideo(ctx context.Context, request UploadRequest, onProgr
 	if maxUploadBytes > 0 && info.Size() > maxUploadBytes {
 		return 0, fmt.Errorf("视频大小 %d 字节超过当前 Bot 上传上限 %d 字节", info.Size(), maxUploadBytes)
 	}
-	if request.Name == "" {
-		request.Name = filepath.Base(request.Path)
-	}
-	if request.Caption == "" {
-		request.Caption = request.Name
-	}
+	request = prepareUploadRequest(request)
 
 	select {
 	case c.uploadSem <- struct{}{}:
@@ -128,6 +123,16 @@ func (c *Client) UploadVideo(ctx context.Context, request UploadRequest, onProgr
 		return 0, fmt.Errorf("%w：消息已发送但无法读取消息 ID：%w", ErrSendOutcomeUnknown, err)
 	}
 	return messageID, nil
+}
+
+// prepareUploadRequest fills only the Telegram document filename. Caption is
+// intentionally left untouched because an empty caption is a valid explicit
+// choice (for example, a source file whose complete name is ".mp4").
+func prepareUploadRequest(request UploadRequest) UploadRequest {
+	if request.Name == "" {
+		request.Name = filepath.Base(request.Path)
+	}
+	return request
 }
 
 func (c *Client) reserveSendSlot(ctx context.Context) error {

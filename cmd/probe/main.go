@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -110,11 +111,15 @@ func run() error {
 		return err
 	}
 	name := filepath.Base(videoPath)
+	caption := name
+	if extension := filepath.Ext(name); strings.EqualFold(extension, ".mp4") {
+		caption = strings.TrimSuffix(name, extension)
+	}
 	messageID, err := client.UploadVideo(ctx, tgtransport.UploadRequest{
 		Channel:  channel,
 		Path:     videoPath,
 		Name:     name,
-		Caption:  name,
+		Caption:  caption,
 		RandomID: randomID,
 		Metadata: metadata,
 	}, func(progress model.Progress) {

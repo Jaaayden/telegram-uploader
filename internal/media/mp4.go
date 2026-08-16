@@ -13,7 +13,8 @@ import (
 // ErrNoVideoTrack is returned when an MP4 does not contain a video track.
 var ErrNoVideoTrack = errors.New("MP4 文件不包含视频轨")
 
-// ErrInvalidMP4 is returned when the MP4 container is malformed or truncated.
+// ErrInvalidMP4 is returned when the MP4 container is too malformed or
+// incomplete to obtain trustworthy video metadata.
 var ErrInvalidMP4 = errors.New("MP4 文件损坏或已截断")
 
 // ParseMP4Metadata reads the MP4 box metadata needed for a Telegram video.
@@ -64,7 +65,7 @@ func ParseMP4MetadataFile(file *os.File) (metadata model.VideoMetadata, retErr e
 	}
 
 	fileSize := uint64(fileInfo.Size())
-	firstMdat, hasMdat, err := validateMdatBounds(parsed.Children, fileSize)
+	firstMdat, hasMdat, truncatedMdat, err := validateMdatBounds(parsed.Children, fileSize)
 	if err != nil {
 		return metadata, err
 	}
@@ -100,10 +101,11 @@ func ParseMP4MetadataFile(file *os.File) (metadata model.VideoMetadata, retErr e
 		}
 
 		metadata = model.VideoMetadata{
-			DurationSeconds:   durationSeconds,
-			Width:             width,
-			Height:            height,
-			SupportsStreaming: hasMdat && parsed.Moov.StartPos < firstMdat,
+			DurationSeconds:    durationSeconds,
+			Width:              width,
+			Height:             height,
+			SupportsStreaming:  hasMdat && parsed.Moov.StartPos < firstMdat,
+			TruncatedMediaData: truncatedMdat,
 		}
 		return metadata, nil
 	}
@@ -123,7 +125,7 @@ func ParseVideoMetadata(path string) (model.VideoMetadata, error) {
 	return ParseMP4Metadata(path)
 }
 
-func validateMdatBounds(children []mp4.Box, fileSize uint64) (first uint64, found bool, err error) {
+func validateMdatBounds(children []mp4.Box, fileSize uint64) (first uint64, found, truncated bool, err error) {
 	for _, child := range children {
 		mdat, ok := child.(*mp4.MdatBox)
 		if !ok {
@@ -132,15 +134,22 @@ func validateMdatBounds(children []mp4.Box, fileSize uint64) (first uint64, foun
 
 		start := mdat.StartPos
 		size := mdat.Size()
-		if start > fileSize || size > fileSize-start {
-			return 0, false, fmt.Errorf("%w：mdat 超出文件范围", ErrInvalidMP4)
+		if start > fileSize || mdat.HeaderSize() > fileSize-start {
+			return 0, false, false, fmt.Errorf("%w：mdat 头部超出文件范围", ErrInvalidMP4)
+		}
+		if size > fileSize-start {
+			// Some players tolerate an MP4 whose final mdat declaration extends
+			// past EOF and play the samples that are still present. This is a
+			// genuine source-file truncation, but it does not prevent us from
+			// reading trustworthy moov metadata or uploading the original bytes.
+			truncated = true
 		}
 		if !found || start < first {
 			first = start
 			found = true
 		}
 	}
-	return first, found, nil
+	return first, found, truncated, nil
 }
 
 func videoDimensions(track *mp4.TrakBox) (width, height int, ok bool) {

@@ -7,6 +7,16 @@ import (
 	"time"
 )
 
+func TestPrepareUploadRequestPreservesExplicitEmptyCaption(t *testing.T) {
+	request := prepareUploadRequest(UploadRequest{Path: "/videos/.mp4", Caption: ""})
+	if request.Name != ".mp4" {
+		t.Fatalf("Name = %q, want .mp4", request.Name)
+	}
+	if request.Caption != "" {
+		t.Fatalf("Caption = %q, want explicit empty caption", request.Caption)
+	}
+}
+
 func TestReserveSendSlotUpdatesTimestampBeforeFirstSend(t *testing.T) {
 	client := &Client{}
 	before := client.lastSend

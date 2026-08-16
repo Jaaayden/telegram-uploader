@@ -40,11 +40,12 @@ func DefaultPaths() (Paths, error) {
 }
 
 type Settings struct {
-	APIID         int    `json:"api_id"`
-	ProxyEnabled  bool   `json:"proxy_enabled"`
-	ProxyAddress  string `json:"proxy_address,omitempty"`
-	ProxyUsername string `json:"proxy_username,omitempty"`
-	LastFolder    string `json:"last_folder,omitempty"`
+	APIID              int    `json:"api_id"`
+	ProxyEnabled       bool   `json:"proxy_enabled"`
+	ProxyAddress       string `json:"proxy_address,omitempty"`
+	ProxyUsername      string `json:"proxy_username,omitempty"`
+	LastFolder         string `json:"last_folder,omitempty"`
+	ScheduledStartUnix int64  `json:"scheduled_start_unix,omitempty"`
 }
 
 type settingsDocument struct {
