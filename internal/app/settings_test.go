@@ -9,7 +9,7 @@ import (
 
 func TestSettingsRoundTrip(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "settings.json")
-	want := Settings{APIID: 42, ProxyEnabled: true, ProxyAddress: "127.0.0.1:1080", ProxyUsername: "u", LastFolder: "/tmp/videos"}
+	want := Settings{APIID: 42, ProxyEnabled: true, ProxyAddress: "127.0.0.1:1080", ProxyUsername: "u", LastFolder: "/tmp/videos", ScheduledStartUnix: 1_787_070_600}
 	if err := SaveSettings(path, want); err != nil {
 		t.Fatal(err)
 	}

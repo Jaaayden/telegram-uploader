@@ -1,9 +1,11 @@
 package ui
 
 import (
+	"context"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"fyne.io/fyne/v2/test"
 	coreapp "github.com/jayden/telegram-video-uploader/internal/app"
@@ -218,5 +220,82 @@ func TestScanningDisablesStartAndMoveActions(t *testing.T) {
 
 	if !u.chooseFolderButton.Disabled() || !u.startButton.Disabled() || !u.moveButton.Disabled() {
 		t.Fatalf("scan availability: add=%v start=%v move=%v, want all disabled", u.chooseFolderButton.Disabled(), u.startButton.Disabled(), u.moveButton.Disabled())
+	}
+}
+
+func TestParseScheduledTimeUsesRequestedLocalZone(t *testing.T) {
+	location := time.FixedZone("UTC+8", 8*60*60)
+	got, err := parseScheduledTime("2026-08-17", "09:35", location)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Location() != location || got.Year() != 2026 || got.Month() != time.August || got.Day() != 17 || got.Hour() != 9 || got.Minute() != 35 {
+		t.Fatalf("parsed schedule = %v, want 2026-08-17 09:35 in requested zone", got)
+	}
+	if _, err := parseScheduledTime("2026/08/17", "9:35", location); err == nil {
+		t.Fatal("invalid schedule format was accepted")
+	}
+}
+
+func TestBeginUploadsRestoresScheduleWhenControllerCannotStart(t *testing.T) {
+	tests := []struct {
+		name      string
+		startAt   time.Time
+		scheduled bool
+		wantDue   bool
+	}{
+		{name: "manual start preserves future schedule", startAt: time.Now().Add(time.Hour).Truncate(time.Second), scheduled: false, wantDue: false},
+		{name: "scheduled start remains due", startAt: time.Now().Add(-time.Minute).Truncate(time.Second), scheduled: true, wantDue: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			settingsPath := filepath.Join(t.TempDir(), "settings.json")
+			coordinator := newScheduleCoordinator(nil)
+			defer coordinator.Stop()
+			if test.wantDue {
+				coordinator.HoldDue(test.startAt)
+			} else {
+				coordinator.Set(test.startAt)
+			}
+			u := &window{
+				controller: coreapp.NewController(nil, nil),
+				paths:      coreapp.Paths{Settings: settingsPath},
+				settings:   coreapp.Settings{ScheduledStartUnix: test.startAt.Unix()},
+				rootCtx:    context.Background(),
+				scheduler:  coordinator,
+			}
+			if err := u.beginUploads(test.scheduled); err == nil {
+				t.Fatal("beginUploads() error = nil without Telegram gateway")
+			}
+			loaded, err := coreapp.LoadSettings(settingsPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if loaded.ScheduledStartUnix != test.startAt.Unix() {
+				t.Fatalf("persisted schedule = %d, want %d", loaded.ScheduledStartUnix, test.startAt.Unix())
+			}
+			stateAt, set, due := coordinator.State()
+			if !set || due != test.wantDue || !stateAt.Equal(test.startAt) {
+				t.Fatalf("restored schedule = (%v, %v, %v), want (%v, true, %v)", stateAt, set, due, test.startAt, test.wantDue)
+			}
+		})
+	}
+}
+
+func TestNextScheduleRetryDelayUsesBoundedBackoff(t *testing.T) {
+	tests := []struct {
+		previous time.Duration
+		want     time.Duration
+	}{
+		{previous: 0, want: 5 * time.Second},
+		{previous: 5 * time.Second, want: 10 * time.Second},
+		{previous: 40 * time.Second, want: time.Minute},
+		{previous: time.Minute, want: time.Minute},
+		{previous: 10 * time.Minute, want: time.Minute},
+	}
+	for _, test := range tests {
+		if got := nextScheduleRetryDelay(test.previous); got != test.want {
+			t.Fatalf("nextScheduleRetryDelay(%v) = %v, want %v", test.previous, got, test.want)
+		}
 	}
 }

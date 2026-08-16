@@ -30,6 +30,11 @@ import (
 	tgtransport "github.com/jayden/telegram-video-uploader/internal/telegram"
 )
 
+const (
+	scheduleRetryInitial = 5 * time.Second
+	scheduleRetryMaximum = time.Minute
+)
+
 // Run creates and runs the single-window desktop application.  It returns
 // when the window is closed.  No credentials are required to construct the
 // window; connection is intentionally deferred until the user presses the
@@ -95,6 +100,9 @@ type window struct {
 	folderLabel        *widget.Label
 	chooseFolderButton *widget.Button
 	startButton        *widget.Button
+	scheduleButton     *widget.Button
+	cancelSchedule     *widget.Button
+	scheduleLabel      *widget.Label
 	cancelAllButton    *widget.Button
 	moveButton         *widget.Button
 	cancelMoveButton   *widget.Button
@@ -117,6 +125,8 @@ type window struct {
 	bindMu     sync.Mutex
 	bindDialog *dialog.CustomDialog
 
+	candidateDialog *dialog.CustomDialog
+
 	moveMu       sync.Mutex
 	moveLastUI   time.Time
 	moveCancel   context.CancelFunc
@@ -124,11 +134,15 @@ type window struct {
 
 	sleepMu    sync.Mutex
 	sleepGuard platform.SleepGuard
+
+	scheduler        *scheduleCoordinator
+	scheduleStarting bool
+	scheduleRetry    time.Duration
 }
 
 func newWindow(application fyne.App, fyneWindow fyne.Window, controller *coreapp.Controller, paths coreapp.Paths, secrets *credentials.Store, settings coreapp.Settings) *window {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &window{
+	u := &window{
 		application: application,
 		window:      fyneWindow,
 		controller:  controller,
@@ -138,6 +152,10 @@ func newWindow(application fyne.App, fyneWindow fyne.Window, controller *coreapp
 		rootCtx:     ctx,
 		rootCancel:  cancel,
 	}
+	u.scheduler = newScheduleCoordinator(func() {
+		u.doUI(u.tryScheduledStart)
+	})
+	return u
 }
 
 func (u *window) build() {
@@ -173,7 +191,8 @@ func (u *window) build() {
 		widget.NewLabelWithStyle("上传队列", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
 		container.NewBorder(nil, nil, nil, u.chooseFolderButton, u.folderLabel),
 		container.NewHBox(u.selectAllButton, u.selectNoneButton, u.removeSelected, u.removeCompleted, u.clearQueueButton, u.selectionLabel),
-		container.NewHBox(u.startButton, u.cancelAllButton, u.moveButton, u.cancelMoveButton),
+		container.NewHBox(u.startButton, u.scheduleButton, u.cancelSchedule, u.cancelAllButton, u.moveButton, u.cancelMoveButton),
+		u.scheduleLabel,
 		u.progress,
 		u.progressSummary,
 		u.operationProgress,
@@ -216,6 +235,9 @@ func (u *window) buildFields() {
 	u.chooseFolderButton = widget.NewButton("添加文件夹…", u.chooseFolder)
 	u.folderLabel = widget.NewLabel("尚未添加来源文件夹")
 	u.startButton = widget.NewButton("开始上传", u.startUploads)
+	u.scheduleButton = widget.NewButton("定时开始…", u.showScheduleDialog)
+	u.cancelSchedule = widget.NewButton("取消定时", u.cancelScheduledStart)
+	u.scheduleLabel = widget.NewLabel("定时：未设置")
 	u.cancelAllButton = widget.NewButton("取消全部", u.confirmCancelAll)
 	u.moveButton = widget.NewButton("移动全部超限文件", u.chooseMoveDestination)
 	u.cancelMoveButton = widget.NewButton("取消移动", u.cancelMove)
@@ -235,6 +257,8 @@ func (u *window) buildFields() {
 	// channel have been selected.
 	u.bindButton.Disable()
 	u.startButton.Disable()
+	u.scheduleButton.Disable()
+	u.cancelSchedule.Disable()
 	u.cancelAllButton.Disable()
 	u.moveButton.Disable()
 	u.selectAllButton.Disable()
@@ -402,6 +426,7 @@ func (u *window) applyLoadedSettings() {
 
 func (u *window) startObservers() {
 	go u.observeController()
+	u.restoreScheduledStart()
 }
 
 func (u *window) observeController() {
@@ -442,8 +467,12 @@ func (u *window) applySnapshot(snapshot coreapp.Snapshot) {
 	}
 	u.refreshQueueRows(snapshot.Jobs)
 	u.updateActionAvailability()
+	u.updateScheduleStatus()
 	if !snapshot.Running {
 		u.stopSleepGuard()
+		if u.scheduler != nil {
+			u.scheduler.RetryDue()
+		}
 	}
 }
 
@@ -455,6 +484,7 @@ func (u *window) updateActionAvailability() {
 		u.cancelAllButton.Disable()
 		u.disableQueueEditing()
 		u.cancelMoveButton.Show()
+		u.updateScheduleControls()
 		u.refreshQueueSelectionAvailability()
 		return
 	}
@@ -491,7 +521,25 @@ func (u *window) updateActionAvailability() {
 		u.startButton.Disable()
 		u.moveButton.Disable()
 	}
+	u.updateScheduleControls()
 	u.refreshQueueSelectionAvailability()
+}
+
+func (u *window) updateScheduleControls() {
+	if u.scheduler == nil || u.scheduleButton == nil {
+		return
+	}
+	_, set, _ := u.scheduler.State()
+	if !u.snapshot.Running && !u.isMoveInFlight() && !u.scanInProgress() && hasRunnableJobs(u.snapshot.Jobs) && !u.scheduleStarting {
+		u.scheduleButton.Enable()
+	} else {
+		u.scheduleButton.Disable()
+	}
+	if set && !u.scheduleStarting {
+		u.cancelSchedule.Enable()
+	} else {
+		u.cancelSchedule.Disable()
+	}
 }
 
 func (u *window) disableQueueEditing() {
@@ -549,15 +597,23 @@ func (u *window) isMoveInFlight() bool {
 }
 
 func (u *window) connect() {
+	u.connectWithMode(false)
+}
+
+func (u *window) connectWithMode(automatic bool) {
 	appID, err := strconv.Atoi(strings.TrimSpace(u.apiID.Text))
 	if err != nil || appID <= 0 {
-		u.showError(errors.New("API ID 必须是正整数"))
+		if !automatic {
+			u.showError(errors.New("API ID 必须是正整数"))
+		}
 		return
 	}
 	apiHash := strings.TrimSpace(u.apiHash.Text)
 	botToken := strings.TrimSpace(u.botToken.Text)
 	if apiHash == "" || botToken == "" {
-		u.showError(errors.New("API Hash 和 Bot Token 不能为空"))
+		if !automatic {
+			u.showError(errors.New("API Hash 和 Bot Token 不能为空"))
+		}
 		return
 	}
 
@@ -568,39 +624,34 @@ func (u *window) connect() {
 
 	u.connectButton.Disable()
 	u.connection.SetText("正在保存凭据并连接……")
-	go u.connectAsync(appID, apiHash, botToken, proxyEnabled, proxyAddress, proxyUsername, proxyPassword)
+	go u.connectAsync(appID, apiHash, botToken, proxyEnabled, proxyAddress, proxyUsername, proxyPassword, automatic)
 }
 
-func (u *window) connectAsync(appID int, apiHash, botToken string, proxyEnabled bool, proxyAddress, proxyUsername, proxyPassword string) {
+func (u *window) connectAsync(appID int, apiHash, botToken string, proxyEnabled bool, proxyAddress, proxyUsername, proxyPassword string, automatic bool) {
 	if err := u.updateSettings(func(settings *coreapp.Settings) {
 		settings.APIID = appID
 		settings.ProxyEnabled = proxyEnabled
 		settings.ProxyAddress = proxyAddress
 		settings.ProxyUsername = proxyUsername
 	}); err != nil {
-		u.showError(err)
-		u.doUI(func() { u.connectButton.Enable(); u.connection.SetText("未连接") })
+		u.handleConnectionFailure(err, automatic)
 		return
 	}
 	if err := u.secrets.SetAPIHash(apiHash); err != nil {
-		u.showError(err)
-		u.doUI(func() { u.connectButton.Enable(); u.connection.SetText("未连接") })
+		u.handleConnectionFailure(err, automatic)
 		return
 	}
 	if err := u.secrets.SetBotToken(botToken); err != nil {
-		u.showError(err)
-		u.doUI(func() { u.connectButton.Enable(); u.connection.SetText("未连接") })
+		u.handleConnectionFailure(err, automatic)
 		return
 	}
 	if proxyPassword == "" {
 		if err := u.secrets.DeleteProxyPassword(); err != nil && !errors.Is(err, credentials.ErrNotFound) {
-			u.showError(err)
-			u.doUI(func() { u.connectButton.Enable(); u.connection.SetText("未连接") })
+			u.handleConnectionFailure(err, automatic)
 			return
 		}
 	} else if err := u.secrets.SetProxyPassword(proxyPassword); err != nil {
-		u.showError(err)
-		u.doUI(func() { u.connectButton.Enable(); u.connection.SetText("未连接") })
+		u.handleConnectionFailure(err, automatic)
 		return
 	}
 
@@ -612,6 +663,7 @@ func (u *window) connectAsync(appID int, apiHash, botToken string, proxyEnabled 
 			Password: proxyPassword,
 		}
 	}
+	var stateClient *tgtransport.Client
 	client, err := tgtransport.NewClient(tgtransport.Config{
 		AppID:          appID,
 		APIHash:        apiHash,
@@ -620,24 +672,17 @@ func (u *window) connectAsync(appID int, apiHash, botToken string, proxyEnabled 
 		SessionStorage: credentials.NewSessionStorage(u.secrets, u.paths.Session),
 	}, tgtransport.Events{
 		OnConnectionState: func(state tgtransport.ConnectionState) {
-			switch state {
-			case tgtransport.StateConnecting:
-				u.setConnectionStatus("正在连接 Telegram……")
-			case tgtransport.StateReady:
-				u.setConnectionStatus("Telegram 连接已建立")
-			case tgtransport.StateDisconnected:
-				u.setConnectionStatus("Telegram 连接已断开")
-			}
+			u.handleConnectionState(stateClient, state)
 		},
 		OnFloodWait: func(wait time.Duration) {
 			u.setConnectionStatus("Telegram 要求等待 " + formatDuration(wait))
 		},
 	})
 	if err != nil {
-		u.showError(err)
-		u.doUI(func() { u.connectButton.Enable(); u.connection.SetText("未连接") })
+		u.handleConnectionFailure(err, automatic)
 		return
 	}
+	stateClient = client
 
 	ctx, cancel := context.WithCancel(u.rootCtx)
 	u.clientMu.Lock()
@@ -647,12 +692,59 @@ func (u *window) connectAsync(appID int, apiHash, botToken string, proxyEnabled 
 	u.controller.SetGateway(client)
 
 	u.doUI(func() { u.connection.SetText("正在启动 Telegram 客户端……") })
-	go u.runClient(client, ctx)
-	go u.waitClientReady(client, ctx)
+	go u.runClient(client, ctx, automatic)
+	go u.waitClientReady(client, ctx, automatic)
 	go u.observeBinding(client, ctx)
 }
 
-func (u *window) runClient(client *tgtransport.Client, ctx context.Context) {
+func (u *window) handleConnectionFailure(err error, automatic bool) {
+	if !automatic {
+		u.showError(err)
+	}
+	u.doUI(func() {
+		u.connected = false
+		u.connectButton.Enable()
+		if automatic {
+			u.connection.SetText("自动连接失败，将稍后重试")
+			u.operationLabel.SetText("定时启动正在等待 Telegram 恢复连接")
+		} else {
+			u.connection.SetText("未连接")
+		}
+		u.updateActionAvailability()
+		u.scheduleConnectionRetry()
+		u.updateScheduleStatus()
+	})
+}
+
+func (u *window) handleConnectionState(client *tgtransport.Client, state tgtransport.ConnectionState) {
+	u.doUI(func() {
+		if client == nil || u.currentClient() != client || u.isClosed() {
+			return
+		}
+		switch state {
+		case tgtransport.StateConnecting:
+			u.connected = false
+			u.connection.SetText("正在连接 Telegram……")
+		case tgtransport.StateReady:
+			u.connection.SetText("Telegram 连接已建立")
+			if u.identity.Username != "" {
+				u.connected = true
+				u.resetScheduleConnectionRetry()
+				if u.scheduler != nil {
+					u.scheduler.RetryDue()
+				}
+			}
+		case tgtransport.StateDisconnected:
+			u.connected = false
+			u.connection.SetText("Telegram 连接已断开")
+			u.scheduleConnectionRetry()
+		}
+		u.updateActionAvailability()
+		u.updateScheduleStatus()
+	})
+}
+
+func (u *window) runClient(client *tgtransport.Client, ctx context.Context, automatic bool) {
 	err := client.Run(ctx)
 	if errors.Is(err, tgtransport.ErrWrongBotSession) {
 		if removeErr := os.Remove(u.paths.Session); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
@@ -664,16 +756,20 @@ func (u *window) runClient(client *tgtransport.Client, ctx context.Context) {
 	// A failed Run must also stop the readiness and binding observers.  A
 	// normal close already cancelled this context, so this is harmless there.
 	u.clientMu.Lock()
-	if u.client == client && u.clientCancel != nil {
-		u.clientCancel()
+	wasCurrent := u.client == client
+	if wasCurrent {
+		if u.clientCancel != nil {
+			u.clientCancel()
+		}
 		u.clientCancel = nil
+		u.client = nil
 	}
 	u.clientMu.Unlock()
-	if err != nil && !errors.Is(err, context.Canceled) && !u.isClosed() {
+	if err != nil && !errors.Is(err, context.Canceled) && !u.isClosed() && !automatic {
 		u.showError(err)
 	}
 	u.doUI(func() {
-		if u.currentClient() != client {
+		if !wasCurrent {
 			return
 		}
 		u.connected = false
@@ -682,14 +778,20 @@ func (u *window) runClient(client *tgtransport.Client, ctx context.Context) {
 		u.connectButton.Enable()
 		u.bindButton.Disable()
 		u.limit.SetText("当前上传上限：未获取")
+		if err != nil && !errors.Is(err, context.Canceled) && automatic {
+			u.connection.SetText("自动连接失败，将稍后重试")
+			u.operationLabel.SetText("定时启动正在等待 Telegram 恢复连接")
+		}
 		u.updateActionAvailability()
+		u.scheduleConnectionRetry()
+		u.updateScheduleStatus()
 	})
 }
 
-func (u *window) waitClientReady(client *tgtransport.Client, ctx context.Context) {
+func (u *window) waitClientReady(client *tgtransport.Client, ctx context.Context, automatic bool) {
 	identity, err := client.WaitReady(ctx)
 	if err != nil {
-		if !errors.Is(err, context.Canceled) && !u.isClosed() {
+		if !errors.Is(err, context.Canceled) && !u.isClosed() && !automatic {
 			u.showError(err)
 		}
 		u.doUI(func() {
@@ -706,6 +808,7 @@ func (u *window) waitClientReady(client *tgtransport.Client, ctx context.Context
 		}
 		u.connected = true
 		u.identity = identity
+		u.resetScheduleConnectionRetry()
 		u.connectButton.Disable()
 		u.bindButton.Enable()
 		u.connection.SetText("已连接 Bot：@" + identity.Username)
@@ -724,6 +827,9 @@ func (u *window) waitClientReady(client *tgtransport.Client, ctx context.Context
 		if err := u.controller.ApplyUploadLimit(identity.MaxUploadBytes); err != nil {
 			u.showError(err)
 		}
+	}
+	if u.scheduler != nil {
+		u.scheduler.RetryDue()
 	}
 }
 
@@ -758,6 +864,10 @@ func (u *window) observeBinding(client *tgtransport.Client, ctx context.Context)
 				u.channel.SetText("已绑定：" + title)
 				u.operationLabel.SetText("频道绑定成功")
 				u.updateActionAvailability()
+				u.updateScheduleStatus()
+				if u.scheduler != nil {
+					u.scheduler.RetryDue()
+				}
 			})
 		case <-ctx.Done():
 			return
@@ -859,6 +969,8 @@ func (u *window) scanFolder(folder string, maxBytes int64) {
 					return
 				}
 				u.showCandidateDialog(folder, candidates)
+			} else if u.scheduler != nil {
+				u.scheduler.RetryDue()
 			}
 		})
 	}()
@@ -892,6 +1004,9 @@ func (u *window) showCandidateDialog(folder string, candidates []model.Job) {
 	if len(candidates) == 0 {
 		u.operationLabel.SetText("当前文件夹没有可添加的 MP4 文件")
 		dialog.ShowInformation("没有候选视频", "当前文件夹顶层没有找到 MP4 文件。", u.window)
+		if u.scheduler != nil {
+			u.scheduler.RetryDue()
+		}
 		return
 	}
 
@@ -1002,6 +1117,16 @@ func (u *window) showCandidateDialog(folder string, candidates []model.Job) {
 		u.operationLabel.SetText(fmt.Sprintf("已从当前文件夹添加 %d 个视频", len(selected)))
 	})
 	candidateDialog = dialog.NewCustom("添加到上传队列", "取消", content, u.window)
+	u.candidateDialog = candidateDialog
+	candidateDialog.SetOnClosed(func() {
+		if u.candidateDialog == candidateDialog {
+			u.candidateDialog = nil
+		}
+		u.updateScheduleStatus()
+		if u.scheduler != nil {
+			u.scheduler.RetryDue()
+		}
+	})
 	candidateDialog.SetButtons([]fyne.CanvasObject{
 		selectAll,
 		selectNone,
@@ -1121,12 +1246,268 @@ func (u *window) confirmClearQueue() {
 	}, u.window)
 }
 
-func (u *window) startUploads() {
-	if err := u.controller.Start(u.rootCtx); err != nil {
+func (u *window) restoreScheduledStart() {
+	if u.scheduler == nil {
+		return
+	}
+	startUnix := u.settingsSnapshot().ScheduledStartUnix
+	if startUnix <= 0 {
+		u.updateScheduleStatus()
+		return
+	}
+	u.scheduler.Set(time.Unix(startUnix, 0).Local())
+	u.updateScheduleStatus()
+	u.ensureScheduledConnection()
+}
+
+func (u *window) showScheduleDialog() {
+	if u.snapshot.Running || u.isMoveInFlight() || u.scanInProgress() {
+		return
+	}
+	now := time.Now()
+	defaultTime := now.Add(10 * time.Minute).Truncate(time.Minute)
+	if !defaultTime.After(now) {
+		defaultTime = defaultTime.Add(time.Minute)
+	}
+	if at, set, _ := u.scheduler.State(); set && at.After(now) {
+		defaultTime = at.Local()
+	}
+
+	dateEntry := widget.NewEntry()
+	dateEntry.SetText(defaultTime.Format("2006-01-02"))
+	timeEntry := widget.NewEntry()
+	timeEntry.SetText(defaultTime.Format("15:04"))
+	validation := widget.NewLabel("")
+	validation.Wrapping = fyne.TextWrapWord
+	note := widget.NewLabel("应用保持运行时会到点自动开始；完全退出应用后，系统不会自行唤醒它。重启应用后会恢复尚未执行的计划。")
+	note.Wrapping = fyne.TextWrapWord
+	content := container.NewVBox(
+		widget.NewLabel("日期（YYYY-MM-DD）"),
+		dateEntry,
+		widget.NewLabel("时间（HH:mm，本机时区）"),
+		timeEntry,
+		validation,
+		widget.NewSeparator(),
+		note,
+	)
+
+	var scheduleDialog *dialog.CustomDialog
+	setButton := widget.NewButton("设置定时", func() {
+		startAt, err := parseScheduledTime(dateEntry.Text, timeEntry.Text, time.Local)
+		if err != nil {
+			validation.SetText(err.Error())
+			return
+		}
+		if !startAt.After(time.Now()) {
+			validation.SetText("定时开始时间必须晚于当前时间")
+			return
+		}
+		if err := u.updateSettings(func(settings *coreapp.Settings) {
+			settings.ScheduledStartUnix = startAt.Unix()
+		}); err != nil {
+			validation.SetText(err.Error())
+			return
+		}
+		u.resetScheduleConnectionRetry()
+		u.scheduler.Set(startAt)
+		u.updateScheduleStatus()
+		u.updateActionAvailability()
+		u.ensureScheduledConnection()
+		scheduleDialog.Dismiss()
+		u.operationLabel.SetText("定时开始已设置")
+	})
+	scheduleDialog = dialog.NewCustom("定时开始上传队列", "取消", content, u.window)
+	scheduleDialog.SetButtons([]fyne.CanvasObject{
+		widget.NewButton("取消", func() { scheduleDialog.Dismiss() }),
+		setButton,
+	})
+	scheduleDialog.Resize(fyne.NewSize(560, 390))
+	scheduleDialog.Show()
+}
+
+func parseScheduledTime(dateText, timeText string, location *time.Location) (time.Time, error) {
+	if location == nil {
+		location = time.Local
+	}
+	value := strings.TrimSpace(dateText) + " " + strings.TrimSpace(timeText)
+	parsed, err := time.ParseInLocation("2006-01-02 15:04", value, location)
+	if err != nil {
+		return time.Time{}, errors.New("时间格式无效，请按 YYYY-MM-DD 和 HH:mm 填写")
+	}
+	return parsed, nil
+}
+
+func (u *window) cancelScheduledStart() {
+	if u.scheduler == nil || u.scheduleStarting {
+		return
+	}
+	if _, set, _ := u.scheduler.State(); !set {
+		return
+	}
+	if err := u.updateSettings(func(settings *coreapp.Settings) {
+		settings.ScheduledStartUnix = 0
+	}); err != nil {
 		u.showError(err)
 		return
 	}
+	u.scheduler.Cancel()
+	u.scheduleRetry = 0
+	u.updateScheduleStatus()
+	u.updateActionAvailability()
+	u.operationLabel.SetText("已取消定时开始")
+}
+
+func (u *window) updateScheduleStatus() {
+	if u.scheduleLabel == nil || u.scheduler == nil {
+		return
+	}
+	startAt, set, due := u.scheduler.State()
+	if !set {
+		u.scheduleLabel.SetText("定时：未设置")
+		return
+	}
+	display := startAt.Local().Format("2006-01-02 15:04")
+	if !due {
+		u.scheduleLabel.SetText("定时：" + display + "（应用需保持打开）")
+		return
+	}
+	suffix := "正在准备开始"
+	switch {
+	case !u.connected:
+		suffix = "时间已到，等待 Telegram 连接"
+		if u.scheduleRetry > 0 {
+			suffix += "（将自动重试）"
+		}
+	case u.snapshot.Channel.ID == 0:
+		suffix = "时间已到，等待绑定频道"
+	case !hasRunnableJobs(u.snapshot.Jobs):
+		suffix = "时间已到，等待队列加入待上传视频"
+	case u.snapshot.Running:
+		suffix = "时间已到，队列正在运行"
+	case u.isMoveInFlight() || u.scanInProgress() || u.candidateDialog != nil:
+		suffix = "时间已到，等待当前文件操作完成"
+	}
+	u.scheduleLabel.SetText("定时：" + display + " · " + suffix)
+}
+
+func (u *window) ensureScheduledConnection() {
+	if u.currentClient() != nil || u.connectButton == nil || u.connectButton.Disabled() {
+		return
+	}
+	u.connected = false
+	appID, err := strconv.Atoi(strings.TrimSpace(u.apiID.Text))
+	if err != nil || appID <= 0 || strings.TrimSpace(u.apiHash.Text) == "" || strings.TrimSpace(u.botToken.Text) == "" {
+		u.updateScheduleStatus()
+		return
+	}
+	u.connectWithMode(true)
+}
+
+func (u *window) scheduleConnectionRetry() {
+	if u.scheduler == nil || u.isClosed() {
+		return
+	}
+	_, set, due := u.scheduler.State()
+	if !set || !due || u.connected {
+		return
+	}
+	u.scheduleRetry = nextScheduleRetryDelay(u.scheduleRetry)
+	u.scheduler.RetryDueAfter(u.scheduleRetry)
+}
+
+func (u *window) resetScheduleConnectionRetry() {
+	u.scheduleRetry = 0
+	if u.scheduler != nil {
+		u.scheduler.CancelRetry()
+	}
+}
+
+func nextScheduleRetryDelay(previous time.Duration) time.Duration {
+	if previous < scheduleRetryInitial {
+		return scheduleRetryInitial
+	}
+	next := previous * 2
+	if next > scheduleRetryMaximum {
+		return scheduleRetryMaximum
+	}
+	return next
+}
+
+func (u *window) tryScheduledStart() {
+	if u.scheduler == nil || u.scheduleStarting {
+		return
+	}
+	_, set, due := u.scheduler.State()
+	if !set || !due {
+		return
+	}
+	u.updateScheduleStatus()
+	if u.snapshot.Running || u.isMoveInFlight() || u.scanInProgress() || u.candidateDialog != nil {
+		return
+	}
+	if !u.connected || u.currentClient() == nil {
+		u.ensureScheduledConnection()
+		return
+	}
+	if u.snapshot.Channel.ID == 0 || !hasRunnableJobs(u.snapshot.Jobs) {
+		return
+	}
+
+	u.scheduleStarting = true
+	u.updateActionAvailability()
+	err := u.beginUploads(true)
+	u.scheduleStarting = false
+	u.updateScheduleStatus()
+	u.updateActionAvailability()
+	if err != nil {
+		u.operationLabel.SetText("定时启动失败，计划仍保留：" + err.Error())
+	}
+}
+
+func (u *window) startUploads() {
+	if err := u.beginUploads(false); err != nil {
+		u.showError(err)
+	}
+}
+
+func (u *window) beginUploads(scheduled bool) error {
+	var scheduledAt time.Time
+	hadSchedule := false
+	wasDue := false
+	if u.scheduler != nil {
+		scheduledAt, hadSchedule, wasDue = u.scheduler.State()
+	}
+	if hadSchedule {
+		if err := u.updateSettings(func(settings *coreapp.Settings) {
+			settings.ScheduledStartUnix = 0
+		}); err != nil {
+			return err
+		}
+		u.scheduler.Cancel()
+		u.scheduleRetry = 0
+	}
+
+	if err := u.controller.Start(u.rootCtx); err != nil {
+		if hadSchedule {
+			restoreErr := u.updateSettings(func(settings *coreapp.Settings) {
+				settings.ScheduledStartUnix = scheduledAt.Unix()
+			})
+			if scheduled || wasDue {
+				u.scheduler.HoldDue(scheduledAt)
+			} else {
+				u.scheduler.Set(scheduledAt)
+			}
+			if restoreErr != nil {
+				return errors.Join(err, fmt.Errorf("恢复定时设置失败：%w", restoreErr))
+			}
+		}
+		return err
+	}
+
 	status := "上传已开始；文件会按队列顺序逐条发送"
+	if scheduled {
+		status = "定时时间已到；上传队列已自动开始"
+	}
 	if guard, err := platform.PreventSleep(); err != nil {
 		status += "；无法阻止系统休眠：" + err.Error()
 	} else {
@@ -1139,6 +1520,9 @@ func (u *window) startUploads() {
 		}
 	}
 	u.operationLabel.SetText(status)
+	u.resetScheduleConnectionRetry()
+	u.updateScheduleStatus()
+	return nil
 }
 
 func (u *window) confirmCancelAll() {
@@ -1316,6 +1700,10 @@ func (u *window) chooseMoveDestination() {
 				u.cancelMoveButton.Hide()
 				u.operationLabel.SetText(mapOperationResult(err, "超限文件移动完成"))
 				u.updateActionAvailability()
+				u.updateScheduleStatus()
+				if u.scheduler != nil {
+					u.scheduler.RetryDue()
+				}
 			})
 		}()
 	}, u.window)
@@ -1360,6 +1748,17 @@ func (u *window) closeIntercept() {
 		}, u.window)
 		return
 	}
+	if u.scheduler != nil {
+		if startAt, set, _ := u.scheduler.State(); set {
+			message := "仍有定时开始计划（" + startAt.Local().Format("2006-01-02 15:04") + "）。应用退出期间不会自动启动；计划会保留，并在下次打开应用时恢复。确定退出吗？"
+			dialog.ShowConfirm("退出并保留定时计划", message, func(ok bool) {
+				if ok {
+					u.forceClose()
+				}
+			}, u.window)
+			return
+		}
+	}
 	u.forceClose()
 }
 
@@ -1387,6 +1786,9 @@ func (u *window) forceClose() {
 	u.clientCancel = nil
 	u.clientMu.Unlock()
 	u.rootCancel()
+	if u.scheduler != nil {
+		u.scheduler.Stop()
+	}
 	u.stopSleepGuard()
 	u.window.Close()
 }
