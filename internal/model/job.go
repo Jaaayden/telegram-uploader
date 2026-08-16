@@ -20,13 +20,15 @@ const (
 	JobInterrupted JobState = "interrupted"
 )
 
-// VideoMetadata contains only the fields needed to make Telegram render an
-// uploaded MP4 as a video. Duration is expressed in whole seconds.
+// VideoMetadata contains the fields needed to make Telegram render an
+// uploaded MP4 as a video, plus non-fatal source-container diagnostics.
+// Duration is expressed in whole seconds.
 type VideoMetadata struct {
-	DurationSeconds   int  `json:"duration_seconds"`
-	Width             int  `json:"width"`
-	Height            int  `json:"height"`
-	SupportsStreaming bool `json:"supports_streaming"`
+	DurationSeconds    int  `json:"duration_seconds"`
+	Width              int  `json:"width"`
+	Height             int  `json:"height"`
+	SupportsStreaming  bool `json:"supports_streaming"`
+	TruncatedMediaData bool `json:"truncated_media_data,omitempty"`
 }
 
 // Job is a snapshot of one file in an upload run. Path, Size and ModTime are

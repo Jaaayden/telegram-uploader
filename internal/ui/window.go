@@ -1101,6 +1101,14 @@ func jobFraction(job model.Job) float64 {
 }
 
 func jobStatus(job model.Job) string {
+	status := baseJobStatus(job)
+	if job.Metadata.TruncatedMediaData {
+		status = "⚠ 源 MP4 尾部结构不完整；不修复，原样传输 · " + status
+	}
+	return status
+}
+
+func baseJobStatus(job model.Job) string {
 	switch job.State {
 	case model.JobQueued:
 		return "等待上传"

@@ -1,7 +1,6 @@
 package media
 
 import (
-	"bytes"
 	"errors"
 	"os"
 	"path/filepath"
@@ -53,7 +52,7 @@ func TestParseMP4MetadataNoVideoTrack(t *testing.T) {
 	}
 }
 
-func TestParseMP4MetadataTruncatedMdat(t *testing.T) {
+func TestParseMP4MetadataMissingTailSampleAllowsOriginalUploadWithWarning(t *testing.T) {
 	path := writeFixture(t, newProgressiveFile(t, true, true))
 	contents, err := os.ReadFile(path)
 	if err != nil {
@@ -66,12 +65,29 @@ func TestParseMP4MetadataTruncatedMdat(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err = ParseMP4Metadata(path)
-	if !errors.Is(err, ErrInvalidMP4) {
-		t.Fatalf("ParseMP4Metadata() error = %v, want ErrInvalidMP4", err)
+	metadata, err := ParseMP4Metadata(path)
+	if err != nil {
+		t.Fatalf("ParseMP4Metadata() error = %v, want compatible upload metadata", err)
 	}
-	if err == nil || !bytes.Contains([]byte(err.Error()), []byte("损坏或已截断")) {
-		t.Fatalf("error = %v, want clear user-facing corruption error", err)
+	if !metadata.TruncatedMediaData {
+		t.Fatalf("TruncatedMediaData = false, want visible source warning")
+	}
+	if metadata.Width != 1920 || metadata.Height != 1080 || metadata.DurationSeconds != 3 {
+		t.Fatalf("metadata = %+v, want intact moov metadata", metadata)
+	}
+}
+
+func TestValidateMdatBoundsRejectsMissingHeader(t *testing.T) {
+	mdat := &mp4.MdatBox{StartPos: 100, Data: []byte{0, 1, 2, 3}}
+	_, _, _, err := validateMdatBounds([]mp4.Box{mdat}, 50)
+	if !errors.Is(err, ErrInvalidMP4) {
+		t.Fatalf("validateMdatBounds() error = %v, want ErrInvalidMP4", err)
+	}
+
+	mdat.StartPos = 46
+	_, _, _, err = validateMdatBounds([]mp4.Box{mdat}, 50)
+	if !errors.Is(err, ErrInvalidMP4) {
+		t.Fatalf("validateMdatBounds() partial-header error = %v, want ErrInvalidMP4", err)
 	}
 }
 
@@ -103,6 +119,8 @@ func newProgressiveFile(t *testing.T, fastStart, video bool) *mp4.File {
 	}
 	track.Mdia.Minf.Stbl.Stsz.SampleUniformSize = 4
 	track.Mdia.Minf.Stbl.Stsz.SampleNumber = 1
+	// Reserve one stco entry before calculating moov.Size; its value is filled
+	// after the final box order determines the mdat payload position.
 	track.Mdia.Minf.Stbl.Stco.ChunkOffset = []uint32{0}
 	if video {
 		track.Tkhd.Width = mp4.Fixed32(1920 << 16)
@@ -113,9 +131,13 @@ func newProgressiveFile(t *testing.T, fastStart, video bool) *mp4.File {
 	mdat := &mp4.MdatBox{Data: []byte{0x00, 0x01, 0x02, 0x03}}
 	file.AddChild(ftyp, 0)
 	if fastStart {
+		mdatStart := ftyp.Size() + moov.Size()
+		track.Mdia.Minf.Stbl.Stco.ChunkOffset = []uint32{uint32(mdatStart + mdat.HeaderSize())}
 		file.AddChild(moov, ftyp.Size())
-		file.AddChild(mdat, ftyp.Size()+moov.Size())
+		file.AddChild(mdat, mdatStart)
 	} else {
+		mdatStart := ftyp.Size()
+		track.Mdia.Minf.Stbl.Stco.ChunkOffset = []uint32{uint32(mdatStart + mdat.HeaderSize())}
 		file.AddChild(mdat, ftyp.Size())
 		file.AddChild(moov, ftyp.Size()+mdat.Size())
 	}

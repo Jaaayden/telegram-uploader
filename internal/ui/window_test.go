@@ -86,3 +86,16 @@ func TestFormatSummaryDoesNotReportHundredPercentAfterFailure(t *testing.T) {
 		t.Fatalf("formatSummary() = %q, want stable failed-file denominator", got)
 	}
 }
+
+func TestJobStatusShowsCompatibleTruncatedMP4Warning(t *testing.T) {
+	job := model.Job{
+		State:    model.JobUploading,
+		Size:     100,
+		Uploaded: 25,
+		Metadata: model.VideoMetadata{TruncatedMediaData: true},
+	}
+	got := jobStatus(job)
+	if !strings.Contains(got, "上传中") || !strings.Contains(got, "源 MP4 尾部结构不完整") || !strings.Contains(got, "原样传输") {
+		t.Fatalf("jobStatus() = %q, want upload state and visible compatibility warning", got)
+	}
+}
