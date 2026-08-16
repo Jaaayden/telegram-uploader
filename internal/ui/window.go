@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -25,6 +26,7 @@ import (
 	"github.com/jayden/telegram-video-uploader/internal/credentials"
 	"github.com/jayden/telegram-video-uploader/internal/model"
 	"github.com/jayden/telegram-video-uploader/internal/platform"
+	"github.com/jayden/telegram-video-uploader/internal/scanner"
 	tgtransport "github.com/jayden/telegram-video-uploader/internal/telegram"
 )
 
@@ -96,10 +98,17 @@ type window struct {
 	cancelAllButton    *widget.Button
 	moveButton         *widget.Button
 	cancelMoveButton   *widget.Button
+	selectAllButton    *widget.Button
+	selectNoneButton   *widget.Button
+	removeSelected     *widget.Button
+	removeCompleted    *widget.Button
+	clearQueueButton   *widget.Button
+	selectionLabel     *widget.Label
 	queueScroll        *container.Scroll
 	queueRows          *fyne.Container
 	jobRows            map[string]*jobRow
 	jobOrder           []string
+	selectedJobs       map[string]bool
 	progress           *widget.ProgressBar
 	progressSummary    *widget.Label
 	operationProgress  *widget.ProgressBar
@@ -163,6 +172,7 @@ func (u *window) build() {
 	queueTop := container.NewVBox(
 		widget.NewLabelWithStyle("上传队列", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
 		container.NewBorder(nil, nil, nil, u.chooseFolderButton, u.folderLabel),
+		container.NewHBox(u.selectAllButton, u.selectNoneButton, u.removeSelected, u.removeCompleted, u.clearQueueButton, u.selectionLabel),
 		container.NewHBox(u.startButton, u.cancelAllButton, u.moveButton, u.cancelMoveButton),
 		u.progress,
 		u.progressSummary,
@@ -203,12 +213,18 @@ func (u *window) buildFields() {
 	u.connectButton = widget.NewButton("连接 Telegram", u.connect)
 	u.bindButton = widget.NewButton("绑定频道", u.beginBinding)
 
-	u.chooseFolderButton = widget.NewButton("选择文件夹", u.chooseFolder)
-	u.folderLabel = widget.NewLabel("尚未选择文件夹")
+	u.chooseFolderButton = widget.NewButton("添加文件夹…", u.chooseFolder)
+	u.folderLabel = widget.NewLabel("尚未添加来源文件夹")
 	u.startButton = widget.NewButton("开始上传", u.startUploads)
 	u.cancelAllButton = widget.NewButton("取消全部", u.confirmCancelAll)
 	u.moveButton = widget.NewButton("移动全部超限文件", u.chooseMoveDestination)
 	u.cancelMoveButton = widget.NewButton("取消移动", u.cancelMove)
+	u.selectAllButton = widget.NewButton("全选", u.selectAllJobs)
+	u.selectNoneButton = widget.NewButton("取消选择", u.selectNoJobs)
+	u.removeSelected = widget.NewButton("删除所选", u.confirmRemoveSelected)
+	u.removeCompleted = widget.NewButton("删除已完成", u.confirmRemoveCompleted)
+	u.clearQueueButton = widget.NewButton("清空队列", u.confirmClearQueue)
+	u.selectionLabel = widget.NewLabel("已选择 0 项")
 	u.progress = widget.NewProgressBar()
 	u.progressSummary = widget.NewLabel("总进度：0 B / 0 B")
 	u.operationProgress = widget.NewProgressBar()
@@ -221,6 +237,11 @@ func (u *window) buildFields() {
 	u.startButton.Disable()
 	u.cancelAllButton.Disable()
 	u.moveButton.Disable()
+	u.selectAllButton.Disable()
+	u.selectNoneButton.Disable()
+	u.removeSelected.Disable()
+	u.removeCompleted.Disable()
+	u.clearQueueButton.Disable()
 	u.cancelMoveButton.Hide()
 }
 
@@ -228,40 +249,27 @@ func (u *window) buildQueue() {
 	u.queueRows = container.NewVBox()
 	u.queueScroll = container.NewVScroll(u.queueRows)
 	u.jobRows = make(map[string]*jobRow)
+	u.selectedJobs = make(map[string]bool)
 }
 
 func newJobRow() *jobRow {
+	selected := widget.NewCheck("", nil)
 	name := widget.NewLabelWithStyle("文件名", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
 	name.Truncation = fyne.TextTruncateEllipsis
-	details := widget.NewLabel("")
-	details.Truncation = fyne.TextTruncateEllipsis
 	status := widget.NewLabel("")
 	status.Truncation = fyne.TextTruncateEllipsis
 	progress := widget.NewProgressBar()
-	cancel := widget.NewButton("取消", nil)
-	retry := widget.NewButton("重试", nil)
-	skip := widget.NewButton("跳过", nil)
-	markSent := widget.NewButton("已发送", nil)
+	action := widget.NewButton("详情", nil)
 
-	cancel.Hide()
-	retry.Hide()
-	skip.Hide()
-	markSent.Hide()
-
-	actions := container.NewHBox(cancel, retry, skip, markSent)
-	body := container.NewVBox(name, details, progress, status)
-	content := container.NewBorder(nil, nil, nil, actions, body)
-	rowContainer := container.NewBorder(nil, widget.NewSeparator(), nil, nil, container.NewPadded(content))
+	body := container.NewGridWithColumns(3, name, progress, status)
+	rowContainer := container.NewBorder(nil, widget.NewSeparator(), selected, action, body)
 	return &jobRow{
 		Container: rowContainer,
+		selected:  selected,
 		name:      name,
-		details:   details,
 		status:    status,
 		progress:  progress,
-		cancel:    cancel,
-		retry:     retry,
-		skip:      skip,
-		markSent:  markSent,
+		action:    action,
 	}
 }
 
@@ -271,48 +279,63 @@ func newJobRow() *jobRow {
 // visible window.
 type jobRow struct {
 	*fyne.Container
+	selected *widget.Check
 	name     *widget.Label
-	details  *widget.Label
 	status   *widget.Label
 	progress *widget.ProgressBar
-	cancel   *widget.Button
-	retry    *widget.Button
-	skip     *widget.Button
-	markSent *widget.Button
+	action   *widget.Button
 }
 
 func (u *window) updateJobRow(row *jobRow, job model.Job) {
-	row.name.SetText(job.Name)
-	row.details.SetText(fmt.Sprintf("第 %d 个 · %s", job.Position+1, formatBytes(job.Size)))
-	row.status.SetText(jobStatus(job))
+	row.name.SetText(fmt.Sprintf("%d. %s", job.Position+1, job.Name))
+	row.status.SetText(compactJobStatus(job))
 	row.progress.SetValue(jobFraction(job))
 
-	row.cancel.Hide()
-	row.retry.Hide()
-	row.skip.Hide()
-	row.markSent.Hide()
 	jobID := job.ID
+	row.selected.OnChanged = nil
+	row.selected.SetChecked(u.selectedJobs[jobID])
+	row.selected.OnChanged = func(checked bool) {
+		if checked {
+			u.selectedJobs[jobID] = true
+		} else {
+			delete(u.selectedJobs, jobID)
+		}
+		u.updateSelectionControls()
+	}
+	if u.snapshot.Running || u.isMoveInFlight() {
+		row.selected.Disable()
+	} else {
+		row.selected.Enable()
+	}
+
+	row.action.Show()
+	row.action.SetText("详情")
+	row.action.OnTapped = func() { u.showJobDetails(jobID) }
 	switch job.State {
 	case model.JobQueued, model.JobInterrupted, model.JobUploading, model.JobSending:
-		row.cancel.Show()
-		row.cancel.OnTapped = func() { u.cancelJob(jobID) }
+		row.action.SetText("取消")
+		row.action.OnTapped = func() { u.cancelJob(jobID) }
 	case model.JobFailed, model.JobConfirming:
-		row.retry.Show()
-		row.retry.OnTapped = func() { u.retryJob(jobID) }
-		row.skip.Show()
-		row.skip.OnTapped = func() { u.skipJob(jobID) }
-		if job.State == model.JobConfirming {
-			row.markSent.Show()
-			row.markSent.OnTapped = func() { u.confirmMarkSent(jobID) }
-		}
+		row.action.SetText("处理…")
+		row.action.OnTapped = func() { u.showJobActions(jobID) }
 	case model.JobCancelled, model.JobSkipped:
-		row.retry.Show()
-		row.retry.OnTapped = func() { u.retryJob(jobID) }
+		row.action.SetText("重试")
+		row.action.OnTapped = func() { u.retryJob(jobID) }
 	}
 	row.Container.Refresh()
 }
 
 func (u *window) refreshQueueRows(jobs []model.Job) {
+	validIDs := make(map[string]struct{}, len(jobs))
+	for _, job := range jobs {
+		validIDs[job.ID] = struct{}{}
+	}
+	for id := range u.selectedJobs {
+		if _, exists := validIDs[id]; !exists {
+			delete(u.selectedJobs, id)
+		}
+	}
+
 	orderChanged := len(u.jobOrder) != len(jobs)
 	if !orderChanged {
 		for i, job := range jobs {
@@ -350,6 +373,7 @@ func (u *window) refreshQueueRows(jobs []model.Job) {
 		u.queueRows.Refresh()
 		u.queueScroll.Refresh()
 	}
+	u.updateSelectionControls()
 }
 
 func (u *window) applyLoadedSettings() {
@@ -360,7 +384,7 @@ func (u *window) applyLoadedSettings() {
 	u.proxyAddress.SetText(u.settings.ProxyAddress)
 	u.proxyUsername.SetText(u.settings.ProxyUsername)
 	if u.settings.LastFolder != "" {
-		u.folderLabel.SetText(u.settings.LastFolder)
+		u.folderLabel.SetText("最近来源：" + u.settings.LastFolder)
 	}
 
 	// Missing keyring entries are normal on first launch.  In particular, do
@@ -397,9 +421,6 @@ func (u *window) applySnapshot(snapshot coreapp.Snapshot) {
 		return
 	}
 	u.snapshot = snapshot
-	if snapshot.Folder != "" {
-		u.folderLabel.SetText(snapshot.Folder)
-	}
 	if snapshot.Channel.ID != 0 {
 		title := snapshot.Channel.Title
 		if title == "" {
@@ -432,7 +453,9 @@ func (u *window) updateActionAvailability() {
 		u.chooseFolderButton.Disable()
 		u.moveButton.Disable()
 		u.cancelAllButton.Disable()
+		u.disableQueueEditing()
 		u.cancelMoveButton.Show()
+		u.refreshQueueSelectionAvailability()
 		return
 	}
 	if u.snapshot.Running {
@@ -440,8 +463,13 @@ func (u *window) updateActionAvailability() {
 		u.chooseFolderButton.Disable()
 		u.moveButton.Disable()
 		u.cancelAllButton.Enable()
+		u.disableQueueEditing()
 	} else {
-		u.chooseFolderButton.Enable()
+		if u.scanInProgress() {
+			u.chooseFolderButton.Disable()
+		} else {
+			u.chooseFolderButton.Enable()
+		}
 		u.cancelAllButton.Disable()
 		if u.hasOversizeJobs() {
 			u.moveButton.Enable()
@@ -453,9 +481,64 @@ func (u *window) updateActionAvailability() {
 		} else {
 			u.startButton.Disable()
 		}
+		u.updateSelectionControls()
 	}
 	if !u.connected {
 		u.bindButton.Disable()
+	}
+	if u.scanInProgress() {
+		u.chooseFolderButton.Disable()
+		u.startButton.Disable()
+		u.moveButton.Disable()
+	}
+	u.refreshQueueSelectionAvailability()
+}
+
+func (u *window) disableQueueEditing() {
+	u.selectAllButton.Disable()
+	u.selectNoneButton.Disable()
+	u.removeSelected.Disable()
+	u.removeCompleted.Disable()
+	u.clearQueueButton.Disable()
+}
+
+func (u *window) updateSelectionControls() {
+	if u.selectionLabel == nil {
+		return
+	}
+	selected := len(u.selectedJobs)
+	u.selectionLabel.SetText(fmt.Sprintf("已选择 %d 项", selected))
+	if u.snapshot.Running || u.isMoveInFlight() {
+		u.disableQueueEditing()
+		return
+	}
+	if len(u.snapshot.Jobs) == 0 {
+		u.disableQueueEditing()
+		return
+	}
+	u.selectAllButton.Enable()
+	u.clearQueueButton.Enable()
+	if selected > 0 {
+		u.selectNoneButton.Enable()
+		u.removeSelected.Enable()
+	} else {
+		u.selectNoneButton.Disable()
+		u.removeSelected.Disable()
+	}
+	if hasCompletedJobs(u.snapshot.Jobs) {
+		u.removeCompleted.Enable()
+	} else {
+		u.removeCompleted.Disable()
+	}
+}
+
+func (u *window) refreshQueueSelectionAvailability() {
+	for _, row := range u.jobRows {
+		if u.snapshot.Running || u.isMoveInFlight() {
+			row.selected.Disable()
+		} else {
+			row.selected.Enable()
+		}
 	}
 }
 
@@ -489,15 +572,12 @@ func (u *window) connect() {
 }
 
 func (u *window) connectAsync(appID int, apiHash, botToken string, proxyEnabled bool, proxyAddress, proxyUsername, proxyPassword string) {
-	settings := u.settingsSnapshot()
-	settings.APIID = appID
-	settings.ProxyEnabled = proxyEnabled
-	settings.ProxyAddress = proxyAddress
-	settings.ProxyUsername = proxyUsername
-	u.settingsMu.Lock()
-	u.settings = settings
-	u.settingsMu.Unlock()
-	if err := coreapp.SaveSettings(u.paths.Settings, settings); err != nil {
+	if err := u.updateSettings(func(settings *coreapp.Settings) {
+		settings.APIID = appID
+		settings.ProxyEnabled = proxyEnabled
+		settings.ProxyAddress = proxyAddress
+		settings.ProxyUsername = proxyUsername
+	}); err != nil {
 		u.showError(err)
 		u.doUI(func() { u.connectButton.Enable(); u.connection.SetText("未连接") })
 		return
@@ -637,15 +717,11 @@ func (u *window) waitClientReady(client *tgtransport.Client, ctx context.Context
 		u.applySnapshot(u.controller.Snapshot())
 	})
 
-	// A folder selected before connection is already visible. Once Telegram
-	// reports the current limit, update only still-pending eligibility without
-	// replacing sent history or the persisted random IDs.
-	folder := u.settingsSnapshot().LastFolder
-	if folder != "" && !u.scanInProgress() {
-		snapshot := u.controller.Snapshot()
-		if snapshot.Folder == "" {
-			u.scanFolder(folder, identity.MaxUploadBytes)
-		} else if err := u.controller.ApplyUploadLimit(identity.MaxUploadBytes); err != nil {
+	// Queue entries may have been added while Telegram was disconnected. Apply
+	// the server limit in place; never rescan LastFolder because the durable
+	// queue can now contain selections from several different folders.
+	if len(u.controller.Snapshot().Jobs) > 0 {
+		if err := u.controller.ApplyUploadLimit(identity.MaxUploadBytes); err != nil {
 			u.showError(err)
 		}
 	}
@@ -725,6 +801,10 @@ func (u *window) beginBinding() {
 }
 
 func (u *window) chooseFolder() {
+	if u.snapshot.Running || u.isMoveInFlight() {
+		u.showError(errors.New("请先暂停或等待当前操作完成，再添加文件夹"))
+		return
+	}
 	dialog.ShowFolderOpen(func(uri fyne.ListableURI, err error) {
 		if err != nil {
 			u.showError(err)
@@ -742,15 +822,13 @@ func (u *window) chooseFolder() {
 			u.showError(errors.New("没有读取到有效的文件夹路径"))
 			return
 		}
-		u.settingsMu.Lock()
-		u.settings.LastFolder = folder
-		settings := u.settings
-		u.settingsMu.Unlock()
-		if err := coreapp.SaveSettings(u.paths.Settings, settings); err != nil {
+		if err := u.updateSettings(func(settings *coreapp.Settings) {
+			settings.LastFolder = folder
+		}); err != nil {
 			u.showError(err)
 			return
 		}
-		u.folderLabel.SetText(folder)
+		u.folderLabel.SetText("最近来源：" + folder)
 		maxBytes := int64(0)
 		if u.connected {
 			maxBytes = u.identity.MaxUploadBytes
@@ -764,34 +842,176 @@ func (u *window) scanFolder(folder string, maxBytes int64) {
 		return
 	}
 	u.doUI(func() {
-		u.chooseFolderButton.Disable()
+		u.updateActionAvailability()
 		u.operationLabel.SetText("正在扫描当前文件夹……")
 	})
 	go func() {
-		err := u.controller.Scan(folder, maxBytes)
+		candidates, err := scanner.Scan(folder, maxBytes)
 		u.endScan()
 		if err != nil {
 			u.showError(err)
 		}
 		u.doUI(func() {
-			u.chooseFolderButton.Enable()
+			u.updateActionAvailability()
 			if err == nil {
-				if maxBytes <= 0 && u.connected && u.identity.MaxUploadBytes > 0 {
-					limit := u.identity.MaxUploadBytes
-					u.operationLabel.SetText("扫描完成，正在应用 Bot 上传上限……")
-					go func() {
-						if limitErr := u.controller.ApplyUploadLimit(limit); limitErr != nil {
-							u.showError(limitErr)
-							return
-						}
-						u.doUI(func() { u.operationLabel.SetText("扫描完成") })
-					}()
+				if u.snapshot.Running || u.isMoveInFlight() {
+					u.operationLabel.SetText("扫描已完成；当前队列正在处理，请稍后重新添加")
 					return
 				}
-				u.operationLabel.SetText("扫描完成")
+				u.showCandidateDialog(folder, candidates)
 			}
 		})
 	}()
+}
+
+type candidateChoice struct {
+	job       model.Job
+	duplicate bool
+	selected  bool
+	check     *widget.Check
+}
+
+func newCandidateChoices(existing, candidates []model.Job) []candidateChoice {
+	existingPaths := make(map[string]struct{}, len(existing))
+	for _, job := range existing {
+		existingPaths[canonicalPathKey(job.Path)] = struct{}{}
+	}
+	choices := make([]candidateChoice, len(candidates))
+	for index, candidate := range candidates {
+		_, duplicate := existingPaths[canonicalPathKey(candidate.Path)]
+		choices[index] = candidateChoice{
+			job:       candidate,
+			duplicate: duplicate,
+			selected:  !duplicate,
+		}
+	}
+	return choices
+}
+
+func (u *window) showCandidateDialog(folder string, candidates []model.Job) {
+	if len(candidates) == 0 {
+		u.operationLabel.SetText("当前文件夹没有可添加的 MP4 文件")
+		dialog.ShowInformation("没有候选视频", "当前文件夹顶层没有找到 MP4 文件。", u.window)
+		return
+	}
+
+	choices := newCandidateChoices(u.snapshot.Jobs, candidates)
+	rows := make([]fyne.CanvasObject, 0, len(candidates))
+	selectedLabel := widget.NewLabel("")
+	var addButton *widget.Button
+	refreshCount := func() {
+		selected := 0
+		duplicates := 0
+		for i := range choices {
+			if choices[i].selected {
+				selected++
+			}
+			if choices[i].duplicate {
+				duplicates++
+			}
+		}
+		selectedLabel.SetText(fmt.Sprintf("已选择 %d / %d 个；%d 个已在队列", selected, len(choices), duplicates))
+		if addButton != nil {
+			if selected > 0 {
+				addButton.Enable()
+			} else {
+				addButton.Disable()
+			}
+		}
+	}
+
+	for index := range candidates {
+		choice := &choices[index]
+		choice.check = widget.NewCheck("", nil)
+		choice.check.SetChecked(choice.selected)
+		choice.check.OnChanged = func(checked bool) {
+			choice.selected = checked
+			refreshCount()
+		}
+		if choice.duplicate {
+			choice.check.Disable()
+		}
+		name := widget.NewLabel(choice.job.Name)
+		name.Truncation = fyne.TextTruncateEllipsis
+		state := formatBytes(choice.job.Size)
+		switch {
+		case choice.duplicate:
+			state += " · 已在队列"
+		case choice.job.State == model.JobOversize:
+			state += " · 超出当前上传上限"
+		default:
+			state += " · 可添加"
+		}
+		status := widget.NewLabel(state)
+		rows = append(rows, container.NewBorder(nil, widget.NewSeparator(), choice.check, status, name))
+	}
+
+	list := container.NewVBox(rows...)
+	scroll := container.NewVScroll(list)
+	scroll.SetMinSize(fyne.NewSize(760, 360))
+	content := container.NewBorder(
+		container.NewVBox(
+			widget.NewLabel("选择要加入队列的视频。可以稍后继续从其他文件夹追加。"),
+			selectedLabel,
+		),
+		nil,
+		nil,
+		nil,
+		scroll,
+	)
+
+	var candidateDialog *dialog.CustomDialog
+	selectAll := widget.NewButton("全选可添加项", func() {
+		for i := range choices {
+			if choices[i].duplicate {
+				continue
+			}
+			choices[i].check.SetChecked(true)
+		}
+		refreshCount()
+	})
+	selectNone := widget.NewButton("取消全选", func() {
+		for i := range choices {
+			if choices[i].duplicate {
+				continue
+			}
+			choices[i].check.SetChecked(false)
+		}
+		refreshCount()
+	})
+	addButton = widget.NewButton("添加所选", func() {
+		selected := make([]model.Job, 0, len(choices))
+		for i := range choices {
+			if choices[i].selected && !choices[i].duplicate {
+				selected = append(selected, choices[i].job)
+			}
+		}
+		if len(selected) == 0 {
+			return
+		}
+		if err := u.controller.AddJobs(selected); err != nil {
+			u.showError(err)
+			return
+		}
+		if u.connected && u.identity.MaxUploadBytes > 0 {
+			if err := u.controller.ApplyUploadLimit(u.identity.MaxUploadBytes); err != nil {
+				u.showError(err)
+			}
+		}
+		candidateDialog.Dismiss()
+		u.operationLabel.SetText(fmt.Sprintf("已从当前文件夹添加 %d 个视频", len(selected)))
+	})
+	candidateDialog = dialog.NewCustom("添加到上传队列", "取消", content, u.window)
+	candidateDialog.SetButtons([]fyne.CanvasObject{
+		selectAll,
+		selectNone,
+		widget.NewButton("取消", func() { candidateDialog.Dismiss() }),
+		addButton,
+	})
+	candidateDialog.Resize(fyne.NewSize(820, 520))
+	refreshCount()
+	u.operationLabel.SetText(fmt.Sprintf("扫描完成：找到 %d 个 MP4 文件", len(candidates)))
+	candidateDialog.Show()
 }
 
 func (u *window) beginScan() bool {
@@ -816,12 +1036,97 @@ func (u *window) scanInProgress() bool {
 	return u.scanning
 }
 
+func (u *window) selectAllJobs() {
+	if u.snapshot.Running || u.isMoveInFlight() {
+		return
+	}
+	for _, job := range u.snapshot.Jobs {
+		u.selectedJobs[job.ID] = true
+	}
+	u.refreshQueueRows(u.snapshot.Jobs)
+}
+
+func (u *window) selectNoJobs() {
+	if u.snapshot.Running || u.isMoveInFlight() {
+		return
+	}
+	clear(u.selectedJobs)
+	u.refreshQueueRows(u.snapshot.Jobs)
+}
+
+func (u *window) selectedJobIDs() []string {
+	ids := make([]string, 0, len(u.selectedJobs))
+	for _, job := range u.snapshot.Jobs {
+		if u.selectedJobs[job.ID] {
+			ids = append(ids, job.ID)
+		}
+	}
+	return ids
+}
+
+func (u *window) confirmRemoveSelected() {
+	ids := u.selectedJobIDs()
+	if len(ids) == 0 {
+		return
+	}
+	message := fmt.Sprintf("从本地队列删除所选的 %d 个条目？\n\n不会删除磁盘上的视频，也不会删除 Telegram 中已经发送的消息。", len(ids))
+	dialog.ShowConfirm("删除所选条目", message, func(ok bool) {
+		if !ok {
+			return
+		}
+		if err := u.controller.RemoveJobs(ids); err != nil {
+			u.showError(err)
+			return
+		}
+		for _, id := range ids {
+			delete(u.selectedJobs, id)
+		}
+		u.operationLabel.SetText(fmt.Sprintf("已从本地队列删除 %d 个条目", len(ids)))
+	}, u.window)
+}
+
+func (u *window) confirmRemoveCompleted() {
+	count := completedJobCount(u.snapshot.Jobs)
+	if count == 0 {
+		return
+	}
+	message := fmt.Sprintf("从本地队列删除 %d 个已发送或已移动的条目？\n\nTelegram 消息和磁盘文件都不会被删除。", count)
+	dialog.ShowConfirm("删除已完成条目", message, func(ok bool) {
+		if !ok {
+			return
+		}
+		if err := u.controller.RemoveCompleted(); err != nil {
+			u.showError(err)
+			return
+		}
+		u.operationLabel.SetText(fmt.Sprintf("已删除 %d 个已完成条目", count))
+	}, u.window)
+}
+
+func (u *window) confirmClearQueue() {
+	if len(u.snapshot.Jobs) == 0 {
+		return
+	}
+	message := fmt.Sprintf("清空本地队列中的全部 %d 个条目？\n\n此操作不会删除磁盘文件或 Telegram 消息。", len(u.snapshot.Jobs))
+	dialog.ShowConfirm("清空队列", message, func(ok bool) {
+		if !ok {
+			return
+		}
+		if err := u.controller.ClearQueue(); err != nil {
+			u.showError(err)
+			return
+		}
+		clear(u.selectedJobs)
+		u.operationLabel.SetText("本地上传队列已清空")
+	}, u.window)
+}
+
 func (u *window) startUploads() {
 	if err := u.controller.Start(u.rootCtx); err != nil {
 		u.showError(err)
 		return
 	}
-	status := "上传已开始；文件会按自然文件名顺序逐条发送"
+	status := "上传已开始；文件会按队列顺序逐条发送"
 	if guard, err := platform.PreventSleep(); err != nil {
 		status += "；无法阻止系统休眠：" + err.Error()
 	} else {
@@ -852,6 +1157,81 @@ func (u *window) cancelJob(id string) {
 	if err := u.controller.CancelJob(id); err != nil {
 		u.showError(err)
 	}
+}
+
+func (u *window) jobByID(id string) (model.Job, bool) {
+	for _, job := range u.snapshot.Jobs {
+		if job.ID == id {
+			return job, true
+		}
+	}
+	return model.Job{}, false
+}
+
+func (u *window) jobDetailsContent(job model.Job) fyne.CanvasObject {
+	path := widget.NewLabel(job.Path)
+	path.Wrapping = fyne.TextWrapWord
+	status := widget.NewLabel(jobStatus(job))
+	status.Wrapping = fyne.TextWrapWord
+	items := []fyne.CanvasObject{
+		widget.NewLabelWithStyle(job.Name, fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		widget.NewLabel(fmt.Sprintf("队列位置：%d · 文件大小：%s", job.Position+1, formatBytes(job.Size))),
+		status,
+		widget.NewSeparator(),
+		widget.NewLabelWithStyle("文件路径", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		path,
+	}
+	if job.MessageID != 0 {
+		items = append(items, widget.NewLabel(fmt.Sprintf("Telegram Message ID：%d", job.MessageID)))
+	}
+	return container.NewVBox(items...)
+}
+
+func (u *window) showJobDetails(id string) {
+	job, ok := u.jobByID(id)
+	if !ok {
+		return
+	}
+	var detailsDialog *dialog.CustomDialog
+	detailsDialog = dialog.NewCustom("队列条目详情", "关闭", u.jobDetailsContent(job), u.window)
+	detailsDialog.SetButtons([]fyne.CanvasObject{
+		widget.NewButton("复制路径", func() { u.application.Clipboard().SetContent(job.Path) }),
+		widget.NewButton("关闭", func() { detailsDialog.Dismiss() }),
+	})
+	detailsDialog.Resize(fyne.NewSize(680, 320))
+	detailsDialog.Show()
+}
+
+func (u *window) showJobActions(id string) {
+	job, ok := u.jobByID(id)
+	if !ok {
+		return
+	}
+	var actionsDialog *dialog.CustomDialog
+	actions := []fyne.CanvasObject{
+		widget.NewButton("复制路径", func() { u.application.Clipboard().SetContent(job.Path) }),
+	}
+	if job.State == model.JobFailed || job.State == model.JobConfirming {
+		actions = append(actions, widget.NewButton("重试", func() {
+			actionsDialog.Dismiss()
+			u.retryJob(id)
+		}))
+		actions = append(actions, widget.NewButton("跳过", func() {
+			actionsDialog.Dismiss()
+			u.skipJob(id)
+		}))
+	}
+	if job.State == model.JobConfirming {
+		actions = append(actions, widget.NewButton("已在频道看到", func() {
+			actionsDialog.Dismiss()
+			u.confirmMarkSent(id)
+		}))
+	}
+	actions = append(actions, widget.NewButton("关闭", func() { actionsDialog.Dismiss() }))
+	actionsDialog = dialog.NewCustom("处理队列条目", "关闭", u.jobDetailsContent(job), u.window)
+	actionsDialog.SetButtons(actions)
+	actionsDialog.Resize(fyne.NewSize(720, 360))
+	actionsDialog.Show()
 }
 
 func (u *window) retryJob(id string) {
@@ -916,7 +1296,7 @@ func (u *window) chooseMoveDestination() {
 		u.moveCancel = cancel
 		u.moveLastUI = time.Time{}
 		u.moveMu.Unlock()
-		u.moveButton.Disable()
+		u.updateActionAvailability()
 		u.cancelMoveButton.Show()
 		u.operationProgress.Show()
 		u.operationLabel.Show()
@@ -1031,6 +1411,18 @@ func (u *window) settingsSnapshot() coreapp.Settings {
 	return u.settings
 }
 
+func (u *window) updateSettings(update func(*coreapp.Settings)) error {
+	u.settingsMu.Lock()
+	defer u.settingsMu.Unlock()
+	next := u.settings
+	update(&next)
+	if err := coreapp.SaveSettings(u.paths.Settings, next); err != nil {
+		return err
+	}
+	u.settings = next
+	return nil
+}
+
 func (u *window) currentClient() *tgtransport.Client {
 	u.clientMu.RLock()
 	defer u.clientMu.RUnlock()
@@ -1074,6 +1466,35 @@ func hasRunnableJobs(jobs []model.Job) bool {
 	return false
 }
 
+func completedJobCount(jobs []model.Job) int {
+	count := 0
+	for _, job := range jobs {
+		if job.State == model.JobSent || job.State == model.JobMoved {
+			count++
+		}
+	}
+	return count
+}
+
+func hasCompletedJobs(jobs []model.Job) bool {
+	return completedJobCount(jobs) > 0
+}
+
+func canonicalPathKey(path string) string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return ""
+	}
+	if absolute, err := filepath.Abs(path); err == nil {
+		path = absolute
+	}
+	path = filepath.Clean(path)
+	if runtime.GOOS == "windows" {
+		path = strings.ToLower(path)
+	}
+	return path
+}
+
 func (u *window) hasOversizeJobs() bool {
 	for _, job := range u.snapshot.Jobs {
 		if job.State == model.JobOversize {
@@ -1098,6 +1519,41 @@ func jobFraction(job model.Job) float64 {
 		return 1
 	}
 	return fraction
+}
+
+func compactJobStatus(job model.Job) string {
+	prefix := ""
+	if job.Metadata.TruncatedMediaData {
+		prefix = "⚠ "
+	}
+	switch job.State {
+	case model.JobQueued:
+		return prefix + "等待 · " + formatBytes(job.Size)
+	case model.JobOversize:
+		return prefix + "超过上限 · " + formatBytes(job.Size)
+	case model.JobUploading:
+		return prefix + fmt.Sprintf("上传中 · %s/s", formatBytes(int64(job.BytesPerSecond)))
+	case model.JobSending:
+		return prefix + "正在提交频道消息…"
+	case model.JobConfirming:
+		return prefix + "待确认 · 点击处理"
+	case model.JobSent:
+		return prefix + "已发送 · " + formatBytes(job.Size)
+	case model.JobCancelled:
+		return prefix + "已取消"
+	case model.JobFailed:
+		return prefix + "失败 · 点击处理"
+	case model.JobSkipped:
+		return prefix + "已跳过"
+	case model.JobMoved:
+		return prefix + "已移动 · " + formatBytes(job.Size)
+	case model.JobMoving:
+		return prefix + "正在移动…"
+	case model.JobInterrupted:
+		return prefix + "上次中断 · 可重试"
+	default:
+		return prefix + string(job.State)
+	}
 }
 
 func jobStatus(job model.Job) string {
