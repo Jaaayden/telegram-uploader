@@ -109,6 +109,7 @@ type window struct {
 	cancelMoveButton   *widget.Button
 	selectAllButton    *widget.Button
 	selectNoneButton   *widget.Button
+	resetJobsButton    *widget.Button
 	removeSelected     *widget.Button
 	removeCompleted    *widget.Button
 	clearQueueButton   *widget.Button
@@ -191,7 +192,7 @@ func (u *window) build() {
 	queueTop := container.NewVBox(
 		widget.NewLabelWithStyle("上传队列", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
 		container.NewBorder(nil, nil, nil, u.chooseFolderButton, u.folderLabel),
-		container.NewHBox(u.selectAllButton, u.selectNoneButton, u.removeSelected, u.removeCompleted, u.clearQueueButton, u.selectionLabel),
+		container.NewHBox(u.selectAllButton, u.selectNoneButton, u.resetJobsButton, u.removeSelected, u.removeCompleted, u.clearQueueButton, u.selectionLabel),
 		container.NewHBox(u.startButton, u.pauseButton, u.scheduleButton, u.cancelSchedule, u.cancelAllButton, u.moveButton, u.cancelMoveButton),
 		u.scheduleLabel,
 		u.progress,
@@ -245,6 +246,7 @@ func (u *window) buildFields() {
 	u.cancelMoveButton = widget.NewButton("取消移动", u.cancelMove)
 	u.selectAllButton = widget.NewButton("全选", u.selectAllJobs)
 	u.selectNoneButton = widget.NewButton("取消选择", u.selectNoJobs)
+	u.resetJobsButton = widget.NewButton("重置任务…", u.showResetJobsDialog)
 	u.removeSelected = widget.NewButton("删除所选", u.confirmRemoveSelected)
 	u.removeCompleted = widget.NewButton("删除已完成", u.confirmRemoveCompleted)
 	u.clearQueueButton = widget.NewButton("清空队列", u.confirmClearQueue)
@@ -266,6 +268,7 @@ func (u *window) buildFields() {
 	u.moveButton.Disable()
 	u.selectAllButton.Disable()
 	u.selectNoneButton.Disable()
+	u.resetJobsButton.Disable()
 	u.removeSelected.Disable()
 	u.removeCompleted.Disable()
 	u.clearQueueButton.Disable()
@@ -567,6 +570,7 @@ func (u *window) updateScheduleControls() {
 func (u *window) disableQueueEditing() {
 	u.selectAllButton.Disable()
 	u.selectNoneButton.Disable()
+	u.resetJobsButton.Disable()
 	u.removeSelected.Disable()
 	u.removeCompleted.Disable()
 	u.clearQueueButton.Disable()
@@ -578,7 +582,7 @@ func (u *window) updateSelectionControls() {
 	}
 	selected := len(u.selectedJobs)
 	u.selectionLabel.SetText(fmt.Sprintf("已选择 %d 项", selected))
-	if u.snapshot.Running || u.isMoveInFlight() {
+	if u.snapshot.Running || u.isMoveInFlight() || u.scanInProgress() {
 		u.disableQueueEditing()
 		return
 	}
@@ -588,6 +592,11 @@ func (u *window) updateSelectionControls() {
 	}
 	u.selectAllButton.Enable()
 	u.clearQueueButton.Enable()
+	if resetJobCountsFor(u.snapshot.Jobs, u.selectedJobs).All > 0 {
+		u.resetJobsButton.Enable()
+	} else {
+		u.resetJobsButton.Disable()
+	}
 	if selected > 0 {
 		u.selectNoneButton.Enable()
 		u.removeSelected.Enable()
@@ -604,7 +613,7 @@ func (u *window) updateSelectionControls() {
 
 func (u *window) refreshQueueSelectionAvailability() {
 	for _, row := range u.jobRows {
-		if u.snapshot.Running || u.isMoveInFlight() {
+		if u.snapshot.Running || u.isMoveInFlight() || u.scanInProgress() {
 			row.selected.Disable()
 		} else {
 			row.selected.Enable()
@@ -1232,6 +1241,57 @@ func (u *window) confirmRemoveSelected() {
 	}, u.window)
 }
 
+func (u *window) showResetJobsDialog() {
+	if u.snapshot.Running || u.isMoveInFlight() || u.scanInProgress() {
+		return
+	}
+	counts := resetJobCountsFor(u.snapshot.Jobs, u.selectedJobs)
+	if counts.All == 0 {
+		return
+	}
+	selectedIDs := u.selectedJobIDs()
+
+	var resetDialog *dialog.CustomDialog
+	makeAction := func(label string, count int, mode coreapp.ResetMode, ids []string) fyne.CanvasObject {
+		button := widget.NewButton(fmt.Sprintf("%s（%d）", label, count), func() {
+			resetDialog.Dismiss()
+			u.resetJobs(mode, ids, label)
+		})
+		if count == 0 {
+			button.Disable()
+		}
+		return button
+	}
+
+	note := widget.NewLabel("重置会把任务恢复为“待上传”，不会立即开始上传，也不需要重新扫描文件夹。为避免重复消息，待确认、已发送、已移动和超限任务不会被批量重置。")
+	note.Wrapping = fyne.TextWrapWord
+	content := container.NewVBox(
+		note,
+		widget.NewSeparator(),
+		makeAction("重置所选任务", counts.Selected, coreapp.ResetSelected, selectedIDs),
+		makeAction("重置已取消任务", counts.Cancelled, coreapp.ResetCancelled, nil),
+		makeAction("重置失败或中断任务", counts.Failed, coreapp.ResetFailed, nil),
+		makeAction("重置已跳过任务", counts.Skipped, coreapp.ResetSkipped, nil),
+		makeAction("重置全部可恢复任务", counts.All, coreapp.ResetAllRecoverable, nil),
+	)
+	resetDialog = dialog.NewCustom("重置队列任务", "关闭", content, u.window)
+	resetDialog.Resize(fyne.NewSize(560, 420))
+	resetDialog.Show()
+}
+
+func (u *window) resetJobs(mode coreapp.ResetMode, ids []string, label string) {
+	count, err := u.controller.ResetJobs(mode, ids)
+	if err != nil {
+		u.showError(err)
+		return
+	}
+	if count == 0 {
+		u.operationLabel.SetText("没有符合条件的可恢复任务")
+		return
+	}
+	u.operationLabel.SetText(fmt.Sprintf("%s：已恢复 %d 个任务，可直接开始或继续上传", label, count))
+}
+
 func (u *window) confirmRemoveCompleted() {
 	count := completedJobCount(u.snapshot.Jobs)
 	if count == 0 {
@@ -1578,7 +1638,7 @@ func (u *window) confirmCancelAll() {
 				u.showError(err)
 				return
 			}
-			u.operationLabel.SetText("已立即取消全部上传（已覆盖暂停状态）")
+			u.operationLabel.SetText("已立即取消全部上传；如需恢复，可使用“重置任务…”")
 		}
 	}, u.window)
 }
@@ -1926,6 +1986,39 @@ func completedJobCount(jobs []model.Job) int {
 
 func hasCompletedJobs(jobs []model.Job) bool {
 	return completedJobCount(jobs) > 0
+}
+
+type resetJobCounts struct {
+	Selected  int
+	Cancelled int
+	Failed    int
+	Skipped   int
+	All       int
+}
+
+func resetJobCountsFor(jobs []model.Job, selected map[string]bool) resetJobCounts {
+	var counts resetJobCounts
+	for _, job := range jobs {
+		resettable := true
+		switch job.State {
+		case model.JobCancelled:
+			counts.Cancelled++
+		case model.JobFailed, model.JobInterrupted:
+			counts.Failed++
+		case model.JobSkipped:
+			counts.Skipped++
+		default:
+			resettable = false
+		}
+		if !resettable {
+			continue
+		}
+		counts.All++
+		if selected[job.ID] {
+			counts.Selected++
+		}
+	}
+	return counts
 }
 
 func canonicalPathKey(path string) string {

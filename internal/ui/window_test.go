@@ -146,6 +146,53 @@ func TestQueueSelectionUsesJobIDsAndPrunesRemovedRows(t *testing.T) {
 	}
 }
 
+func TestResetJobCountsIncludeOnlySafeRecoverableStates(t *testing.T) {
+	jobs := []model.Job{
+		{ID: "cancelled", State: model.JobCancelled},
+		{ID: "failed", State: model.JobFailed},
+		{ID: "interrupted", State: model.JobInterrupted},
+		{ID: "skipped", State: model.JobSkipped},
+		{ID: "confirming", State: model.JobConfirming},
+		{ID: "sent", State: model.JobSent},
+		{ID: "moved", State: model.JobMoved},
+		{ID: "oversize", State: model.JobOversize},
+		{ID: "queued", State: model.JobQueued},
+	}
+	counts := resetJobCountsFor(jobs, map[string]bool{
+		"cancelled": true,
+		"sent":      true,
+	})
+	if counts.Cancelled != 1 || counts.Failed != 2 || counts.Skipped != 1 || counts.All != 4 || counts.Selected != 1 {
+		t.Fatalf("reset counts = %+v, want cancelled=1 failed=2 skipped=1 all=4 selected=1", counts)
+	}
+}
+
+func TestResetControlRequiresIdleRecoverableJobs(t *testing.T) {
+	application := test.NewApp()
+	defer application.Quit()
+
+	u := &window{}
+	u.buildFields()
+	u.buildQueue()
+	u.snapshot = coreapp.Snapshot{Jobs: []model.Job{{ID: "cancelled", State: model.JobCancelled}}}
+	u.updateActionAvailability()
+	if u.resetJobsButton.Disabled() {
+		t.Fatal("reset button disabled for an idle cancelled task")
+	}
+
+	u.snapshot.Running = true
+	u.updateActionAvailability()
+	if !u.resetJobsButton.Disabled() {
+		t.Fatal("reset button enabled while the queue is running")
+	}
+
+	u.snapshot = coreapp.Snapshot{Jobs: []model.Job{{ID: "sent", State: model.JobSent}}}
+	u.updateActionAvailability()
+	if !u.resetJobsButton.Disabled() {
+		t.Fatal("reset button enabled when the queue only contains completed tasks")
+	}
+}
+
 func TestCompactRowRebindsSingleActionAcrossStates(t *testing.T) {
 	application := test.NewApp()
 	defer application.Quit()

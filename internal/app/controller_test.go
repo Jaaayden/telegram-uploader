@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -62,8 +64,8 @@ func TestControllerUploadsSeriallyWithExactRequestAndProgress(t *testing.T) {
 		if call.Name != jobs[i].Name {
 			t.Errorf("call %d Name = %q, want %q", i, call.Name, jobs[i].Name)
 		}
-		if call.Caption != jobs[i].Name {
-			t.Errorf("call %d Caption = %q, want exact filename %q", i, call.Caption, jobs[i].Name)
+		if want := strings.TrimSuffix(jobs[i].Name, filepath.Ext(jobs[i].Name)); call.Caption != want {
+			t.Errorf("call %d Caption = %q, want filename without extension %q", i, call.Caption, want)
 		}
 		if call.RandomID != jobs[i].RandomID {
 			t.Errorf("call %d RandomID = %d, want %d", i, call.RandomID, jobs[i].RandomID)
@@ -92,6 +94,21 @@ func TestControllerUploadsSeriallyWithExactRequestAndProgress(t *testing.T) {
 		}
 		if job.ChannelID != channel.ID {
 			t.Errorf("job %d ChannelID = %d, want %d", i, job.ChannelID, channel.ID)
+		}
+	}
+}
+
+func TestCaptionFromFilenameRemovesOnlyMP4Suffix(t *testing.T) {
+	tests := map[string]string{
+		"episode.01.mp4": "episode.01",
+		"video.MP4":      "video",
+		"trailer.mov":    "trailer.mov",
+		"no-extension":   "no-extension",
+		".mp4":           "",
+	}
+	for name, want := range tests {
+		if got := captionFromFilename(name); got != want {
+			t.Errorf("captionFromFilename(%q) = %q, want %q", name, got, want)
 		}
 	}
 }
@@ -513,6 +530,115 @@ func TestControllerQueueRemovalOperationsReindexAndPersist(t *testing.T) {
 	}
 }
 
+func TestControllerResetJobsByModePreservesSafeHistory(t *testing.T) {
+	jobs, _ := fixtureJobs(t, []fixtureJob{
+		{Name: "queued.mp4", RandomID: 8251, State: model.JobQueued},
+		{Name: "cancelled.mp4", RandomID: 8252, State: model.JobCancelled},
+		{Name: "failed.mp4", RandomID: 8253, State: model.JobFailed},
+		{Name: "interrupted.mp4", RandomID: 8254, State: model.JobInterrupted},
+		{Name: "skipped.mp4", RandomID: 8255, State: model.JobSkipped},
+		{Name: "confirming.mp4", RandomID: 8256, State: model.JobConfirming},
+		{Name: "sent.mp4", RandomID: 8257, State: model.JobSent},
+		{Name: "moved.mp4", RandomID: 8258, State: model.JobMoved},
+		{Name: "oversize.mp4", RandomID: 8259, State: model.JobOversize},
+	})
+	now := time.Now()
+	for i := 1; i <= 4; i++ {
+		jobs[i].Uploaded = 3
+		jobs[i].BytesPerSecond = 9
+		jobs[i].MessageID = 42
+		jobs[i].ChannelID = -10042
+		jobs[i].Metadata = model.VideoMetadata{Width: 1920, Height: 1080}
+		jobs[i].Error = "old state"
+		jobs[i].StartedAt = &now
+		jobs[i].CompletedAt = &now
+		jobs[i].MoveDestination = "/tmp/old.mp4"
+	}
+
+	tests := []struct {
+		name      string
+		mode      ResetMode
+		ids       []string
+		wantReset map[int]bool
+		wantCount int
+	}{
+		{name: "selected", mode: ResetSelected, ids: []string{jobs[1].ID, jobs[6].ID}, wantReset: map[int]bool{1: true}, wantCount: 1},
+		{name: "cancelled", mode: ResetCancelled, wantReset: map[int]bool{1: true}, wantCount: 1},
+		{name: "failed and interrupted", mode: ResetFailed, wantReset: map[int]bool{2: true, 3: true}, wantCount: 2},
+		{name: "skipped", mode: ResetSkipped, wantReset: map[int]bool{4: true}, wantCount: 1},
+		{name: "all recoverable", mode: ResetAllRecoverable, wantReset: map[int]bool{1: true, 2: true, 3: true, 4: true}, wantCount: 4},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := &memoryQueueStore{jobs: cloneJobs(jobs), channel: testChannel(), paused: true}
+			controller := newLoadedController(t, store, &fakeGateway{})
+			count, err := controller.ResetJobs(test.mode, test.ids)
+			if err != nil {
+				t.Fatalf("ResetJobs() error = %v", err)
+			}
+			if count != test.wantCount {
+				t.Fatalf("ResetJobs() count = %d, want %d", count, test.wantCount)
+			}
+
+			got := controller.Snapshot()
+			if !got.Paused {
+				t.Fatal("ResetJobs() cleared the durable pause state")
+			}
+			for i := range got.Jobs {
+				if got.Jobs[i].ID != jobs[i].ID || got.Jobs[i].RandomID != jobs[i].RandomID || got.Jobs[i].Path != jobs[i].Path || got.Jobs[i].Position != jobs[i].Position {
+					t.Errorf("job %d identity changed: got %+v, want %+v", i, got.Jobs[i], jobs[i])
+				}
+				if !test.wantReset[i] {
+					if !reflect.DeepEqual(got.Jobs[i], jobs[i]) {
+						t.Errorf("non-target job %d changed: got %+v, want %+v", i, got.Jobs[i], jobs[i])
+					}
+					continue
+				}
+				reset := got.Jobs[i]
+				if reset.State != model.JobQueued || reset.Uploaded != 0 || reset.BytesPerSecond != 0 || reset.MessageID != 0 || reset.ChannelID != 0 || reset.Metadata != (model.VideoMetadata{}) || reset.Error != "" || reset.StartedAt != nil || reset.CompletedAt != nil || reset.MoveDestination != "" {
+					t.Errorf("reset job %d retained transient state: %+v", i, reset)
+				}
+			}
+			if saved := store.SnapshotJobs(); !reflect.DeepEqual(saved, got.Jobs) {
+				t.Fatalf("persisted reset queue = %+v, want %+v", saved, got.Jobs)
+			}
+		})
+	}
+}
+
+func TestControllerCancelAllCanBeResetAndUploadedWithoutRescanning(t *testing.T) {
+	jobs, _ := fixtureJobs(t, []fixtureJob{
+		{Name: "first.mp4", RandomID: 8271},
+		{Name: "second.mp4", RandomID: 8272},
+	})
+	store := &memoryQueueStore{jobs: jobs, channel: testChannel()}
+	gateway := &fakeGateway{}
+	controller := newLoadedController(t, store, gateway)
+
+	if err := controller.CancelAll(); err != nil {
+		t.Fatalf("CancelAll() error = %v", err)
+	}
+	if !allJobsState(controller.Snapshot().Jobs, model.JobCancelled) {
+		t.Fatalf("jobs after CancelAll() = %+v, want cancelled", controller.Snapshot().Jobs)
+	}
+	count, err := controller.ResetJobs(ResetCancelled, nil)
+	if err != nil {
+		t.Fatalf("ResetJobs() error = %v", err)
+	}
+	if count != len(jobs) || !allJobsState(controller.Snapshot().Jobs, model.JobQueued) {
+		t.Fatalf("jobs after reset = %+v, count %d; want %d queued jobs", controller.Snapshot().Jobs, count, len(jobs))
+	}
+	if err := controller.Start(context.Background()); err != nil {
+		t.Fatalf("Start() after reset error = %v", err)
+	}
+	final := waitForSnapshot(t, controller, func(snapshot Snapshot) bool {
+		return !snapshot.Running && allJobsState(snapshot.Jobs, model.JobSent)
+	})
+	if len(final.Jobs) != len(jobs) || len(gateway.Calls()) != len(jobs) {
+		t.Fatalf("upload after reset = %d jobs, %d calls; want %d", len(final.Jobs), len(gateway.Calls()), len(jobs))
+	}
+}
+
 func TestControllerQueueRemovalRequiresIdleQueue(t *testing.T) {
 	jobs, _ := fixtureJobs(t, []fixtureJob{{Name: "active.mp4", RandomID: 8301}})
 	store := &memoryQueueStore{jobs: jobs, channel: testChannel()}
@@ -541,6 +667,9 @@ func TestControllerQueueRemovalRequiresIdleQueue(t *testing.T) {
 	if err := controller.ClearQueue(); err == nil {
 		t.Fatal("ClearQueue() error = nil while queue is running")
 	}
+	if _, err := controller.ResetJobs(ResetSelected, []string{jobs[0].ID}); err == nil {
+		t.Fatal("ResetJobs() error = nil while queue is running")
+	}
 	if err := controller.CancelAll(); err != nil {
 		t.Fatalf("CancelAll() error = %v", err)
 	}
@@ -551,6 +680,7 @@ func TestControllerQueueMutationsPublishOnlyAfterPersistenceSucceeds(t *testing.
 	jobs, _ := fixtureJobs(t, []fixtureJob{
 		{Name: "sent.mp4", RandomID: 8401, State: model.JobSent, Uploaded: 4},
 		{Name: "queued.mp4", RandomID: 8402, State: model.JobQueued},
+		{Name: "failed.mp4", RandomID: 8404, State: model.JobFailed, Error: "failed"},
 	})
 	candidates, _ := fixtureJobs(t, []fixtureJob{{Name: "candidate.mp4", RandomID: 8403}})
 	candidates[0].ID = "candidate-job"
@@ -564,6 +694,11 @@ func TestControllerQueueMutationsPublishOnlyAfterPersistenceSucceeds(t *testing.
 		{name: "remove selected", run: func(controller *Controller) error { return controller.RemoveJobs([]string{jobs[1].ID}) }},
 		{name: "remove completed", run: func(controller *Controller) error { return controller.RemoveCompleted() }},
 		{name: "clear", run: func(controller *Controller) error { return controller.ClearQueue() }},
+		{name: "reset", run: func(controller *Controller) error {
+			_, err := controller.ResetJobs(ResetAllRecoverable, nil)
+			return err
+		}},
+		{name: "retry", run: func(controller *Controller) error { return controller.Retry(jobs[2].ID) }},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

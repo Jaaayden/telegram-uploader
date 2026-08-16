@@ -44,6 +44,20 @@ type Snapshot struct {
 	ETA            time.Duration
 }
 
+// ResetMode selects which recoverable queue jobs should return to JobQueued.
+// Sent, moved, oversize and confirming jobs are deliberately excluded from
+// every bulk mode: resetting them without an explicit per-job decision could
+// duplicate a Telegram post, lose move history, or retry an ineligible file.
+type ResetMode uint8
+
+const (
+	ResetSelected ResetMode = iota + 1
+	ResetCancelled
+	ResetFailed
+	ResetSkipped
+	ResetAllRecoverable
+)
+
 type Controller struct {
 	mu        sync.RWMutex
 	persistMu sync.Mutex
@@ -531,6 +545,109 @@ func (c *Controller) RemoveCompleted() error {
 	return nil
 }
 
+// ResetJobs returns recoverable terminal jobs to the queued state while the
+// queue is idle. ResetSelected applies the same safety rules to the supplied
+// job IDs; the other modes ignore ids and select jobs by durable state.
+//
+// The complete next queue is persisted before it is published to observers,
+// so a storage failure cannot leave the UI and queue.json disagreeing.
+func (c *Controller) ResetJobs(mode ResetMode, ids []string) (int, error) {
+	if !validResetMode(mode) {
+		return 0, errors.New("未知的任务重置方式")
+	}
+
+	selected := make(map[string]struct{}, len(ids))
+	if mode == ResetSelected {
+		for _, id := range ids {
+			if id != "" {
+				selected[id] = struct{}{}
+			}
+		}
+		if len(selected) == 0 {
+			return 0, nil
+		}
+	}
+
+	if !c.opMu.TryLock() {
+		return 0, errors.New("上传、扫描或移动操作正在进行，请稍后重试")
+	}
+	defer c.opMu.Unlock()
+
+	c.mu.Lock()
+	if c.running {
+		c.mu.Unlock()
+		return 0, errors.New("上传进行中，不能重置队列任务")
+	}
+	nextJobs := append([]model.Job(nil), c.jobs...)
+	channel := c.channel
+	paused := c.paused
+	c.mu.Unlock()
+
+	resetCount := 0
+	for i := range nextJobs {
+		job := &nextJobs[i]
+		if !matchesResetMode(*job, mode, selected) {
+			continue
+		}
+		job.State = model.JobQueued
+		resetPendingJobProgress(job)
+		resetCount++
+	}
+	if resetCount == 0 {
+		return 0, nil
+	}
+
+	if err := c.saveSnapshot(nextJobs, channel, paused); err != nil {
+		c.setPersistenceError(err)
+		return 0, err
+	}
+	c.mu.Lock()
+	c.jobs = nextJobs
+	c.lastError = ""
+	c.notifyLocked()
+	c.mu.Unlock()
+	return resetCount, nil
+}
+
+func validResetMode(mode ResetMode) bool {
+	switch mode {
+	case ResetSelected, ResetCancelled, ResetFailed, ResetSkipped, ResetAllRecoverable:
+		return true
+	default:
+		return false
+	}
+}
+
+func matchesResetMode(job model.Job, mode ResetMode, selected map[string]struct{}) bool {
+	if !isRecoverableJobState(job.State) {
+		return false
+	}
+	switch mode {
+	case ResetSelected:
+		_, ok := selected[job.ID]
+		return ok
+	case ResetCancelled:
+		return job.State == model.JobCancelled
+	case ResetFailed:
+		return job.State == model.JobFailed || job.State == model.JobInterrupted
+	case ResetSkipped:
+		return job.State == model.JobSkipped
+	case ResetAllRecoverable:
+		return true
+	default:
+		return false
+	}
+}
+
+func isRecoverableJobState(state model.JobState) bool {
+	switch state {
+	case model.JobCancelled, model.JobFailed, model.JobInterrupted, model.JobSkipped:
+		return true
+	default:
+		return false
+	}
+}
+
 func filteredJobs(jobs []model.Job, remove func(model.Job) bool) ([]model.Job, int) {
 	kept := make([]model.Job, 0, len(jobs))
 	removed := 0
@@ -834,7 +951,7 @@ func (c *Controller) runQueue(ctx context.Context) {
 			Path:     job.Path,
 			File:     file,
 			Name:     job.Name,
-			Caption:  job.Name,
+			Caption:  captionFromFilename(job.Name),
 			RandomID: job.RandomID,
 			Metadata: metadata,
 		}, func(progress model.Progress) {
@@ -935,6 +1052,14 @@ func (c *Controller) nextJob() (int, model.Job, tgtransport.Gateway, model.Chann
 		}
 	}
 	return 0, model.Job{}, nil, model.Channel{}, false
+}
+
+func captionFromFilename(name string) string {
+	extension := filepath.Ext(name)
+	if strings.EqualFold(extension, ".mp4") {
+		return strings.TrimSuffix(name, extension)
+	}
+	return name
 }
 
 func (c *Controller) applyProgress(index int, jobID string, progress model.Progress) {
@@ -1074,27 +1199,32 @@ func (c *Controller) Retry(id string) error {
 		c.mu.Unlock()
 		return errors.New("请先等待当前队列停止")
 	}
-	for i := range c.jobs {
-		if c.jobs[i].ID != id {
+	nextJobs := append([]model.Job(nil), c.jobs...)
+	channel := c.channel
+	paused := c.paused
+	c.mu.Unlock()
+	for i := range nextJobs {
+		if nextJobs[i].ID != id {
 			continue
 		}
-		switch c.jobs[i].State {
+		switch nextJobs[i].State {
 		case model.JobFailed, model.JobInterrupted, model.JobCancelled, model.JobSkipped, model.JobConfirming:
-			c.jobs[i].State = model.JobQueued
-			c.jobs[i].Uploaded = 0
-			c.jobs[i].BytesPerSecond = 0
-			c.jobs[i].Error = ""
-			c.jobs[i].StartedAt = nil
-			c.jobs[i].CompletedAt = nil
+			nextJobs[i].State = model.JobQueued
+			resetPendingJobProgress(&nextJobs[i])
+			if err := c.saveSnapshot(nextJobs, channel, paused); err != nil {
+				c.setPersistenceError(err)
+				return err
+			}
+			c.mu.Lock()
+			c.jobs = nextJobs
+			c.lastError = ""
 			c.notifyLocked()
 			c.mu.Unlock()
-			return c.persist()
+			return nil
 		default:
-			c.mu.Unlock()
 			return errors.New("该任务当前不能重试")
 		}
 	}
-	c.mu.Unlock()
 	return errors.New("没有找到上传任务")
 }
 
