@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/zalando/go-keyring"
@@ -224,6 +225,11 @@ func TestSessionFileInPlaceEncryptionDoesNotLeavePlaintext(t *testing.T) {
 
 func assert0600(t *testing.T, path string) {
 	t.Helper()
+	// Windows exposes ACL-backed files with synthesized Unix permission bits,
+	// commonly 0666. os.FileMode therefore cannot verify Windows file privacy.
+	if runtime.GOOS == "windows" {
+		return
+	}
 	info, err := os.Stat(path)
 	if err != nil {
 		t.Fatalf("stat %q: %v", path, err)

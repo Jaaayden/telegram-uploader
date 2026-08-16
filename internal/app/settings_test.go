@@ -3,6 +3,7 @@ package app
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -19,11 +20,15 @@ func TestSettingsRoundTrip(t *testing.T) {
 	if got != want {
 		t.Fatalf("settings = %#v, want %#v", got, want)
 	}
-	info, err := os.Stat(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if info.Mode().Perm() != 0o600 {
-		t.Fatalf("mode = %o", info.Mode().Perm())
+	// Windows reports synthesized Unix permission bits; file privacy is
+	// governed by ACLs and cannot be asserted through os.FileMode.
+	if runtime.GOOS != "windows" {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode().Perm() != 0o600 {
+			t.Fatalf("mode = %o", info.Mode().Perm())
+		}
 	}
 }
