@@ -19,15 +19,23 @@ import (
 )
 
 type QueueStore interface {
-	Save([]model.Job, model.Channel) error
-	Load() ([]model.Job, model.Channel, error)
+	Save([]model.Job, model.Channel, bool) error
+	Load() ([]model.Job, model.Channel, bool, error)
 }
 
 type Snapshot struct {
-	Jobs           []model.Job
-	Channel        model.Channel
-	Folder         string
-	Running        bool
+	Jobs    []model.Job
+	Channel model.Channel
+	Folder  string
+	Running bool
+	// Paused means that the queue has an explicit pause intent. When Running
+	// is also true, the current file is allowed to finish and the queue will
+	// stop before starting the next file.
+	Paused bool
+	// PauseRequested is true only while a running queue is finishing its
+	// current file in response to Pause(). It is exposed separately so the UI
+	// can explain why the active file is still moving.
+	PauseRequested bool
 	ActiveID       string
 	LastError      string
 	DoneBytes      int64
@@ -45,12 +53,19 @@ type Controller struct {
 	mover   *mover.Mover
 	gateway tgtransport.Gateway
 
-	jobs      []model.Job
-	channel   model.Channel
-	folder    string
-	running   bool
-	activeID  string
-	lastError string
+	jobs    []model.Job
+	channel model.Channel
+	folder  string
+	running bool
+	paused  bool
+	// pauseRequested is a transient view of a pause intent while the queue is
+	// still running. paused remains true until Resume or Start clears it.
+	pauseRequested bool
+	// pauseRevision prevents a failed persistence attempt from rolling back a
+	// newer Pause, Resume, Start, or CancelAll action.
+	pauseRevision uint64
+	activeID      string
+	lastError     string
 
 	activeCancel       context.CancelFunc
 	allCancel          context.CancelFunc
@@ -93,7 +108,7 @@ func (c *Controller) Load() error {
 	if c.store == nil {
 		return nil
 	}
-	jobs, channel, err := c.store.Load()
+	jobs, channel, paused, err := c.store.Load()
 	if err != nil {
 		return err
 	}
@@ -104,6 +119,8 @@ func (c *Controller) Load() error {
 	c.mu.Lock()
 	c.jobs = append([]model.Job(nil), jobs...)
 	c.channel = channel
+	c.paused = paused
+	c.pauseRequested = false
 	if len(jobs) > 0 {
 		c.folder = filepath.Dir(jobs[0].Path)
 	}
@@ -186,6 +203,101 @@ func (c *Controller) Scan(folder string, maxBytes int64) error {
 	c.notifyLocked()
 	c.mu.Unlock()
 	return c.persist()
+}
+
+// Pause requests a soft pause. It never cancels the active Telegram request:
+// the current file is allowed to finish, then runQueue stops before selecting
+// another runnable job. The active-run path intentionally bypasses opMu
+// because the upload goroutine owns that lock for the duration of a run;
+// idle pauses still use opMu to serialize with queue editing.
+func (c *Controller) Pause() error {
+	c.mu.Lock()
+	if !c.running {
+		c.mu.Unlock()
+		if !c.opMu.TryLock() {
+			return errors.New("上传、扫描或移动操作正在进行，请稍后重试")
+		}
+		defer c.opMu.Unlock()
+		c.mu.Lock()
+	}
+	wasPaused := c.paused
+	wasRequested := c.pauseRequested
+	c.paused = true
+	if c.running {
+		c.pauseRequested = true
+	}
+	stateChanged := !wasPaused || wasRequested != c.pauseRequested
+	if stateChanged {
+		c.pauseRevision++
+		c.notifyLocked()
+	}
+	revision := c.pauseRevision
+	c.mu.Unlock()
+	if !stateChanged {
+		return nil
+	}
+	if err := c.persist(); err != nil {
+		c.mu.Lock()
+		if c.pauseRevision == revision {
+			c.paused = wasPaused
+			c.pauseRequested = wasRequested && c.running
+			c.pauseRevision++
+			c.notifyLocked()
+		}
+		c.mu.Unlock()
+		c.setPersistenceError(err)
+		return err
+	}
+	return nil
+}
+
+// Resume clears a soft pause without starting a queue by itself. Callers can
+// then use Start, which also accepts a paused queue and resumes it. If the
+// queue is still finishing its active file, clearing the request lets it
+// continue with the next file as soon as that operation returns.
+func (c *Controller) Resume() error {
+	c.mu.Lock()
+	if !c.running {
+		c.mu.Unlock()
+		if !c.opMu.TryLock() {
+			return errors.New("上传、扫描或移动操作正在进行，请稍后重试")
+		}
+		defer c.opMu.Unlock()
+		c.mu.Lock()
+	}
+	if !c.paused && !c.pauseRequested {
+		c.mu.Unlock()
+		return nil
+	}
+	wasPaused := c.paused
+	wasRequested := c.pauseRequested
+	c.paused = false
+	c.pauseRequested = false
+	c.pauseRevision++
+	revision := c.pauseRevision
+	c.notifyLocked()
+	c.mu.Unlock()
+	if err := c.persist(); err != nil {
+		c.mu.Lock()
+		if c.pauseRevision == revision {
+			c.paused = wasPaused
+			c.pauseRequested = wasRequested && c.running
+			c.pauseRevision++
+			c.notifyLocked()
+		}
+		c.mu.Unlock()
+		c.setPersistenceError(err)
+		return err
+	}
+	return nil
+}
+
+// IsPaused reports an explicit pause intent. It is safe to call while an
+// upload is active and is equivalent to Snapshot().Paused.
+func (c *Controller) IsPaused() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.paused
 }
 
 // AddJobs appends scanned candidates to the durable queue while the queue is
@@ -276,9 +388,10 @@ func (c *Controller) AddJobs(candidates []model.Job) error {
 	}
 	reindexJobs(nextJobs)
 	channel := c.channel
+	paused := c.paused
 	c.mu.Unlock()
 
-	if err := c.saveSnapshot(nextJobs, channel); err != nil {
+	if err := c.saveSnapshot(nextJobs, channel, paused); err != nil {
 		c.setPersistenceError(err)
 		return err
 	}
@@ -326,9 +439,10 @@ func (c *Controller) RemoveJobs(ids []string) error {
 		return nil
 	}
 	channel := c.channel
+	paused := c.paused
 	c.mu.Unlock()
 
-	if err := c.saveSnapshot(nextJobs, channel); err != nil {
+	if err := c.saveSnapshot(nextJobs, channel, paused); err != nil {
 		c.setPersistenceError(err)
 		return err
 	}
@@ -361,9 +475,10 @@ func (c *Controller) ClearQueue() error {
 		return nil
 	}
 	channel := c.channel
+	paused := c.paused
 	c.mu.Unlock()
 
-	if err := c.saveSnapshot(nil, channel); err != nil {
+	if err := c.saveSnapshot(nil, channel, paused); err != nil {
 		c.setPersistenceError(err)
 		return err
 	}
@@ -398,9 +513,10 @@ func (c *Controller) RemoveCompleted() error {
 		return nil
 	}
 	channel := c.channel
+	paused := c.paused
 	c.mu.Unlock()
 
-	if err := c.saveSnapshot(nextJobs, channel); err != nil {
+	if err := c.saveSnapshot(nextJobs, channel, paused); err != nil {
 		c.setPersistenceError(err)
 		return err
 	}
@@ -564,6 +680,13 @@ func (c *Controller) Start(parent context.Context) error {
 		c.opMu.Unlock()
 		return errors.New("队列中没有待上传视频")
 	}
+	wasPaused := c.paused || c.pauseRequested
+	if wasPaused {
+		c.paused = false
+		c.pauseRequested = false
+		c.pauseRevision++
+	}
+	startPauseRevision := c.pauseRevision
 	if parent == nil {
 		parent = context.Background()
 	}
@@ -582,6 +705,13 @@ func (c *Controller) Start(parent context.Context) error {
 		c.mu.Lock()
 		c.running = false
 		c.allCancel = nil
+		if wasPaused && c.pauseRevision == startPauseRevision {
+			c.paused = true
+			c.pauseRevision++
+		}
+		// A pause request is transient and only meaningful while Running is
+		// true. Preserve any newer paused intent, but normalize its view.
+		c.pauseRequested = false
 		c.lastError = err.Error()
 		c.notifyLocked()
 		c.mu.Unlock()
@@ -634,6 +764,10 @@ func (c *Controller) runQueue(ctx context.Context) {
 	defer func() {
 		c.mu.Lock()
 		c.running = false
+		if c.pauseRequested {
+			c.pauseRevision++
+		}
+		c.pauseRequested = false
 		c.activeID = ""
 		c.activeCancel = nil
 		c.allCancel = nil
@@ -669,6 +803,15 @@ func (c *Controller) runQueue(ctx context.Context) {
 		fileCtx, fileCancel := context.WithCancel(ctx)
 		now := time.Now()
 		c.mu.Lock()
+		// Pause may have been requested after nextJob selected this entry but
+		// before the file was opened. Re-check under the same mutex used by
+		// Pause so a between-files pause cannot start a new Telegram request.
+		if c.paused || c.pauseRequested {
+			c.mu.Unlock()
+			fileCancel()
+			_ = file.Close()
+			return
+		}
 		c.jobs[index].Metadata = metadata
 		c.jobs[index].State = model.JobUploading
 		c.jobs[index].Uploaded = 0
@@ -783,6 +926,9 @@ func (c *Controller) runQueue(ctx context.Context) {
 func (c *Controller) nextJob() (int, model.Job, tgtransport.Gateway, model.Channel, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+	if c.paused || c.pauseRequested {
+		return 0, model.Job{}, nil, model.Channel{}, false
+	}
 	for i, job := range c.jobs {
 		if job.State == model.JobQueued || job.State == model.JobInterrupted {
 			return i, job, c.gateway, c.channel, true
@@ -891,6 +1037,17 @@ func (c *Controller) CancelJob(id string) error {
 
 func (c *Controller) CancelAll() error {
 	c.mu.Lock()
+	if !c.running {
+		c.mu.Unlock()
+		if !c.opMu.TryLock() {
+			return errors.New("上传、扫描或移动操作正在进行，请稍后重试")
+		}
+		defer c.opMu.Unlock()
+		c.mu.Lock()
+	}
+	c.pauseRevision++
+	c.paused = false
+	c.pauseRequested = false
 	c.cancelAllRequested = true
 	if c.allCancel != nil {
 		c.allCancel()
@@ -1126,20 +1283,26 @@ func safeMoveDestination(destinationDir, name string) (string, error) {
 }
 
 func (c *Controller) persist() error {
-	c.mu.RLock()
-	jobs := append([]model.Job(nil), c.jobs...)
-	channel := c.channel
-	c.mu.RUnlock()
-	return c.saveSnapshot(jobs, channel)
-}
-
-func (c *Controller) saveSnapshot(jobs []model.Job, channel model.Channel) error {
 	if c.store == nil {
 		return nil
 	}
 	c.persistMu.Lock()
 	defer c.persistMu.Unlock()
-	return c.store.Save(append([]model.Job(nil), jobs...), channel)
+	c.mu.RLock()
+	jobs := append([]model.Job(nil), c.jobs...)
+	channel := c.channel
+	paused := c.paused
+	c.mu.RUnlock()
+	return c.store.Save(jobs, channel, paused)
+}
+
+func (c *Controller) saveSnapshot(jobs []model.Job, channel model.Channel, paused bool) error {
+	if c.store == nil {
+		return nil
+	}
+	c.persistMu.Lock()
+	defer c.persistMu.Unlock()
+	return c.store.Save(append([]model.Job(nil), jobs...), channel, paused)
 }
 
 func (c *Controller) notifyLocked() {
@@ -1161,12 +1324,14 @@ func (c *Controller) notifyLocked() {
 func (c *Controller) snapshotLocked() Snapshot {
 	jobs := append([]model.Job(nil), c.jobs...)
 	snapshot := Snapshot{
-		Jobs:      jobs,
-		Channel:   c.channel,
-		Folder:    c.folder,
-		Running:   c.running,
-		ActiveID:  c.activeID,
-		LastError: c.lastError,
+		Jobs:           jobs,
+		Channel:        c.channel,
+		Folder:         c.folder,
+		Running:        c.running,
+		Paused:         c.paused,
+		PauseRequested: c.pauseRequested,
+		ActiveID:       c.activeID,
+		LastError:      c.lastError,
 	}
 	for _, job := range jobs {
 		total, done := jobProgressBytes(job)

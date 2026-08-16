@@ -96,6 +96,283 @@ func TestControllerUploadsSeriallyWithExactRequestAndProgress(t *testing.T) {
 	}
 }
 
+func TestControllerPauseFinishesActiveJobThenStopsAndResumes(t *testing.T) {
+	jobs, _ := fixtureJobs(t, []fixtureJob{
+		{Name: "pause-first.mp4", RandomID: 7111},
+		{Name: "pause-second.mp4", RandomID: 7112},
+	})
+	store := &memoryQueueStore{jobs: jobs, channel: testChannel()}
+	gateway := &fakeGateway{}
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var signal sync.Once
+	gateway.upload = func(ctx context.Context, request tgtransport.UploadRequest, progress func(model.Progress)) (int, error) {
+		if request.RandomID == jobs[0].RandomID {
+			signal.Do(func() { close(firstStarted) })
+			select {
+			case <-releaseFirst:
+			case <-ctx.Done():
+				return 0, ctx.Err()
+			}
+		}
+		info, err := os.Stat(request.Path)
+		if err != nil {
+			return 0, err
+		}
+		progress(model.Progress{BytesDone: info.Size(), BytesTotal: info.Size(), At: time.Now()})
+		return int(request.RandomID), nil
+	}
+
+	controller := newLoadedController(t, store, gateway)
+	if err := controller.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	select {
+	case <-firstStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for first upload")
+	}
+	if err := controller.Pause(); err != nil {
+		t.Fatalf("Pause() error = %v", err)
+	}
+	paused := controller.Snapshot()
+	if !paused.Running || !paused.Paused || !paused.PauseRequested {
+		t.Fatalf("snapshot after Pause() = %+v, want running pause request", paused)
+	}
+	if paused.Jobs[1].State != model.JobQueued {
+		t.Fatalf("pending job after Pause() = %+v, want queued", paused.Jobs[1])
+	}
+
+	close(releaseFirst)
+	stopped := waitForSnapshot(t, controller, func(snapshot Snapshot) bool {
+		return !snapshot.Running && snapshot.Paused && snapshot.Jobs[0].State == model.JobSent && snapshot.Jobs[1].State == model.JobQueued
+	})
+	if stopped.PauseRequested {
+		t.Fatalf("pause request remained set after queue stopped: %+v", stopped)
+	}
+	if calls := gateway.Calls(); len(calls) != 1 {
+		t.Fatalf("UploadVideo calls after soft pause = %d, want 1", len(calls))
+	}
+	if err := controller.Resume(); err != nil {
+		t.Fatalf("Resume() error = %v", err)
+	}
+	if snapshot := controller.Snapshot(); snapshot.Paused || snapshot.PauseRequested {
+		t.Fatalf("snapshot after Resume() = %+v, want active pause cleared", snapshot)
+	}
+	if err := controller.Start(context.Background()); err != nil {
+		t.Fatalf("Start() after Resume() error = %v", err)
+	}
+	final := waitForSnapshot(t, controller, func(snapshot Snapshot) bool {
+		return !snapshot.Running && allJobsState(snapshot.Jobs, model.JobSent)
+	})
+	if final.Jobs[1].Error != "" {
+		t.Fatalf("resumed job error = %q, want empty", final.Jobs[1].Error)
+	}
+	if calls := gateway.Calls(); len(calls) != 2 || calls[1].RandomID != jobs[1].RandomID {
+		t.Fatalf("UploadVideo calls after Resume() = %#v, want second job only", calls)
+	}
+}
+
+func TestControllerPauseIdlePersistsAndIsIdempotent(t *testing.T) {
+	jobs, _ := fixtureJobs(t, []fixtureJob{{Name: "idle-pause.mp4", RandomID: 7121}})
+	store := &memoryQueueStore{jobs: jobs, channel: testChannel()}
+	controller := newLoadedController(t, store, &fakeGateway{})
+
+	if err := controller.Pause(); err != nil {
+		t.Fatalf("first Pause() error = %v", err)
+	}
+	savesAfterFirstPause := store.savesCount()
+	if err := controller.Pause(); err != nil {
+		t.Fatalf("second Pause() error = %v", err)
+	}
+	if got := store.savesCount(); got != savesAfterFirstPause {
+		t.Fatalf("idempotent Pause() performed %d additional saves", got-savesAfterFirstPause)
+	}
+	snapshot := controller.Snapshot()
+	if snapshot.Running || !snapshot.Paused || snapshot.PauseRequested {
+		t.Fatalf("idle paused snapshot = %+v", snapshot)
+	}
+	if err := controller.Resume(); err != nil {
+		t.Fatalf("first Resume() error = %v", err)
+	}
+	savesAfterFirstResume := store.savesCount()
+	if err := controller.Resume(); err != nil {
+		t.Fatalf("second Resume() error = %v", err)
+	}
+	if got := store.savesCount(); got != savesAfterFirstResume {
+		t.Fatalf("idempotent Resume() performed %d additional saves", got-savesAfterFirstResume)
+	}
+	snapshot = controller.Snapshot()
+	if snapshot.Paused || snapshot.PauseRequested || snapshot.Jobs[0].Error != "" {
+		t.Fatalf("idle resumed snapshot = %+v", snapshot)
+	}
+}
+
+func TestControllerPauseAndResumeRollbackOnPersistenceFailure(t *testing.T) {
+	jobs, _ := fixtureJobs(t, []fixtureJob{{Name: "pause-persist.mp4", RandomID: 7123}})
+	store := &memoryQueueStore{jobs: jobs, channel: testChannel()}
+	controller := newLoadedController(t, store, &fakeGateway{})
+	saveFailure := errors.New("simulated pause persistence failure")
+
+	store.saveErr = saveFailure
+	if err := controller.Pause(); !errors.Is(err, saveFailure) {
+		t.Fatalf("Pause() error = %v, want %v", err, saveFailure)
+	}
+	if snapshot := controller.Snapshot(); snapshot.Paused || snapshot.PauseRequested {
+		t.Fatalf("failed Pause() left in-memory pause active: %+v", snapshot)
+	}
+	if _, _, paused, err := store.Load(); err != nil || paused {
+		t.Fatalf("failed Pause() persisted state = (%v, %v), want unpaused", paused, err)
+	}
+
+	store.saveErr = nil
+	if err := controller.Pause(); err != nil {
+		t.Fatalf("Pause() before Resume test error = %v", err)
+	}
+	store.saveErr = saveFailure
+	if err := controller.Resume(); !errors.Is(err, saveFailure) {
+		t.Fatalf("Resume() error = %v, want %v", err, saveFailure)
+	}
+	if snapshot := controller.Snapshot(); !snapshot.Paused || snapshot.PauseRequested {
+		t.Fatalf("failed Resume() did not restore pause: %+v", snapshot)
+	}
+	store.saveErr = nil
+	if _, _, paused, err := store.Load(); err != nil || !paused {
+		t.Fatalf("failed Resume() persisted state = (%v, %v), want paused", paused, err)
+	}
+}
+
+func TestControllerStartFailureRestoresPausedQueue(t *testing.T) {
+	jobs, _ := fixtureJobs(t, []fixtureJob{{Name: "paused-start-failure.mp4", RandomID: 7124}})
+	store := &memoryQueueStore{jobs: jobs, channel: testChannel()}
+	controller := newLoadedController(t, store, &fakeGateway{})
+	if err := controller.Pause(); err != nil {
+		t.Fatalf("Pause() error = %v", err)
+	}
+	saveFailure := errors.New("simulated start persistence failure")
+	store.saveErr = saveFailure
+	if err := controller.Start(context.Background()); !errors.Is(err, saveFailure) {
+		t.Fatalf("Start() error = %v, want %v", err, saveFailure)
+	}
+	if snapshot := controller.Snapshot(); snapshot.Running || !snapshot.Paused || snapshot.PauseRequested {
+		t.Fatalf("snapshot after failed paused Start() = %+v, want idle paused", snapshot)
+	}
+}
+
+func TestControllerLoadRestoresPersistedPause(t *testing.T) {
+	jobs, _ := fixtureJobs(t, []fixtureJob{{Name: "restore-pause.mp4", RandomID: 7122}})
+	store := &memoryQueueStore{jobs: jobs, channel: testChannel()}
+	first := newLoadedController(t, store, &fakeGateway{})
+	if err := first.Pause(); err != nil {
+		t.Fatalf("Pause() error = %v", err)
+	}
+
+	restored := NewController(store, nil)
+	if err := restored.Load(); err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if snapshot := restored.Snapshot(); !snapshot.Paused || snapshot.PauseRequested || snapshot.Running {
+		t.Fatalf("restored snapshot = %+v, want idle paused queue", snapshot)
+	}
+}
+
+func TestControllerCancelAllClearsPendingPause(t *testing.T) {
+	jobs, _ := fixtureJobs(t, []fixtureJob{
+		{Name: "cancel-pause-active.mp4", RandomID: 7131},
+		{Name: "cancel-pause-pending.mp4", RandomID: 7132},
+	})
+	store := &memoryQueueStore{jobs: jobs, channel: testChannel()}
+	gateway := &fakeGateway{}
+	started := make(chan struct{})
+	var signal sync.Once
+	gateway.upload = func(ctx context.Context, request tgtransport.UploadRequest, _ func(model.Progress)) (int, error) {
+		if request.RandomID == jobs[0].RandomID {
+			signal.Do(func() { close(started) })
+			<-ctx.Done()
+			return 0, ctx.Err()
+		}
+		return int(request.RandomID), nil
+	}
+	controller := newLoadedController(t, store, gateway)
+	if err := controller.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	select {
+	case <-started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for active upload")
+	}
+	if err := controller.Pause(); err != nil {
+		t.Fatalf("Pause() error = %v", err)
+	}
+	if err := controller.CancelAll(); err != nil {
+		t.Fatalf("CancelAll() error = %v", err)
+	}
+	final := waitForSnapshot(t, controller, func(snapshot Snapshot) bool {
+		return !snapshot.Running && !snapshot.Paused && !snapshot.PauseRequested && len(snapshot.Jobs) == 2 &&
+			snapshot.Jobs[0].State == model.JobCancelled && snapshot.Jobs[1].State == model.JobCancelled
+	})
+	for i, job := range final.Jobs {
+		if job.Error != "" {
+			t.Errorf("cancelled job %d error = %q, want empty", i, job.Error)
+		}
+	}
+}
+
+func TestControllerCancelAllDoesNotRaceIdleQueueMutation(t *testing.T) {
+	jobs, _ := fixtureJobs(t, []fixtureJob{{Name: "existing.mp4", RandomID: 7133}})
+	candidates, _ := fixtureJobs(t, []fixtureJob{{Name: "candidate.mp4", RandomID: 7134}})
+	candidates[0].ID = "candidate-job"
+	store := &memoryQueueStore{jobs: jobs, channel: testChannel()}
+	controller := newLoadedController(t, store, &fakeGateway{})
+	saveEntered := make(chan struct{})
+	releaseSave := make(chan struct{})
+	var once sync.Once
+	store.saveHook = func([]model.Job) {
+		once.Do(func() { close(saveEntered) })
+		<-releaseSave
+	}
+
+	addDone := make(chan error, 1)
+	go func() { addDone <- controller.AddJobs(candidates) }()
+	select {
+	case <-saveEntered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for AddJobs persistence")
+	}
+	if err := controller.CancelAll(); err == nil {
+		t.Fatal("CancelAll() succeeded while an idle queue mutation owned opMu")
+	}
+	close(releaseSave)
+	if err := <-addDone; err != nil {
+		t.Fatalf("AddJobs() error = %v", err)
+	}
+	for _, job := range controller.Snapshot().Jobs {
+		if job.State == model.JobCancelled {
+			t.Fatalf("CancelAll raced and cancelled a structurally mutating queue: %+v", job)
+		}
+	}
+}
+
+func TestControllerPauseResumeIsRaceSafe(t *testing.T) {
+	jobs, _ := fixtureJobs(t, []fixtureJob{{Name: "pause-race.mp4", RandomID: 7141}})
+	controller := newLoadedController(t, &memoryQueueStore{jobs: jobs, channel: testChannel()}, &fakeGateway{})
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			if index%2 == 0 {
+				_ = controller.Pause()
+			} else {
+				_ = controller.Resume()
+			}
+			_ = controller.Snapshot()
+		}(i)
+	}
+	wg.Wait()
+}
+
 func TestApplyUploadLimitPreservesHistoryAndJobIdentity(t *testing.T) {
 	jobs := []model.Job{
 		{ID: "queued", Name: "queued.mp4", Size: 100, State: model.JobQueued, RandomID: 11},
@@ -871,13 +1148,14 @@ type memoryQueueStore struct {
 	mu       sync.Mutex
 	jobs     []model.Job
 	channel  model.Channel
+	paused   bool
 	saves    int
 	history  [][]model.Job
 	saveHook func([]model.Job)
 	saveErr  error
 }
 
-func (s *memoryQueueStore) Save(jobs []model.Job, channel model.Channel) error {
+func (s *memoryQueueStore) Save(jobs []model.Job, channel model.Channel, paused bool) error {
 	s.mu.Lock()
 	if s.saveErr != nil {
 		err := s.saveErr
@@ -886,6 +1164,7 @@ func (s *memoryQueueStore) Save(jobs []model.Job, channel model.Channel) error {
 	}
 	s.jobs = cloneJobs(jobs)
 	s.channel = channel
+	s.paused = paused
 	s.saves++
 	s.history = append(s.history, cloneJobs(jobs))
 	hook := s.saveHook
@@ -896,16 +1175,22 @@ func (s *memoryQueueStore) Save(jobs []model.Job, channel model.Channel) error {
 	return nil
 }
 
-func (s *memoryQueueStore) Load() ([]model.Job, model.Channel, error) {
+func (s *memoryQueueStore) Load() ([]model.Job, model.Channel, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return cloneJobs(s.jobs), s.channel, nil
+	return cloneJobs(s.jobs), s.channel, s.paused, nil
 }
 
 func (s *memoryQueueStore) SnapshotJobs() []model.Job {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return cloneJobs(s.jobs)
+}
+
+func (s *memoryQueueStore) savesCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.saves
 }
 
 type fakeGateway struct {

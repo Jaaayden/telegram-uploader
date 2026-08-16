@@ -100,6 +100,7 @@ type window struct {
 	folderLabel        *widget.Label
 	chooseFolderButton *widget.Button
 	startButton        *widget.Button
+	pauseButton        *widget.Button
 	scheduleButton     *widget.Button
 	cancelSchedule     *widget.Button
 	scheduleLabel      *widget.Label
@@ -191,7 +192,7 @@ func (u *window) build() {
 		widget.NewLabelWithStyle("上传队列", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
 		container.NewBorder(nil, nil, nil, u.chooseFolderButton, u.folderLabel),
 		container.NewHBox(u.selectAllButton, u.selectNoneButton, u.removeSelected, u.removeCompleted, u.clearQueueButton, u.selectionLabel),
-		container.NewHBox(u.startButton, u.scheduleButton, u.cancelSchedule, u.cancelAllButton, u.moveButton, u.cancelMoveButton),
+		container.NewHBox(u.startButton, u.pauseButton, u.scheduleButton, u.cancelSchedule, u.cancelAllButton, u.moveButton, u.cancelMoveButton),
 		u.scheduleLabel,
 		u.progress,
 		u.progressSummary,
@@ -235,6 +236,7 @@ func (u *window) buildFields() {
 	u.chooseFolderButton = widget.NewButton("添加文件夹…", u.chooseFolder)
 	u.folderLabel = widget.NewLabel("尚未添加来源文件夹")
 	u.startButton = widget.NewButton("开始上传", u.startUploads)
+	u.pauseButton = widget.NewButton("暂停队列", u.pauseUploads)
 	u.scheduleButton = widget.NewButton("定时开始…", u.showScheduleDialog)
 	u.cancelSchedule = widget.NewButton("取消定时", u.cancelScheduledStart)
 	u.scheduleLabel = widget.NewLabel("定时：未设置")
@@ -257,6 +259,7 @@ func (u *window) buildFields() {
 	// channel have been selected.
 	u.bindButton.Disable()
 	u.startButton.Disable()
+	u.pauseButton.Disable()
 	u.scheduleButton.Disable()
 	u.cancelSchedule.Disable()
 	u.cancelAllButton.Disable()
@@ -464,6 +467,10 @@ func (u *window) applySnapshot(snapshot coreapp.Snapshot) {
 		// displays it in the row/state summary rather than opening a dialog on
 		// every coalesced snapshot.
 		u.operationLabel.SetText(snapshot.LastError)
+	} else if snapshot.PauseRequested {
+		u.operationLabel.SetText("暂停请求已收到，正在完成当前文件")
+	} else if snapshot.Paused && !snapshot.Running {
+		u.operationLabel.SetText("队列已暂停；点击“继续上传”后将从下一条待上传视频开始")
 	}
 	u.refreshQueueRows(snapshot.Jobs)
 	u.updateActionAvailability()
@@ -478,7 +485,9 @@ func (u *window) applySnapshot(snapshot coreapp.Snapshot) {
 
 func (u *window) updateActionAvailability() {
 	if u.isMoveInFlight() {
+		u.startButton.SetText("开始上传")
 		u.startButton.Disable()
+		u.pauseButton.Disable()
 		u.chooseFolderButton.Disable()
 		u.moveButton.Disable()
 		u.cancelAllButton.Disable()
@@ -489,12 +498,24 @@ func (u *window) updateActionAvailability() {
 		return
 	}
 	if u.snapshot.Running {
+		u.startButton.SetText("开始上传")
 		u.startButton.Disable()
+		if u.snapshot.PauseRequested {
+			u.pauseButton.Disable()
+		} else {
+			u.pauseButton.Enable()
+		}
 		u.chooseFolderButton.Disable()
 		u.moveButton.Disable()
 		u.cancelAllButton.Enable()
 		u.disableQueueEditing()
 	} else {
+		if u.snapshot.Paused {
+			u.startButton.SetText("继续上传")
+		} else {
+			u.startButton.SetText("开始上传")
+		}
+		u.pauseButton.Disable()
 		if u.scanInProgress() {
 			u.chooseFolderButton.Disable()
 		} else {
@@ -519,6 +540,7 @@ func (u *window) updateActionAvailability() {
 	if u.scanInProgress() {
 		u.chooseFolderButton.Disable()
 		u.startButton.Disable()
+		u.pauseButton.Disable()
 		u.moveButton.Disable()
 	}
 	u.updateScheduleControls()
@@ -530,7 +552,7 @@ func (u *window) updateScheduleControls() {
 		return
 	}
 	_, set, _ := u.scheduler.State()
-	if !u.snapshot.Running && !u.isMoveInFlight() && !u.scanInProgress() && hasRunnableJobs(u.snapshot.Jobs) && !u.scheduleStarting {
+	if !u.snapshot.Running && !u.snapshot.Paused && !u.snapshot.PauseRequested && !u.isMoveInFlight() && !u.scanInProgress() && hasRunnableJobs(u.snapshot.Jobs) && !u.scheduleStarting {
 		u.scheduleButton.Enable()
 	} else {
 		u.scheduleButton.Disable()
@@ -1373,6 +1395,8 @@ func (u *window) updateScheduleStatus() {
 	}
 	suffix := "正在准备开始"
 	switch {
+	case u.snapshot.Paused || u.snapshot.PauseRequested:
+		suffix = "时间已到，等待手动继续"
 	case !u.connected:
 		suffix = "时间已到，等待 Telegram 连接"
 		if u.scheduleRetry > 0 {
@@ -1445,6 +1469,12 @@ func (u *window) tryScheduledStart() {
 	if u.snapshot.Running || u.isMoveInFlight() || u.scanInProgress() || u.candidateDialog != nil {
 		return
 	}
+	// A scheduled start must never clear a manual pause. The user must press
+	// “继续上传”, which goes through the normal beginUploads path and lets
+	// Controller.Start clear and persist the pause state.
+	if u.snapshot.Paused || u.snapshot.PauseRequested {
+		return
+	}
 	if !u.connected || u.currentClient() == nil {
 		u.ensureScheduledConnection()
 		return
@@ -1467,6 +1497,22 @@ func (u *window) tryScheduledStart() {
 func (u *window) startUploads() {
 	if err := u.beginUploads(false); err != nil {
 		u.showError(err)
+	}
+}
+
+func (u *window) pauseUploads() {
+	if u.controller == nil || !u.snapshot.Running || u.snapshot.PauseRequested {
+		return
+	}
+	// Disable immediately so a second click cannot queue duplicate persistence
+	// requests while the controller is finishing the pause transition.
+	if u.pauseButton != nil {
+		u.pauseButton.Disable()
+	}
+	u.operationLabel.SetText("暂停请求已收到，正在完成当前文件")
+	if err := u.controller.Pause(); err != nil {
+		u.showError(err)
+		u.applySnapshot(u.controller.Snapshot())
 	}
 }
 
@@ -1526,13 +1572,13 @@ func (u *window) beginUploads(scheduled bool) error {
 }
 
 func (u *window) confirmCancelAll() {
-	dialog.ShowConfirm("取消全部上传", "取消会终止当前文件并取消所有尚未发送的文件，已经发送的消息不会删除。确定继续吗？", func(ok bool) {
+	dialog.ShowConfirm("立即取消全部上传", "此操作会立即中断当前文件、取消所有尚未发送的文件，并覆盖暂停状态；已经发送的消息不会删除。确定继续吗？", func(ok bool) {
 		if ok {
 			if err := u.controller.CancelAll(); err != nil {
 				u.showError(err)
 				return
 			}
-			u.operationLabel.SetText("已请求取消全部上传")
+			u.operationLabel.SetText("已立即取消全部上传（已覆盖暂停状态）")
 		}
 	}, u.window)
 }

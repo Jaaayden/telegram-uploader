@@ -223,6 +223,107 @@ func TestScanningDisablesStartAndMoveActions(t *testing.T) {
 	}
 }
 
+func TestPauseControlsReflectRunningAndPausedStates(t *testing.T) {
+	application := test.NewApp()
+	defer application.Quit()
+
+	u := &window{connected: true, scheduler: newScheduleCoordinator(nil)}
+	defer u.scheduler.Stop()
+	u.buildFields()
+	u.buildQueue()
+	job := model.Job{ID: "queued", Position: 0, Name: "queued.mp4", Size: 100, State: model.JobQueued}
+
+	u.snapshot = coreapp.Snapshot{
+		Running: true,
+		Channel: model.Channel{ID: 1},
+		Jobs:    []model.Job{job},
+	}
+	u.updateActionAvailability()
+	if u.pauseButton.Disabled() {
+		t.Fatal("pause button disabled while queue is running")
+	}
+	if !u.startButton.Disabled() {
+		t.Fatal("start button enabled while queue is running")
+	}
+	if got := u.startButton.Text; got != "开始上传" {
+		t.Fatalf("running start button text = %q, want 开始上传", got)
+	}
+
+	u.snapshot.PauseRequested = true
+	u.updateActionAvailability()
+	if !u.pauseButton.Disabled() {
+		t.Fatal("pause button enabled while pause request is pending")
+	}
+
+	u.applySnapshot(coreapp.Snapshot{
+		Paused:  true,
+		Channel: model.Channel{ID: 1},
+		Jobs:    []model.Job{job},
+	})
+	if got := u.startButton.Text; got != "继续上传" {
+		t.Fatalf("paused start button text = %q, want 继续上传", got)
+	}
+	if u.startButton.Disabled() {
+		t.Fatal("continue button disabled for a runnable paused queue")
+	}
+	if u.pauseButton.Disabled() != true {
+		t.Fatal("pause button enabled while queue is idle and paused")
+	}
+	if !u.scheduleButton.Disabled() {
+		t.Fatal("schedule button enabled while queue is manually paused")
+	}
+	if u.selectAllButton.Disabled() || u.clearQueueButton.Disabled() {
+		t.Fatal("queue editing stayed disabled after the queue became paused and idle")
+	}
+	if !strings.Contains(u.operationLabel.Text, "队列已暂停") {
+		t.Fatalf("paused operation status = %q, want explicit paused guidance", u.operationLabel.Text)
+	}
+}
+
+func TestScheduledStartWaitsForManualContinueWhenPaused(t *testing.T) {
+	application := test.NewApp()
+	defer application.Quit()
+
+	startAt := time.Now().Add(-time.Minute).Truncate(time.Second)
+	for _, testCase := range []struct {
+		name           string
+		paused         bool
+		pauseRequested bool
+	}{
+		{name: "paused idle", paused: true},
+		{name: "pause requested", pauseRequested: true},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			coordinator := newScheduleCoordinator(nil)
+			defer coordinator.Stop()
+			coordinator.HoldDue(startAt)
+			u := &window{
+				connected: true,
+				scheduler: coordinator,
+				snapshot: coreapp.Snapshot{
+					Running:        testCase.pauseRequested,
+					Paused:         testCase.paused || testCase.pauseRequested,
+					PauseRequested: testCase.pauseRequested,
+					Channel:        model.Channel{ID: 1},
+					Jobs:           []model.Job{{ID: "queued", State: model.JobQueued}},
+				},
+			}
+			u.buildFields()
+			u.buildQueue()
+			u.updateScheduleStatus()
+			if !strings.Contains(u.scheduleLabel.Text, "等待手动继续") {
+				t.Fatalf("schedule status = %q, want manual-continue guidance", u.scheduleLabel.Text)
+			}
+
+			u.tryScheduledStart()
+			stateAt, set, due := coordinator.State()
+			if !set || !due || !stateAt.Equal(startAt) {
+				t.Fatalf("scheduled start was consumed while paused: (%v, %v, %v)", stateAt, set, due)
+			}
+		})
+	}
+}
+
 func TestParseScheduledTimeUsesRequestedLocalZone(t *testing.T) {
 	location := time.FixedZone("UTC+8", 8*60*60)
 	got, err := parseScheduledTime("2026-08-17", "09:35", location)

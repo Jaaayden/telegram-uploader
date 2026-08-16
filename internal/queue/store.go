@@ -34,6 +34,7 @@ type document struct {
 	SchemaVersion int           `json:"schema_version"`
 	Jobs          []model.Job   `json:"jobs"`
 	Channel       model.Channel `json:"channel"`
+	Paused        bool          `json:"paused,omitempty"`
 }
 
 // loadDocument contains pointers for version fields so a missing version is
@@ -45,12 +46,14 @@ type loadDocument struct {
 	Version       *int          `json:"version"`
 	Jobs          []model.Job   `json:"jobs"`
 	Channel       model.Channel `json:"channel"`
+	Paused        bool          `json:"paused"`
 }
 
-// Save atomically persists jobs and the Telegram channel metadata. The
-// temporary file is created beside the destination with mode 0600, flushed to
-// stable storage before rename, and removed on every unsuccessful path.
-func (s Store) Save(jobs []model.Job, channel model.Channel) (err error) {
+// Save atomically persists jobs, Telegram channel metadata, and the queue's
+// explicit paused state. The temporary file is created beside the destination
+// with mode 0600, flushed to stable storage before rename, and removed on every
+// unsuccessful path.
+func (s Store) Save(jobs []model.Job, channel model.Channel, paused bool) (err error) {
 	path := string(s)
 	if path == "" {
 		return errors.New("queue: empty store path")
@@ -60,6 +63,7 @@ func (s Store) Save(jobs []model.Job, channel model.Channel) (err error) {
 		SchemaVersion: currentSchemaVersion,
 		Jobs:          jobs,
 		Channel:       channel,
+		Paused:        paused,
 	})
 	if err != nil {
 		return fmt.Errorf("queue: encode store: %w", err)
@@ -108,35 +112,35 @@ func (s Store) Save(jobs []model.Job, channel model.Channel) (err error) {
 	return nil
 }
 
-// Load reads the queue file. A missing file is an empty queue. Interrupted
+// Load reads the queue file. A missing file is an empty, unpaused queue. Interrupted
 // work is never resumed blindly: jobs that were active when the process
 // stopped are marked interrupted and their transient byte count is cleared,
 // while RandomID is retained for the caller's recovery logic.
-func (s Store) Load() ([]model.Job, model.Channel, error) {
+func (s Store) Load() ([]model.Job, model.Channel, bool, error) {
 	path := string(s)
 	if path == "" {
-		return nil, model.Channel{}, errors.New("queue: empty store path")
+		return nil, model.Channel{}, false, errors.New("queue: empty store path")
 	}
 
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return []model.Job{}, model.Channel{}, nil
+			return []model.Job{}, model.Channel{}, false, nil
 		}
-		return nil, model.Channel{}, fmt.Errorf("queue: read store: %w", err)
+		return nil, model.Channel{}, false, fmt.Errorf("queue: read store: %w", err)
 	}
 
 	var raw loadDocument
 	if err := json.Unmarshal(data, &raw); err != nil {
-		return nil, model.Channel{}, fmt.Errorf("queue: decode store: %w", err)
+		return nil, model.Channel{}, false, fmt.Errorf("queue: decode store: %w", err)
 	}
 
 	version, ok := schemaVersion(raw.SchemaVersion, raw.Version)
 	if !ok {
-		return nil, model.Channel{}, fmt.Errorf("%w: missing schema version", ErrUnsupportedSchemaVersion)
+		return nil, model.Channel{}, false, fmt.Errorf("%w: missing schema version", ErrUnsupportedSchemaVersion)
 	}
 	if version != currentSchemaVersion {
-		return nil, model.Channel{}, fmt.Errorf("%w: %d", ErrUnsupportedSchemaVersion, version)
+		return nil, model.Channel{}, false, fmt.Errorf("%w: %d", ErrUnsupportedSchemaVersion, version)
 	}
 
 	for i := range raw.Jobs {
@@ -150,7 +154,7 @@ func (s Store) Load() ([]model.Job, model.Channel, error) {
 		}
 	}
 
-	return raw.Jobs, raw.Channel, nil
+	return raw.Jobs, raw.Channel, raw.Paused, nil
 }
 
 func schemaVersion(schemaVersion, version *int) (int, bool) {

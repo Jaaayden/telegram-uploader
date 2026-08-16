@@ -41,10 +41,10 @@ func TestStoreRoundTrip(t *testing.T) {
 	channel := model.Channel{ID: -100123, AccessHash: 456, Title: "Videos"}
 
 	store := Store(path)
-	if err := store.Save(jobs, channel); err != nil {
+	if err := store.Save(jobs, channel, true); err != nil {
 		t.Fatalf("Save() error = %v", err)
 	}
-	gotJobs, gotChannel, err := store.Load()
+	gotJobs, gotChannel, gotPaused, err := store.Load()
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
@@ -53,6 +53,9 @@ func TestStoreRoundTrip(t *testing.T) {
 	}
 	if gotChannel != channel {
 		t.Fatalf("channel = %#v, want %#v", gotChannel, channel)
+	}
+	if !gotPaused {
+		t.Fatal("paused = false, want true")
 	}
 
 	var saved map[string]json.RawMessage
@@ -69,12 +72,27 @@ func TestStoreRoundTrip(t *testing.T) {
 	}
 }
 
+func TestStoreLoadLegacyDocumentDefaultsToUnpaused(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "queue.json")
+	legacy := []byte(`{"schema_version":1,"jobs":[],"channel":{}}`)
+	if err := os.WriteFile(path, legacy, 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	_, _, paused, err := Store(path).Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if paused {
+		t.Fatal("legacy queue loaded as paused, want false")
+	}
+}
+
 func TestStoreSaveUsesPrivatePermissions(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("Windows does not provide Unix permission semantics")
 	}
 	path := filepath.Join(t.TempDir(), "queue.json")
-	if err := Store(path).Save(nil, model.Channel{}); err != nil {
+	if err := Store(path).Save(nil, model.Channel{}, false); err != nil {
 		t.Fatalf("Save() error = %v", err)
 	}
 	info, err := os.Stat(path)
@@ -95,11 +113,11 @@ func TestStoreLoadRecoversActiveJobs(t *testing.T) {
 		{ID: "sent", State: model.JobSent, Uploaded: 400, RandomID: 4},
 		{ID: "queued", State: model.JobQueued, Uploaded: 500, RandomID: 5},
 	}
-	if err := Store(path).Save(jobs, model.Channel{}); err != nil {
+	if err := Store(path).Save(jobs, model.Channel{}, false); err != nil {
 		t.Fatalf("Save() error = %v", err)
 	}
 
-	got, _, err := Store(path).Load()
+	got, _, _, err := Store(path).Load()
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
@@ -129,7 +147,7 @@ func TestStoreLoadRecoversActiveJobs(t *testing.T) {
 
 func TestStoreLoadMissingIsEmpty(t *testing.T) {
 	store := Store(filepath.Join(t.TempDir(), "missing.json"))
-	jobs, channel, err := store.Load()
+	jobs, channel, paused, err := store.Load()
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
@@ -139,6 +157,9 @@ func TestStoreLoadMissingIsEmpty(t *testing.T) {
 	if channel != (model.Channel{}) {
 		t.Fatalf("channel = %#v, want zero value", channel)
 	}
+	if paused {
+		t.Fatal("paused = true for missing queue, want false")
+	}
 }
 
 func TestStoreLoadRejectsCorruptJSON(t *testing.T) {
@@ -146,14 +167,14 @@ func TestStoreLoadRejectsCorruptJSON(t *testing.T) {
 	if err := os.WriteFile(path, []byte(`{"schema_version":1,"jobs":[`), 0o600); err != nil {
 		t.Fatalf("WriteFile() error = %v", err)
 	}
-	if _, _, err := Store(path).Load(); err == nil {
+	if _, _, _, err := Store(path).Load(); err == nil {
 		t.Fatal("Load() error = nil, want corrupt JSON error")
 	}
 }
 
 func TestStoreLoadRejectsUnknownNewerVersion(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "queue.json")
-	if err := Store(path).Save(nil, model.Channel{}); err != nil {
+	if err := Store(path).Save(nil, model.Channel{}, false); err != nil {
 		t.Fatalf("Save() error = %v", err)
 	}
 	data, err := os.ReadFile(path)
@@ -173,7 +194,7 @@ func TestStoreLoadRejectsUnknownNewerVersion(t *testing.T) {
 		t.Fatalf("WriteFile() error = %v", err)
 	}
 
-	if _, _, err := Store(path).Load(); !errors.Is(err, ErrUnsupportedSchemaVersion) {
+	if _, _, _, err := Store(path).Load(); !errors.Is(err, ErrUnsupportedSchemaVersion) {
 		t.Fatalf("Load() error = %v, want ErrUnsupportedSchemaVersion", err)
 	}
 }
@@ -181,7 +202,7 @@ func TestStoreLoadRejectsUnknownNewerVersion(t *testing.T) {
 func TestStoreSaveLeavesNoTemporaryFile(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "queue.json")
-	if err := Store(path).Save(nil, model.Channel{}); err != nil {
+	if err := Store(path).Save(nil, model.Channel{}, false); err != nil {
 		t.Fatalf("Save() error = %v", err)
 	}
 	matches, err := filepath.Glob(filepath.Join(dir, ".queue.json.tmp-*"))
