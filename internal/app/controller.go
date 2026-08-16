@@ -183,6 +183,69 @@ func (c *Controller) Scan(folder string, maxBytes int64) error {
 	return c.persist()
 }
 
+// ApplyUploadLimit updates only jobs whose eligibility can still change. It
+// is used when a folder was scanned before Telegram reported the current Bot
+// upload limit, and deliberately preserves sent, failed and active history.
+func (c *Controller) ApplyUploadLimit(maxBytes int64) error {
+	if maxBytes <= 0 {
+		return errors.New("上传上限必须大于 0")
+	}
+	if !c.opMu.TryLock() {
+		return errors.New("上传、扫描或移动操作正在进行，请稍后重试")
+	}
+	defer c.opMu.Unlock()
+
+	c.mu.Lock()
+	if c.running {
+		c.mu.Unlock()
+		return errors.New("上传进行中，不能更新文件上限")
+	}
+	changed := false
+	for i := range c.jobs {
+		job := &c.jobs[i]
+		switch job.State {
+		case model.JobQueued, model.JobInterrupted, model.JobOversize:
+		default:
+			continue
+		}
+		if job.Size > maxBytes {
+			if job.State != model.JobOversize || job.Uploaded != 0 {
+				job.State = model.JobOversize
+				resetPendingJobProgress(job)
+				changed = true
+			}
+		} else if job.State == model.JobOversize {
+			job.State = model.JobQueued
+			resetPendingJobProgress(job)
+			changed = true
+		}
+	}
+	if changed {
+		c.notifyLocked()
+	}
+	c.mu.Unlock()
+	if !changed {
+		return nil
+	}
+	if err := c.persist(); err != nil {
+		c.setPersistenceError(err)
+		return err
+	}
+	return nil
+}
+
+func resetPendingJobProgress(job *model.Job) {
+	job.Uploaded = 0
+	job.BytesPerSecond = 0
+	job.MessageID = 0
+	job.ChannelID = 0
+	job.Metadata = model.VideoMetadata{}
+	job.Error = ""
+	job.StartedAt = nil
+	job.CompletedAt = nil
+	job.MoveDestination = ""
+}
+
 func (c *Controller) SetChannel(channel model.Channel) error {
 	if !c.opMu.TryLock() {
 		return errors.New("上传、扫描或移动操作正在进行，请稍后重试")
@@ -825,14 +888,10 @@ func (c *Controller) snapshotLocked() Snapshot {
 		LastError: c.lastError,
 	}
 	for _, job := range jobs {
-		switch job.State {
-		case model.JobQueued, model.JobInterrupted, model.JobUploading, model.JobSending, model.JobSent:
-			snapshot.TotalBytes += job.Size
-		}
-		if job.State == model.JobSent {
-			snapshot.DoneBytes += job.Size
-		} else if job.State == model.JobUploading || job.State == model.JobSending {
-			snapshot.DoneBytes += job.Uploaded
+		total, done := jobProgressBytes(job)
+		snapshot.TotalBytes += total
+		snapshot.DoneBytes += done
+		if job.State == model.JobUploading || job.State == model.JobSending {
 			snapshot.BytesPerSecond += job.BytesPerSecond
 		}
 	}
@@ -840,4 +899,22 @@ func (c *Controller) snapshotLocked() Snapshot {
 		snapshot.ETA = time.Duration(float64(snapshot.TotalBytes-snapshot.DoneBytes)/snapshot.BytesPerSecond) * time.Second
 	}
 	return snapshot
+}
+
+func jobProgressBytes(job model.Job) (total, done int64) {
+	if job.Size <= 0 {
+		return 0, 0
+	}
+	total = job.Size
+	if job.State == model.JobSent || job.State == model.JobMoved {
+		return total, total
+	}
+	done = job.Uploaded
+	if done < 0 {
+		done = 0
+	}
+	if done > total {
+		done = total
+	}
+	return total, done
 }

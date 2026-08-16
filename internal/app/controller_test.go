@@ -96,6 +96,76 @@ func TestControllerUploadsSeriallyWithExactRequestAndProgress(t *testing.T) {
 	}
 }
 
+func TestApplyUploadLimitPreservesHistoryAndJobIdentity(t *testing.T) {
+	jobs := []model.Job{
+		{ID: "queued", Name: "queued.mp4", Size: 100, State: model.JobQueued, RandomID: 11},
+		{ID: "interrupted", Name: "interrupted.mp4", Size: 200, State: model.JobInterrupted, Uploaded: 80, RandomID: 12},
+		{
+			ID: "formerly-oversize", Name: "small.mp4", Size: 50,
+			State: model.JobOversize, Uploaded: 49, BytesPerSecond: 12,
+			RandomID: 13, Metadata: model.VideoMetadata{Width: 1920},
+			MoveDestination: "/stale/destination.mp4",
+		},
+		{ID: "sent", Name: "sent.mp4", Size: 500, State: model.JobSent, Uploaded: 500, RandomID: 14},
+		{ID: "failed", Name: "failed.mp4", Size: 500, State: model.JobFailed, Uploaded: 20, RandomID: 15},
+	}
+	store := &memoryQueueStore{jobs: jobs, channel: testChannel()}
+	controller := NewController(store, nil)
+	if err := controller.Load(); err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if err := controller.ApplyUploadLimit(150); err != nil {
+		t.Fatalf("ApplyUploadLimit() error = %v", err)
+	}
+
+	got := controller.Snapshot().Jobs
+	wantStates := []model.JobState{
+		model.JobQueued,
+		model.JobOversize,
+		model.JobQueued,
+		model.JobSent,
+		model.JobFailed,
+	}
+	for i := range got {
+		if got[i].State != wantStates[i] {
+			t.Errorf("job %d state = %s, want %s", i, got[i].State, wantStates[i])
+		}
+		if got[i].ID != jobs[i].ID || got[i].RandomID != jobs[i].RandomID {
+			t.Errorf("job %d identity changed: got ID=%q randomID=%d", i, got[i].ID, got[i].RandomID)
+		}
+	}
+	if got[1].Uploaded != 0 {
+		t.Errorf("new oversize job Uploaded = %d, want 0", got[1].Uploaded)
+	}
+	if got[2].Uploaded != 0 || got[2].BytesPerSecond != 0 || got[2].Metadata != (model.VideoMetadata{}) || got[2].MoveDestination != "" {
+		t.Errorf("re-enabled job retained transient state: %+v", got[2])
+	}
+	if got[4].Uploaded != jobs[4].Uploaded {
+		t.Errorf("failed history Uploaded = %d, want %d", got[4].Uploaded, jobs[4].Uploaded)
+	}
+}
+
+func TestSnapshotProgressUsesStableQueueTotal(t *testing.T) {
+	controller := NewController(nil, nil)
+	controller.jobs = []model.Job{
+		{Size: 100, State: model.JobQueued},
+		{Size: 200, State: model.JobFailed, Uploaded: 50},
+		{Size: 300, State: model.JobConfirming, Uploaded: 250},
+		{Size: 400, State: model.JobSent},
+		{Size: 500, State: model.JobCancelled, Uploaded: 600},
+		{Size: 600, State: model.JobOversize, Uploaded: -1},
+		{Size: 700, State: model.JobMoved},
+	}
+
+	snapshot := controller.Snapshot()
+	if snapshot.TotalBytes != 2800 {
+		t.Fatalf("TotalBytes = %d, want 2800", snapshot.TotalBytes)
+	}
+	if snapshot.DoneBytes != 1900 {
+		t.Fatalf("DoneBytes = %d, want 1900", snapshot.DoneBytes)
+	}
+}
+
 func TestControllerCancelOneJobContinuesWithNext(t *testing.T) {
 	jobs, _ := fixtureJobs(t, []fixtureJob{
 		{Name: "cancel-me.mp4", RandomID: 7201},

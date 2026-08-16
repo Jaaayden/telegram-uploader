@@ -58,6 +58,8 @@ type window struct {
 
 	settingsMu sync.Mutex
 	settings   coreapp.Settings
+	scanMu     sync.Mutex
+	scanning   bool
 
 	rootCtx    context.Context
 	rootCancel context.CancelFunc
@@ -94,7 +96,10 @@ type window struct {
 	cancelAllButton    *widget.Button
 	moveButton         *widget.Button
 	cancelMoveButton   *widget.Button
-	list               *widget.List
+	queueScroll        *container.Scroll
+	queueRows          *fyne.Container
+	jobRows            map[string]*jobRow
+	jobOrder           []string
 	progress           *widget.ProgressBar
 	progressSummary    *widget.Label
 	operationProgress  *widget.ProgressBar
@@ -164,7 +169,7 @@ func (u *window) build() {
 		u.operationProgress,
 		u.operationLabel,
 	)
-	queueContent := container.NewBorder(queueTop, nil, nil, nil, u.list)
+	queueContent := container.NewBorder(queueTop, nil, nil, nil, u.queueScroll)
 
 	split := container.NewHSplit(settingsScroll, queueContent)
 	split.SetOffset(0.30)
@@ -220,28 +225,35 @@ func (u *window) buildFields() {
 }
 
 func (u *window) buildQueue() {
-	u.list = widget.NewList(
-		func() int { return len(u.snapshot.Jobs) },
-		func() fyne.CanvasObject { return newJobRow() },
-		u.updateJobRow,
-	)
-	u.list.HideSeparators = false
+	u.queueRows = container.NewVBox()
+	u.queueScroll = container.NewVScroll(u.queueRows)
+	u.jobRows = make(map[string]*jobRow)
 }
 
 func newJobRow() *jobRow {
-	name := widget.NewLabel("")
+	name := widget.NewLabelWithStyle("文件名", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
+	name.Truncation = fyne.TextTruncateEllipsis
 	details := widget.NewLabel("")
+	details.Truncation = fyne.TextTruncateEllipsis
 	status := widget.NewLabel("")
+	status.Truncation = fyne.TextTruncateEllipsis
 	progress := widget.NewProgressBar()
 	cancel := widget.NewButton("取消", nil)
 	retry := widget.NewButton("重试", nil)
 	skip := widget.NewButton("跳过", nil)
 	markSent := widget.NewButton("已发送", nil)
 
+	cancel.Hide()
+	retry.Hide()
+	skip.Hide()
+	markSent.Hide()
+
 	actions := container.NewHBox(cancel, retry, skip, markSent)
 	body := container.NewVBox(name, details, progress, status)
+	content := container.NewBorder(nil, nil, nil, actions, body)
+	rowContainer := container.NewBorder(nil, widget.NewSeparator(), nil, nil, container.NewPadded(content))
 	return &jobRow{
-		Container: container.NewBorder(nil, nil, nil, actions, body),
+		Container: rowContainer,
 		name:      name,
 		details:   details,
 		status:    status,
@@ -253,9 +265,10 @@ func newJobRow() *jobRow {
 	}
 }
 
-// jobRow is used as a pooled widget.List row.  UpdateJobRow must rebind all
-// callbacks because Fyne reuses the same row for different item IDs while
-// scrolling.
+// jobRow is stable for a job ID. Keeping the widgets instead of relying on a
+// virtual list row pool makes file names and per-file progress deterministic
+// across refreshes while the surrounding scroll container still bounds the
+// visible window.
 type jobRow struct {
 	*fyne.Container
 	name     *widget.Label
@@ -268,14 +281,9 @@ type jobRow struct {
 	markSent *widget.Button
 }
 
-func (u *window) updateJobRow(id widget.ListItemID, object fyne.CanvasObject) {
-	row, ok := object.(*jobRow)
-	if !ok || int(id) < 0 || int(id) >= len(u.snapshot.Jobs) {
-		return
-	}
-	job := u.snapshot.Jobs[int(id)]
+func (u *window) updateJobRow(row *jobRow, job model.Job) {
 	row.name.SetText(job.Name)
-	row.details.SetText(fmt.Sprintf("%s · %s", formatBytes(job.Size), job.Path))
+	row.details.SetText(fmt.Sprintf("第 %d 个 · %s", job.Position+1, formatBytes(job.Size)))
 	row.status.SetText(jobStatus(job))
 	row.progress.SetValue(jobFraction(job))
 
@@ -302,6 +310,46 @@ func (u *window) updateJobRow(id widget.ListItemID, object fyne.CanvasObject) {
 		row.retry.OnTapped = func() { u.retryJob(jobID) }
 	}
 	row.Container.Refresh()
+}
+
+func (u *window) refreshQueueRows(jobs []model.Job) {
+	orderChanged := len(u.jobOrder) != len(jobs)
+	if !orderChanged {
+		for i, job := range jobs {
+			if u.jobOrder[i] != job.ID {
+				orderChanged = true
+				break
+			}
+		}
+	}
+
+	if orderChanged {
+		nextRows := make(map[string]*jobRow, len(jobs))
+		nextOrder := make([]string, 0, len(jobs))
+		objects := make([]fyne.CanvasObject, 0, len(jobs))
+		for _, job := range jobs {
+			row := u.jobRows[job.ID]
+			if row == nil {
+				row = newJobRow()
+			}
+			nextRows[job.ID] = row
+			nextOrder = append(nextOrder, job.ID)
+			objects = append(objects, row.Container)
+		}
+		u.jobRows = nextRows
+		u.jobOrder = nextOrder
+		u.queueRows.Objects = objects
+	}
+
+	for _, job := range jobs {
+		if row := u.jobRows[job.ID]; row != nil {
+			u.updateJobRow(row, job)
+		}
+	}
+	if orderChanged {
+		u.queueRows.Refresh()
+		u.queueScroll.Refresh()
+	}
 }
 
 func (u *window) applyLoadedSettings() {
@@ -371,7 +419,7 @@ func (u *window) applySnapshot(snapshot coreapp.Snapshot) {
 		// every coalesced snapshot.
 		u.operationLabel.SetText(snapshot.LastError)
 	}
-	u.list.Refresh()
+	u.refreshQueueRows(snapshot.Jobs)
 	u.updateActionAvailability()
 	if !snapshot.Running {
 		u.stopSleepGuard()
@@ -589,11 +637,17 @@ func (u *window) waitClientReady(client *tgtransport.Client, ctx context.Context
 		u.applySnapshot(u.controller.Snapshot())
 	})
 
-	// A folder selected before connection is scanned only after the server's
-	// current upload limit is known.
+	// A folder selected before connection is already visible. Once Telegram
+	// reports the current limit, update only still-pending eligibility without
+	// replacing sent history or the persisted random IDs.
 	folder := u.settingsSnapshot().LastFolder
-	if folder != "" && u.controller.Snapshot().Folder == "" {
-		u.scanFolder(folder, identity.MaxUploadBytes)
+	if folder != "" && !u.scanInProgress() {
+		snapshot := u.controller.Snapshot()
+		if snapshot.Folder == "" {
+			u.scanFolder(folder, identity.MaxUploadBytes)
+		} else if err := u.controller.ApplyUploadLimit(identity.MaxUploadBytes); err != nil {
+			u.showError(err)
+		}
 	}
 }
 
@@ -697,31 +751,69 @@ func (u *window) chooseFolder() {
 			return
 		}
 		u.folderLabel.SetText(folder)
-		if !u.connected {
-			u.operationLabel.SetText("文件夹已选择，连接 Bot 后会按当前上传上限扫描")
-			return
+		maxBytes := int64(0)
+		if u.connected {
+			maxBytes = u.identity.MaxUploadBytes
 		}
-		u.scanFolder(folder, u.identity.MaxUploadBytes)
+		u.scanFolder(folder, maxBytes)
 	}, u.window)
 }
 
 func (u *window) scanFolder(folder string, maxBytes int64) {
+	if !u.beginScan() {
+		return
+	}
 	u.doUI(func() {
 		u.chooseFolderButton.Disable()
 		u.operationLabel.SetText("正在扫描当前文件夹……")
 	})
 	go func() {
 		err := u.controller.Scan(folder, maxBytes)
+		u.endScan()
 		if err != nil {
 			u.showError(err)
 		}
 		u.doUI(func() {
 			u.chooseFolderButton.Enable()
 			if err == nil {
+				if maxBytes <= 0 && u.connected && u.identity.MaxUploadBytes > 0 {
+					limit := u.identity.MaxUploadBytes
+					u.operationLabel.SetText("扫描完成，正在应用 Bot 上传上限……")
+					go func() {
+						if limitErr := u.controller.ApplyUploadLimit(limit); limitErr != nil {
+							u.showError(limitErr)
+							return
+						}
+						u.doUI(func() { u.operationLabel.SetText("扫描完成") })
+					}()
+					return
+				}
 				u.operationLabel.SetText("扫描完成")
 			}
 		})
 	}()
+}
+
+func (u *window) beginScan() bool {
+	u.scanMu.Lock()
+	defer u.scanMu.Unlock()
+	if u.scanning {
+		return false
+	}
+	u.scanning = true
+	return true
+}
+
+func (u *window) endScan() {
+	u.scanMu.Lock()
+	u.scanning = false
+	u.scanMu.Unlock()
+}
+
+func (u *window) scanInProgress() bool {
+	u.scanMu.Lock()
+	defer u.scanMu.Unlock()
+	return u.scanning
 }
 
 func (u *window) startUploads() {
@@ -992,22 +1084,20 @@ func (u *window) hasOversizeJobs() bool {
 }
 
 func jobFraction(job model.Job) float64 {
-	switch job.State {
-	case model.JobSent, model.JobMoved:
+	if job.State == model.JobSent || job.State == model.JobMoved {
 		return 1
-	case model.JobUploading, model.JobSending:
-		if job.Size > 0 {
-			fraction := float64(job.Uploaded) / float64(job.Size)
-			if fraction < 0 {
-				return 0
-			}
-			if fraction > 1 {
-				return 1
-			}
-			return fraction
-		}
 	}
-	return 0
+	if job.Size <= 0 {
+		return 0
+	}
+	fraction := float64(job.Uploaded) / float64(job.Size)
+	if fraction < 0 {
+		return 0
+	}
+	if fraction > 1 {
+		return 1
+	}
+	return fraction
 }
 
 func jobStatus(job model.Job) string {
@@ -1017,9 +1107,9 @@ func jobStatus(job model.Job) string {
 	case model.JobOversize:
 		return "超过 Bot 当前上传上限，未上传"
 	case model.JobUploading:
-		return fmt.Sprintf("上传中 · %s/s", formatBytes(int64(job.BytesPerSecond)))
+		return fmt.Sprintf("上传中 · %s / %s · %s/s", formatBytes(job.Uploaded), formatBytes(job.Size), formatBytes(int64(job.BytesPerSecond)))
 	case model.JobSending:
-		return "正在提交频道消息……"
+		return fmt.Sprintf("上传完成 · %s / %s · 正在提交频道消息……", formatBytes(job.Uploaded), formatBytes(job.Size))
 	case model.JobConfirming:
 		if job.Error != "" {
 			return "待确认：" + job.Error
