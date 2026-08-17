@@ -42,6 +42,12 @@ func TestControllerUploadsSeriallyWithExactRequestAndProgress(t *testing.T) {
 			BytesPerSecond: 128,
 			At:             time.Now(),
 		})
+		if request.BeforeSend == nil {
+			return 0, errors.New("missing pre-send durability callback")
+		}
+		if err := request.BeforeSend(); err != nil {
+			return 0, err
+		}
 		return int(request.RandomID), nil
 	}
 
@@ -891,6 +897,44 @@ func TestControllerPersistenceFailureStopsBeforeSendingNextJob(t *testing.T) {
 	}
 }
 
+func TestControllerPreSendPersistenceFailurePreventsMessageSubmission(t *testing.T) {
+	jobs, _ := fixtureJobs(t, []fixtureJob{{Name: "pre-send-persist.mp4", RandomID: 7351}})
+	store := &memoryQueueStore{jobs: jobs, channel: testChannel()}
+	persistFailure := errors.New("disk failed at pre-send boundary")
+	submitted := make(chan struct{}, 1)
+	gateway := &fakeGateway{}
+	gateway.upload = func(_ context.Context, request tgtransport.UploadRequest, progress func(model.Progress)) (int, error) {
+		progress(model.Progress{BytesDone: jobs[0].Size, BytesTotal: jobs[0].Size, At: time.Now()})
+		store.mu.Lock()
+		store.saveErr = persistFailure
+		store.mu.Unlock()
+		if request.BeforeSend == nil {
+			return 0, errors.New("missing pre-send durability callback")
+		}
+		if err := request.BeforeSend(); err != nil {
+			return 0, err
+		}
+		submitted <- struct{}{}
+		return int(request.RandomID), nil
+	}
+
+	controller := newLoadedController(t, store, gateway)
+	if err := controller.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	final := waitForSnapshot(t, controller, func(snapshot Snapshot) bool {
+		return !snapshot.Running && len(snapshot.Jobs) == 1 && snapshot.Jobs[0].State == model.JobFailed
+	})
+	select {
+	case <-submitted:
+		t.Fatal("message submission continued after pre-send state persistence failed")
+	default:
+	}
+	if !strings.Contains(final.Jobs[0].Error, "保存消息提交状态失败") {
+		t.Fatalf("failed job error = %q, want pre-send persistence detail", final.Jobs[0].Error)
+	}
+}
+
 func TestControllerRetriesPreSendFailureThenContinuesQueue(t *testing.T) {
 	jobs, _ := fixtureJobs(t, []fixtureJob{
 		{Name: "retry.mp4", RandomID: 7351},
@@ -1277,6 +1321,59 @@ func TestControllerIgnoresProgressFromPreviousRetryAttempt(t *testing.T) {
 	})
 	if got := controller.Snapshot().Jobs[0]; got.Uploaded != 25 || got.BytesPerSecond != 50 {
 		t.Fatalf("current attempt progress = %+v, want 25 bytes at 50 B/s", got)
+	}
+}
+
+func TestControllerDoesNotPersistIntermediateUploadProgress(t *testing.T) {
+	store := &memoryQueueStore{}
+	controller := NewController(store, nil)
+	controller.jobs = []model.Job{{ID: "job", Size: 100, State: model.JobUploading}}
+	controller.activeID = "job"
+	controller.activeAttempt = 1
+
+	for _, uploaded := range []int64{10, 40, 80} {
+		controller.applyProgressForAttempt(0, "job", 1, model.Progress{
+			BytesDone:      uploaded,
+			BytesTotal:     100,
+			BytesPerSecond: 50,
+			At:             time.Now(),
+		})
+	}
+	if got := store.savesCount(); got != 0 {
+		t.Fatalf("intermediate progress saves = %d, want 0", got)
+	}
+
+	controller.applyProgressForAttempt(0, "job", 1, model.Progress{
+		BytesDone:      100,
+		BytesTotal:     100,
+		BytesPerSecond: 50,
+		At:             time.Now(),
+	})
+	if got := store.savesCount(); got != 0 {
+		t.Fatalf("final byte progress saves = %d, want 0", got)
+	}
+	if err := controller.prepareSendForAttempt(0, "job", 1); err != nil {
+		t.Fatalf("prepareSendForAttempt() error = %v", err)
+	}
+	if got := store.savesCount(); got != 1 {
+		t.Fatalf("explicit pre-send transition saves = %d, want 1", got)
+	}
+	if got := store.SnapshotJobs()[0]; got.State != model.JobSending || got.Uploaded != 100 {
+		t.Fatalf("persisted final progress = %+v, want sending at 100 bytes", got)
+	}
+
+	// Repeated or stale callbacks must not add disk writes or regress speed.
+	controller.applyProgressForAttempt(0, "job", 1, model.Progress{
+		BytesDone:      80,
+		BytesTotal:     100,
+		BytesPerSecond: 1,
+		At:             time.Now(),
+	})
+	if got := store.savesCount(); got != 1 {
+		t.Fatalf("repeated/stale progress saves = %d, want 1", got)
+	}
+	if got := controller.Snapshot().Jobs[0]; got.Uploaded != 100 || got.BytesPerSecond != 0 {
+		t.Fatalf("stale progress changed current snapshot: %+v", got)
 	}
 }
 

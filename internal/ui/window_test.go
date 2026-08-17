@@ -10,7 +10,49 @@ import (
 	"fyne.io/fyne/v2/test"
 	coreapp "github.com/jayden/telegram-video-uploader/internal/app"
 	"github.com/jayden/telegram-video-uploader/internal/model"
+	tgtransport "github.com/jayden/telegram-video-uploader/internal/telegram"
 )
+
+func TestUploadConcurrencyOptionMapping(t *testing.T) {
+	options := uploadConcurrencyOptions()
+	wantOptions := []string{
+		uploadConcurrencyCompatibilityLabel,
+		uploadConcurrencyBalancedLabel,
+		uploadConcurrencyFastLabel,
+	}
+	if len(options) != len(wantOptions) {
+		t.Fatalf("upload concurrency options = %#v, want %#v", options, wantOptions)
+	}
+	for index := range wantOptions {
+		if options[index] != wantOptions[index] {
+			t.Fatalf("option[%d] = %q, want %q", index, options[index], wantOptions[index])
+		}
+	}
+
+	tests := []struct {
+		option string
+		value  int
+	}{
+		{option: uploadConcurrencyCompatibilityLabel, value: tgtransport.UploadConcurrencyCompatibility},
+		{option: uploadConcurrencyBalancedLabel, value: tgtransport.UploadConcurrencyBalanced},
+		{option: uploadConcurrencyFastLabel, value: tgtransport.UploadConcurrencyFast},
+	}
+	for _, test := range tests {
+		got, ok := uploadConcurrencyForOption(test.option)
+		if !ok || got != test.value {
+			t.Errorf("uploadConcurrencyForOption(%q) = (%d, %v), want (%d, true)", test.option, got, ok, test.value)
+		}
+		if got := uploadConcurrencyOptionFor(test.value); got != test.option {
+			t.Errorf("uploadConcurrencyOptionFor(%d) = %q, want %q", test.value, got, test.option)
+		}
+	}
+	if _, ok := uploadConcurrencyForOption("未知档位"); ok {
+		t.Fatal("unknown upload concurrency option was accepted")
+	}
+	if got := normalizeUploadConcurrency(0); got != tgtransport.DefaultUploadConcurrency {
+		t.Fatalf("normalizeUploadConcurrency(0) = %d, want %d", got, tgtransport.DefaultUploadConcurrency)
+	}
+}
 
 func TestRefreshQueueRowsShowsNamesProgressAndReusesRows(t *testing.T) {
 	application := test.NewApp()

@@ -53,8 +53,12 @@ type Client struct {
 	binding           chan BindingEvent
 
 	uploadSem chan struct{}
-	sendMu    sync.Mutex
-	lastSend  time.Time
+	// uploadConcurrency is read once for each video. The connection pool is
+	// created at the largest supported profile and grows lazily, so changing
+	// this value does not require reconnecting Telegram.
+	uploadConcurrency int
+	sendMu            sync.Mutex
+	lastSend          time.Time
 }
 
 func NewClient(cfg Config, events Events) (*Client, error) {
@@ -70,14 +74,16 @@ func NewClient(cfg Config, events Events) (*Client, error) {
 	if cfg.SessionStorage == nil {
 		cfg.SessionStorage = &session.StorageMemory{}
 	}
+	cfg.UploadConcurrency = normalizeUploadConcurrency(cfg.UploadConcurrency)
 
 	c := &Client{
-		cfg:       cfg,
-		events:    events,
-		ready:     make(chan struct{}),
-		runDone:   make(chan struct{}),
-		binding:   make(chan BindingEvent, 4),
-		uploadSem: make(chan struct{}, 1),
+		cfg:               cfg,
+		events:            events,
+		ready:             make(chan struct{}),
+		runDone:           make(chan struct{}),
+		binding:           make(chan BindingEvent, 4),
+		uploadSem:         make(chan struct{}, 1),
+		uploadConcurrency: cfg.UploadConcurrency,
 	}
 	c.flood = &floodGate{onWait: events.OnFloodWait}
 
@@ -221,7 +227,10 @@ func (c *Client) Run(ctx context.Context) (retErr error) {
 		}
 
 		maxBytes, maxUploadExact := c.queryMaxUploadBytes(runCtx)
-		uploadPool, err := c.raw.Pool(uploadConnectionCount)
+		// gotd pools open connections on demand. Keeping the ceiling at the
+		// largest supported profile lets a setting change take effect for the
+		// next video without eagerly creating twelve connections.
+		uploadPool, err := c.raw.Pool(uploadConnectionPoolMaximum)
 		if err != nil {
 			return fmt.Errorf("创建上传连接池失败：%w", err)
 		}
@@ -243,6 +252,31 @@ func (c *Client) Run(ctx context.Context) (retErr error) {
 			},
 		})
 	})
+}
+
+func normalizeUploadConcurrency(value int) int {
+	switch value {
+	case UploadConcurrencyCompatibility, UploadConcurrencyBalanced, UploadConcurrencyFast:
+		return value
+	default:
+		return DefaultUploadConcurrency
+	}
+}
+
+// SetUploadConcurrency changes the part concurrency used by the next video.
+// It returns the normalized supported value that was applied.
+func (c *Client) SetUploadConcurrency(value int) int {
+	value = normalizeUploadConcurrency(value)
+	c.mu.Lock()
+	c.uploadConcurrency = value
+	c.mu.Unlock()
+	return value
+}
+
+func (c *Client) currentUploadConcurrency() int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return normalizeUploadConcurrency(c.uploadConcurrency)
 }
 
 func (c *Client) WaitReady(ctx context.Context) (Identity, error) {

@@ -32,7 +32,24 @@ type Config struct {
 	BotToken       string
 	Proxy          *ProxyConfig
 	SessionStorage session.Storage
+	// UploadConcurrency controls the number of parts transferred in parallel
+	// for one video. Zero and unsupported values use the balanced default.
+	UploadConcurrency int
 }
+
+const (
+	// UploadConcurrencyCompatibility minimizes simultaneous Telegram
+	// connections for restrictive proxies and unstable networks.
+	UploadConcurrencyCompatibility = 4
+	// UploadConcurrencyBalanced is the default. With 512 KiB parts it keeps up
+	// to 4 MiB in flight, which is a better fit for high-bandwidth/high-latency
+	// links than the previous four-part limit.
+	UploadConcurrencyBalanced = 8
+	// UploadConcurrencyFast trades additional connections and memory for a
+	// larger in-flight window. The UI deliberately exposes no unbounded value.
+	UploadConcurrencyFast    = 12
+	DefaultUploadConcurrency = UploadConcurrencyBalanced
+)
 
 type ConnectionState string
 
@@ -67,6 +84,10 @@ type UploadRequest struct {
 	Caption  string
 	RandomID int64
 	Metadata model.VideoMetadata
+	// BeforeSend runs after every file part is confirmed but before the
+	// messages.sendMedia request. Returning an error guarantees that no channel
+	// message is submitted.
+	BeforeSend func() error
 }
 
 // Gateway is the transport boundary used by the queue controller. The real

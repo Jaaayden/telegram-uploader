@@ -91,7 +91,6 @@ type Controller struct {
 	cancelAllRequested bool
 	retryWaitActive    bool
 	updates            chan Snapshot
-	lastPersist        time.Time
 	uploadRetryDelays  []time.Duration
 	uploadRetryWait    func(context.Context, time.Duration) error
 }
@@ -1172,6 +1171,9 @@ func (c *Controller) uploadJobWithRetry(
 				Caption:  captionFromFilename(job.Name),
 				RandomID: job.RandomID,
 				Metadata: metadata,
+				BeforeSend: func() error {
+					return c.prepareSendForAttempt(index, job.ID, attemptID)
+				},
 			}, func(progress model.Progress) {
 				c.applyProgressForAttempt(index, job.ID, attemptID, progress)
 			})
@@ -1346,24 +1348,54 @@ func (c *Controller) applyProgressForAttempt(index int, jobID string, attemptID 
 		c.mu.Unlock()
 		return
 	}
-	if progress.BytesDone > job.Uploaded {
-		job.Uploaded = progress.BytesDone
+	// Several gotd part workers can finish almost simultaneously. A callback
+	// that was prepared first may acquire the controller after a newer one; do
+	// not let it overwrite newer byte or speed information.
+	if progress.BytesDone < job.Uploaded {
+		c.mu.Unlock()
+		return
 	}
+	job.Uploaded = progress.BytesDone
 	job.BytesPerSecond = progress.BytesPerSecond
-	if progress.BytesTotal > 0 && progress.BytesDone >= progress.BytesTotal {
-		job.State = model.JobSending
-	}
 	c.notifyLocked()
-	shouldPersist := time.Since(c.lastPersist) >= time.Second
-	if shouldPersist {
-		c.lastPersist = time.Now()
-	}
 	c.mu.Unlock()
-	if shouldPersist {
-		if err := c.persist(); err != nil {
-			c.setPersistenceError(err)
-		}
+}
+
+func (c *Controller) prepareSendForAttempt(index int, jobID string, attemptID uint64) error {
+	c.mu.Lock()
+	if index < 0 || index >= len(c.jobs) || c.jobs[index].ID != jobID {
+		c.mu.Unlock()
+		return errors.New("消息提交前上传队列发生了变化")
 	}
+	if c.activeID != jobID || c.activeAttempt != attemptID {
+		c.mu.Unlock()
+		return errors.New("消息提交前上传任务已失效")
+	}
+	job := &c.jobs[index]
+	if job.State != model.JobUploading && job.State != model.JobSending {
+		state := job.State
+		c.mu.Unlock()
+		return fmt.Errorf("消息提交前任务状态已变为 %s", state)
+	}
+	if job.State == model.JobSending {
+		c.mu.Unlock()
+		return nil
+	}
+	job.State = model.JobSending
+	job.Uploaded = job.Size
+	job.BytesPerSecond = 0
+	c.notifyLocked()
+	c.mu.Unlock()
+
+	// Partial file parts cannot resume, so intermediate byte counters stay in
+	// memory. This one transition is different: it is the durable boundary that
+	// makes a crash during messages.sendMedia recover as Confirming rather than
+	// blindly retrying a possibly delivered message.
+	if err := c.persist(); err != nil {
+		c.setPersistenceError(err)
+		return fmt.Errorf("%w：保存消息提交状态失败：%v", errQueuePersistenceLost, err)
+	}
+	return nil
 }
 
 func (c *Controller) failJob(index int, jobID string, err error) {

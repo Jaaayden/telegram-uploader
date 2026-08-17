@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+
+	tgtransport "github.com/jayden/telegram-video-uploader/internal/telegram"
 )
 
 const settingsSchemaVersion = 1
@@ -46,6 +48,7 @@ type Settings struct {
 	ProxyUsername      string `json:"proxy_username,omitempty"`
 	LastFolder         string `json:"last_folder,omitempty"`
 	ScheduledStartUnix int64  `json:"scheduled_start_unix,omitempty"`
+	UploadConcurrency  int    `json:"upload_concurrency"`
 }
 
 type settingsDocument struct {
@@ -56,7 +59,7 @@ type settingsDocument struct {
 func LoadSettings(path string) (Settings, error) {
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
-		return Settings{}, nil
+		return normalizeSettings(Settings{}), nil
 	}
 	if err != nil {
 		return Settings{}, fmt.Errorf("读取设置失败：%w", err)
@@ -68,10 +71,11 @@ func LoadSettings(path string) (Settings, error) {
 	if document.SchemaVersion != settingsSchemaVersion {
 		return Settings{}, fmt.Errorf("不支持的设置文件版本：%d", document.SchemaVersion)
 	}
-	return document.Settings, nil
+	return normalizeSettings(document.Settings), nil
 }
 
 func SaveSettings(path string, settings Settings) error {
+	settings = normalizeSettings(settings)
 	payload, err := json.MarshalIndent(settingsDocument{
 		SchemaVersion: settingsSchemaVersion,
 		Settings:      settings,
@@ -115,6 +119,18 @@ func SaveSettings(path string, settings Settings) error {
 		return fmt.Errorf("同步设置目录失败：%w", err)
 	}
 	return nil
+}
+
+func normalizeSettings(settings Settings) Settings {
+	switch settings.UploadConcurrency {
+	case tgtransport.UploadConcurrencyCompatibility,
+		tgtransport.UploadConcurrencyBalanced,
+		tgtransport.UploadConcurrencyFast:
+		return settings
+	default:
+		settings.UploadConcurrency = tgtransport.DefaultUploadConcurrency
+		return settings
+	}
 }
 
 func syncSettingsDirectory(dir string) error {
