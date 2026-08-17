@@ -16,6 +16,7 @@ var (
 	ErrAlreadyRunning     = errors.New("Telegram 客户端已经在运行")
 	ErrWrongBotSession    = errors.New("保存的会话属于另一个 Bot，请清除会话后重试")
 	ErrChannelNotWritable = errors.New("Bot 没有该频道的发帖权限")
+	ErrUploadData         = errors.New("视频数据上传未完成")
 	ErrSendOutcomeUnknown = errors.New("频道消息的最终状态未知")
 )
 

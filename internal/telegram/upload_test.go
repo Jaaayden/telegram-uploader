@@ -10,6 +10,7 @@ import (
 
 	"github.com/gotd/td/telegram/uploader"
 	"github.com/gotd/td/tg"
+	"github.com/jayden/telegram-video-uploader/internal/model"
 )
 
 type zeroReader struct{}
@@ -197,5 +198,77 @@ func TestReserveSendSlotCancellationDoesNotReserveSlot(t *testing.T) {
 	}
 	if !client.lastSend.Equal(before) {
 		t.Fatalf("lastSend changed to %v after canceled wait; want %v", client.lastSend, before)
+	}
+}
+
+func TestUploadProgressReporterCoalescesIntermediateUpdatesButKeepsFinal(t *testing.T) {
+	var updates []model.Progress
+	reporter := &uploadProgressReporter{
+		started:  time.Now(),
+		interval: time.Hour,
+		callback: func(progress model.Progress) { updates = append(updates, progress) },
+	}
+
+	states := []uploader.ProgressState{
+		{Uploaded: 10, Total: 100},
+		{Uploaded: 50, Total: 100},
+		{Uploaded: 100, Total: 100},
+	}
+	for _, state := range states {
+		if err := reporter.Chunk(context.Background(), state); err != nil {
+			t.Fatalf("Chunk(%+v) error = %v", state, err)
+		}
+	}
+	if len(updates) != 2 || updates[0].BytesDone != 10 || updates[1].BytesDone != 100 {
+		t.Fatalf("progress updates = %+v, want first and final only", updates)
+	}
+}
+
+func TestUploadProgressReporterIgnoresOutOfOrderUpdates(t *testing.T) {
+	var updates []model.Progress
+	reporter := &uploadProgressReporter{
+		started:  time.Now(),
+		interval: 0,
+		callback: func(progress model.Progress) { updates = append(updates, progress) },
+	}
+	for _, uploaded := range []int64{80, 60, 100} {
+		if err := reporter.Chunk(context.Background(), uploader.ProgressState{Uploaded: uploaded, Total: 100}); err != nil {
+			t.Fatalf("Chunk(%d) error = %v", uploaded, err)
+		}
+	}
+	if len(updates) != 2 || updates[0].BytesDone != 80 || updates[1].BytesDone != 100 {
+		t.Fatalf("progress updates = %+v, want monotonic [80, 100]", updates)
+	}
+}
+
+func TestUploadProgressReporterSerializesConcurrentUpdates(t *testing.T) {
+	var updates []model.Progress
+	reporter := &uploadProgressReporter{
+		started:  time.Now(),
+		interval: 0,
+		callback: func(progress model.Progress) { updates = append(updates, progress) },
+	}
+	start := make(chan struct{})
+	var workers sync.WaitGroup
+	for _, uploaded := range []int64{10, 70, 30, 90, 20, 60, 100, 80} {
+		uploaded := uploaded
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			<-start
+			if err := reporter.Chunk(context.Background(), uploader.ProgressState{Uploaded: uploaded, Total: 100}); err != nil {
+				t.Errorf("Chunk(%d) error = %v", uploaded, err)
+			}
+		}()
+	}
+	close(start)
+	workers.Wait()
+	if len(updates) == 0 || updates[len(updates)-1].BytesDone != 100 {
+		t.Fatalf("final progress updates = %+v, want 100 bytes", updates)
+	}
+	for i := 1; i < len(updates); i++ {
+		if updates[i].BytesDone < updates[i-1].BytesDone {
+			t.Fatalf("progress regressed from %d to %d: %+v", updates[i-1].BytesDone, updates[i].BytesDone, updates)
+		}
 	}
 }

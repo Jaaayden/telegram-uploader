@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/gotd/td/telegram/message"
@@ -17,19 +18,60 @@ import (
 	"github.com/jayden/telegram-video-uploader/internal/model"
 )
 
-type progressFunc func(context.Context, uploader.ProgressState) error
-
 const (
 	// Telegram recommends 512 KiB parts to reduce protocol overhead. Four
 	// dedicated connections then keep up to 2 MiB in flight without making
 	// files concurrent.
-	uploadPartSize              = uploader.MaximumPartSize
-	uploadConnectionCount int64 = 4
-	uploadThreads               = int(uploadConnectionCount)
+	uploadPartSize               = uploader.MaximumPartSize
+	uploadConnectionCount  int64 = 4
+	uploadThreads                = int(uploadConnectionCount)
+	progressUpdateInterval       = 100 * time.Millisecond
 )
 
-func (f progressFunc) Chunk(ctx context.Context, state uploader.ProgressState) error {
-	return f(ctx, state)
+type uploadProgressReporter struct {
+	mu         sync.Mutex
+	started    time.Time
+	lastUpdate time.Time
+	lastBytes  int64
+	interval   time.Duration
+	callback   func(model.Progress)
+}
+
+func (p *uploadProgressReporter) Chunk(ctx context.Context, state uploader.ProgressState) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if state.Uploaded < p.lastBytes {
+		return nil
+	}
+	p.lastBytes = state.Uploaded
+	now := time.Now()
+	complete := state.Total > 0 && state.Uploaded >= state.Total
+	if !complete && !p.lastUpdate.IsZero() && now.Sub(p.lastUpdate) < p.interval {
+		return nil
+	}
+	p.lastUpdate = now
+	if p.callback == nil {
+		return nil
+	}
+	elapsed := now.Sub(p.started).Seconds()
+	var speed float64
+	if elapsed > 0 {
+		speed = float64(state.Uploaded) / elapsed
+	}
+	p.callback(model.Progress{
+		BytesDone:      state.Uploaded,
+		BytesTotal:     state.Total,
+		BytesPerSecond: speed,
+		At:             now,
+	})
+	return nil
 }
 
 func newUploadEngine(api uploader.Client, progress uploader.Progress) *uploader.Uploader {
@@ -86,26 +128,11 @@ func (c *Client) UploadVideo(ctx context.Context, request UploadRequest, onProgr
 		return 0, ctx.Err()
 	}
 
-	started := time.Now()
-	progress := progressFunc(func(progressCtx context.Context, state uploader.ProgressState) error {
-		if err := progressCtx.Err(); err != nil {
-			return err
-		}
-		if onProgress != nil {
-			elapsed := time.Since(started).Seconds()
-			var speed float64
-			if elapsed > 0 {
-				speed = float64(state.Uploaded) / elapsed
-			}
-			onProgress(model.Progress{
-				BytesDone:      state.Uploaded,
-				BytesTotal:     state.Total,
-				BytesPerSecond: speed,
-				At:             time.Now(),
-			})
-		}
-		return nil
-	})
+	progress := &uploadProgressReporter{
+		started:  time.Now(),
+		interval: progressUpdateInterval,
+		callback: onProgress,
+	}
 	uploadEngine := newUploadEngine(uploadAPI, progress)
 	var inputFile tg.InputFileClass
 	if request.File != nil {
@@ -114,7 +141,7 @@ func (c *Client) UploadVideo(ctx context.Context, request UploadRequest, onProgr
 		inputFile, err = uploadEngine.FromPath(ctx, request.Path)
 	}
 	if err != nil {
-		return 0, fmt.Errorf("上传视频数据失败：%w", err)
+		return 0, fmt.Errorf("%w：上传视频数据失败：%w", ErrUploadData, err)
 	}
 
 	document := message.UploadedDocument(inputFile, styling.Plain(request.Caption)).

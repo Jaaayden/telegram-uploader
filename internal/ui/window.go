@@ -82,6 +82,10 @@ type window struct {
 	identity  tgtransport.Identity
 	snapshot  coreapp.Snapshot
 
+	snapshotDispatchMu     sync.Mutex
+	pendingSnapshot        coreapp.Snapshot
+	snapshotDispatchQueued bool
+
 	// Settings controls.
 	apiID         *widget.Entry
 	apiHash       *widget.Entry
@@ -438,13 +442,48 @@ func (u *window) startObservers() {
 func (u *window) observeController() {
 	for {
 		select {
-		case snapshot := <-u.controller.Updates():
-			current := snapshot
-			u.doUI(func() { u.applySnapshot(current) })
+		case snapshot, ok := <-u.controller.Updates():
+			if !ok {
+				return
+			}
+			u.dispatchControllerSnapshot(snapshot)
 		case <-u.rootCtx.Done():
 			return
 		}
 	}
+}
+
+func (u *window) dispatchControllerSnapshot(snapshot coreapp.Snapshot) {
+	if u.enqueueControllerSnapshot(snapshot) {
+		u.doUI(func() {
+			if current, ok := u.takeControllerSnapshot(); ok {
+				u.applySnapshot(current)
+			}
+		})
+	}
+}
+
+func (u *window) enqueueControllerSnapshot(snapshot coreapp.Snapshot) bool {
+	u.snapshotDispatchMu.Lock()
+	defer u.snapshotDispatchMu.Unlock()
+	u.pendingSnapshot = snapshot
+	if u.snapshotDispatchQueued {
+		return false
+	}
+	u.snapshotDispatchQueued = true
+	return true
+}
+
+func (u *window) takeControllerSnapshot() (coreapp.Snapshot, bool) {
+	u.snapshotDispatchMu.Lock()
+	defer u.snapshotDispatchMu.Unlock()
+	if !u.snapshotDispatchQueued {
+		return coreapp.Snapshot{}, false
+	}
+	snapshot := u.pendingSnapshot
+	u.pendingSnapshot = coreapp.Snapshot{}
+	u.snapshotDispatchQueued = false
+	return snapshot, true
 }
 
 func (u *window) applySnapshot(snapshot coreapp.Snapshot) {
@@ -848,7 +887,7 @@ func (u *window) waitClientReady(client *tgtransport.Client, ctx context.Context
 			limitPrefix = "协议上限（服务端动态值未确认）："
 		}
 		u.limit.SetText(limitPrefix + formatBytes(identity.MaxUploadBytes))
-		u.applySnapshot(u.controller.Snapshot())
+		u.dispatchControllerSnapshot(u.controller.Snapshot())
 	})
 
 	// Queue entries may have been added while Telegram was disconnected. Apply
@@ -1572,7 +1611,7 @@ func (u *window) pauseUploads() {
 	u.operationLabel.SetText("暂停请求已收到，正在完成当前文件")
 	if err := u.controller.Pause(); err != nil {
 		u.showError(err)
-		u.applySnapshot(u.controller.Snapshot())
+		u.dispatchControllerSnapshot(u.controller.Snapshot())
 	}
 }
 
@@ -2073,6 +2112,9 @@ func compactJobStatus(job model.Job) string {
 	case model.JobOversize:
 		return prefix + "超过上限 · " + formatBytes(job.Size)
 	case model.JobUploading:
+		if job.Error != "" {
+			return prefix + job.Error
+		}
 		return prefix + fmt.Sprintf("上传中 · %s/s", formatBytes(int64(job.BytesPerSecond)))
 	case model.JobSending:
 		return prefix + "正在提交频道消息…"
@@ -2112,6 +2154,9 @@ func baseJobStatus(job model.Job) string {
 	case model.JobOversize:
 		return "超过 Bot 当前上传上限，未上传"
 	case model.JobUploading:
+		if job.Error != "" {
+			return job.Error
+		}
 		return fmt.Sprintf("上传中 · %s / %s · %s/s", formatBytes(job.Uploaded), formatBytes(job.Size), formatBytes(int64(job.BytesPerSecond)))
 	case model.JobSending:
 		return fmt.Sprintf("上传完成 · %s / %s · 正在提交频道消息……", formatBytes(job.Uploaded), formatBytes(job.Size))

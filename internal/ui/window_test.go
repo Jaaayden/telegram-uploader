@@ -53,6 +53,48 @@ func TestRefreshQueueRowsShowsNamesProgressAndReusesRows(t *testing.T) {
 	}
 }
 
+func TestControllerSnapshotDispatchCoalescesToLatestState(t *testing.T) {
+	u := &window{}
+	first := coreapp.Snapshot{ActiveID: "first"}
+	latest := coreapp.Snapshot{ActiveID: "latest"}
+
+	if !u.enqueueControllerSnapshot(first) {
+		t.Fatal("first snapshot did not request a UI dispatch")
+	}
+	for i := 0; i < 1000; i++ {
+		if u.enqueueControllerSnapshot(coreapp.Snapshot{ActiveID: "stale"}) {
+			t.Fatal("intermediate snapshot queued a duplicate UI dispatch")
+		}
+	}
+	if u.enqueueControllerSnapshot(latest) {
+		t.Fatal("latest snapshot queued a duplicate UI dispatch")
+	}
+	got, ok := u.takeControllerSnapshot()
+	if !ok || got.ActiveID != latest.ActiveID {
+		t.Fatalf("dispatched snapshot = (%+v, %v), want latest active ID %q", got, ok, latest.ActiveID)
+	}
+	if _, ok := u.takeControllerSnapshot(); ok {
+		t.Fatal("empty dispatcher returned a snapshot")
+	}
+	if !u.enqueueControllerSnapshot(first) {
+		t.Fatal("dispatcher did not accept a new snapshot after draining")
+	}
+}
+
+func TestJobStatusShowsRetryWaitInsteadOfZeroUploadSpeed(t *testing.T) {
+	job := model.Job{
+		State: model.JobUploading,
+		Size:  100,
+		Error: "连接中断，5 秒后自动重试（2/5）",
+	}
+	if got := compactJobStatus(job); got != job.Error {
+		t.Fatalf("compactJobStatus() = %q, want retry detail %q", got, job.Error)
+	}
+	if got := jobStatus(job); got != job.Error {
+		t.Fatalf("jobStatus() = %q, want retry detail %q", got, job.Error)
+	}
+}
+
 func TestJobFractionKeepsPartialProgressAcrossStates(t *testing.T) {
 	states := []model.JobState{
 		model.JobUploading,
