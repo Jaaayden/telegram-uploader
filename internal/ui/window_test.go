@@ -2,11 +2,17 @@ package ui
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"io"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/test"
 	coreapp "github.com/jayden/telegram-video-uploader/internal/app"
 	"github.com/jayden/telegram-video-uploader/internal/model"
@@ -54,7 +60,7 @@ func TestUploadConcurrencyOptionMapping(t *testing.T) {
 	}
 }
 
-func TestRefreshQueueRowsShowsNamesProgressAndReusesRows(t *testing.T) {
+func TestRefreshQueueRowsShowsNamesProgressAndRebindsVisibleRow(t *testing.T) {
 	application := test.NewApp()
 	defer application.Quit()
 
@@ -66,12 +72,13 @@ func TestRefreshQueueRowsShowsNamesProgressAndReusesRows(t *testing.T) {
 	}
 	u.refreshQueueRows(jobs)
 
-	if len(u.queueRows.Objects) != len(jobs) {
-		t.Fatalf("rendered rows = %d, want %d", len(u.queueRows.Objects), len(jobs))
+	if len(u.queueJobs) != len(jobs) || u.queueList.Length() != len(jobs) {
+		t.Fatalf("queue length = %d/%d, want %d", len(u.queueJobs), u.queueList.Length(), len(jobs))
 	}
-	first := u.jobRows["first"]
-	if first == nil || !strings.Contains(first.name.Text, jobs[0].Name) {
-		t.Fatalf("first row name = %v, want %q", first, jobs[0].Name)
+	first := newJobRow()
+	u.updateJobRow(first, u.queueJobs[0])
+	if !strings.Contains(first.name.Text, jobs[0].Name) {
+		t.Fatalf("first row name = %q, want %q", first.name.Text, jobs[0].Name)
 	}
 	if first.progress.Value != 0 {
 		t.Fatalf("initial first progress = %v, want 0", first.progress.Value)
@@ -81,9 +88,7 @@ func TestRefreshQueueRowsShowsNamesProgressAndReusesRows(t *testing.T) {
 	jobs[0].Uploaded = 50
 	jobs[0].BytesPerSecond = 25
 	u.refreshQueueRows(jobs)
-	if u.jobRows["first"] != first {
-		t.Fatal("progress refresh replaced the stable row widget")
-	}
+	u.updateJobRow(first, u.queueJobs[0])
 	if !strings.Contains(first.name.Text, jobs[0].Name) {
 		t.Fatalf("refreshed first row name = %q, want %q", first.name.Text, jobs[0].Name)
 	}
@@ -92,6 +97,460 @@ func TestRefreshQueueRowsShowsNamesProgressAndReusesRows(t *testing.T) {
 	}
 	if !strings.Contains(first.status.Text, "25 B/s") {
 		t.Fatalf("refreshed first status = %q, want upload speed", first.status.Text)
+	}
+}
+
+func TestVirtualQueueListCreatesOnlyVisibleRows(t *testing.T) {
+	application := test.NewApp()
+	defer application.Quit()
+
+	u := &window{}
+	u.buildQueue()
+	jobs := make([]model.Job, 1000)
+	for index := range jobs {
+		jobs[index] = model.Job{
+			ID:       fmt.Sprintf("job-%04d", index),
+			Position: index,
+			Name:     fmt.Sprintf("video-%04d.mp4", index),
+			Size:     100,
+			State:    model.JobQueued,
+		}
+	}
+	u.snapshot = coreapp.Snapshot{Jobs: jobs}
+	u.refreshQueueRows(jobs)
+
+	window := test.NewWindow(u.queueList)
+	defer window.Close()
+	window.Resize(fyne.NewSize(900, 480))
+	window.Show()
+	test.WidgetRenderer(u.queueList)
+
+	if u.queueRowCreateCount == 0 || u.queueRowCreateCount >= len(jobs) {
+		t.Fatalf("created queue rows = %d, want a visible pool smaller than %d jobs", u.queueRowCreateCount, len(jobs))
+	}
+}
+
+func TestVirtualQueueProgressUpdatesReuseVisibleRows(t *testing.T) {
+	application := test.NewApp()
+	defer application.Quit()
+
+	u := &window{}
+	u.buildQueue()
+	jobs := make([]model.Job, 1000)
+	for index := range jobs {
+		jobs[index] = model.Job{
+			ID:       fmt.Sprintf("job-%04d", index),
+			Position: index,
+			Name:     fmt.Sprintf("video-%04d.mp4", index),
+			Size:     1000,
+			State:    model.JobQueued,
+		}
+	}
+	u.snapshot = coreapp.Snapshot{Jobs: jobs}
+	u.refreshQueueRows(jobs)
+	window := test.NewWindow(u.queueList)
+	defer window.Close()
+	window.Resize(fyne.NewSize(900, 480))
+	window.Show()
+	test.WidgetRenderer(u.queueList)
+	created := u.queueRowCreateCount
+
+	jobs[0].State = model.JobUploading
+	for update := 1; update <= 100; update++ {
+		jobs[0].Uploaded = int64(update * 10)
+		jobs[0].BytesPerSecond = 100
+		u.snapshot = coreapp.Snapshot{Running: true, ActiveID: jobs[0].ID, Jobs: jobs}
+		u.refreshQueueRows(jobs)
+	}
+	if u.queueRowCreateCount != created {
+		t.Fatalf("progress updates created %d additional rows, want the visible row pool reused", u.queueRowCreateCount-created)
+	}
+}
+
+func TestReusedQueueRowBindsCheckboxToLatestJobID(t *testing.T) {
+	application := test.NewApp()
+	defer application.Quit()
+
+	u := &window{}
+	u.buildQueue()
+	row := newJobRow()
+	first := model.Job{ID: "first", Name: "first.mp4", State: model.JobQueued}
+	second := model.Job{ID: "second", Name: "second.mp4", State: model.JobQueued}
+	u.updateJobRow(row, first)
+	u.updateJobRow(row, second)
+	row.selected.SetChecked(true)
+
+	if u.selectedJobs["first"] || !u.selectedJobs["second"] {
+		t.Fatalf("selection after row reuse = %#v, want only second job", u.selectedJobs)
+	}
+}
+
+func TestConnectionConfigurationAndTransientErrorClassification(t *testing.T) {
+	application := test.NewApp()
+	defer application.Quit()
+
+	u := &window{}
+	u.buildFields()
+	if u.hasCompleteConnectionConfig() {
+		t.Fatal("empty settings were treated as a complete connection configuration")
+	}
+	u.apiID.SetText("12345")
+	u.apiHash.SetText("hash")
+	u.botToken.SetText("12345:token")
+	if !u.hasCompleteConnectionConfig() {
+		t.Fatal("complete settings were not recognized")
+	}
+	if !isTransientConnectionError(io.EOF) {
+		t.Fatal("EOF was not classified as transient")
+	}
+	if isTransientConnectionError(context.Canceled) {
+		t.Fatal("intentional cancellation was classified as transient")
+	}
+	if isTransientConnectionError(errors.New("BOT_TOKEN_INVALID")) {
+		t.Fatal("a configuration/authentication error was classified as transient")
+	}
+	if !shouldRetryConnection(nil, nil, false) {
+		t.Fatal("an unexpected clean client stop was not scheduled for reconnect")
+	}
+	if shouldRetryConnection(nil, context.Canceled, false) || shouldRetryConnection(io.EOF, nil, true) {
+		t.Fatal("an intentional stop or closed window was scheduled for reconnect")
+	}
+}
+
+func TestAutoConnectPolicyStartsOnlyWithUsableSavedConfiguration(t *testing.T) {
+	application := test.NewApp()
+	defer application.Quit()
+
+	tests := []struct {
+		name          string
+		configure     func(*window)
+		settingsErr   error
+		credentialErr error
+		wantStart     bool
+		wantConfigErr bool
+	}{
+		{
+			name: "complete credentials",
+			configure: func(u *window) {
+				u.apiID.SetText("12345")
+				u.apiHash.SetText("hash")
+				u.botToken.SetText("12345:token")
+			},
+			wantStart: true,
+		},
+		{name: "missing credentials", configure: func(u *window) { u.apiID.SetText("12345") }},
+		{
+			name:        "settings file error",
+			settingsErr: errors.New("invalid settings"),
+			configure: func(u *window) {
+				u.apiID.SetText("12345")
+				u.apiHash.SetText("hash")
+				u.botToken.SetText("12345:token")
+			},
+		},
+		{
+			name:          "keyring error",
+			credentialErr: errors.New("keyring unavailable"),
+			configure: func(u *window) {
+				u.apiID.SetText("12345")
+				u.apiHash.SetText("hash")
+				u.botToken.SetText("12345:token")
+			},
+		},
+		{
+			name: "enabled proxy without address",
+			configure: func(u *window) {
+				u.apiID.SetText("12345")
+				u.apiHash.SetText("hash")
+				u.botToken.SetText("12345:token")
+				u.proxyEnabled.SetChecked(true)
+			},
+			wantConfigErr: true,
+		},
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			started := make(chan connectionRequest, 1)
+			u := &window{
+				settingsLoadErr:   testCase.settingsErr,
+				credentialLoadErr: testCase.credentialErr,
+				connectionStarter: func(request connectionRequest, _ bool, _ uint64) { started <- request },
+			}
+			u.buildFields()
+			testCase.configure(u)
+			u.autoConnectIfConfigured()
+			if (u.connectionConfigErr != nil) != testCase.wantConfigErr {
+				t.Fatalf("connection configuration error = %v, want present=%v", u.connectionConfigErr, testCase.wantConfigErr)
+			}
+
+			if testCase.wantStart {
+				select {
+				case request := <-started:
+					if request.appID != 12345 || request.apiHash != "hash" || request.botToken != "12345:token" {
+						t.Fatalf("connection request = %+v, want saved credentials", request)
+					}
+				case <-time.After(time.Second):
+					t.Fatal("complete saved configuration did not start an automatic connection")
+				}
+				return
+			}
+			select {
+			case request := <-started:
+				t.Fatalf("automatic connection unexpectedly started: %+v", request)
+			case <-time.After(20 * time.Millisecond):
+			}
+		})
+	}
+}
+
+func TestAutomaticEnsureConnectionDoesNotRetryConfigurationError(t *testing.T) {
+	application := test.NewApp()
+	defer application.Quit()
+	started := make(chan struct{}, 1)
+	u := &window{
+		connectionConfigErr: errors.New("invalid bot token"),
+		connectionStarter: func(connectionRequest, bool, uint64) {
+			started <- struct{}{}
+		},
+	}
+	u.buildFields()
+	u.apiID.SetText("12345")
+	u.apiHash.SetText("hash")
+	u.botToken.SetText("12345:invalid")
+	u.ensureConnection()
+	select {
+	case <-started:
+		t.Fatal("configuration error was retried automatically")
+	case <-time.After(20 * time.Millisecond):
+	}
+}
+
+func TestAutomaticReconnectUsesLastAppliedConfiguration(t *testing.T) {
+	application := test.NewApp()
+	defer application.Quit()
+
+	started := make(chan connectionRequest, 2)
+	u := &window{connectionStarter: func(request connectionRequest, _ bool, _ uint64) { started <- request }}
+	u.buildFields()
+	u.apiID.SetText("12345")
+	u.apiHash.SetText("saved-hash")
+	u.botToken.SetText("12345:saved-token")
+	u.connectWithMode(true)
+	receive := func() connectionRequest {
+		select {
+		case request := <-started:
+			return request
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for connection attempt")
+			return connectionRequest{}
+		}
+	}
+	first := receive()
+
+	u.clientMu.Lock()
+	u.connecting = false
+	u.clientMu.Unlock()
+	// Unsaved edits must not disable reconnecting with the last configuration
+	// that was actually applied to a client.
+	u.apiHash.SetText("")
+	u.botToken.SetText("")
+	u.ensureConnection()
+	second := receive()
+	if second != first {
+		t.Fatalf("automatic reconnect request = %+v, want last applied %+v", second, first)
+	}
+}
+
+func TestUploadConcurrencyChangeUpdatesPendingReconnect(t *testing.T) {
+	application := test.NewApp()
+	defer application.Quit()
+	pending := connectionRequest{uploadConcurrency: tgtransport.UploadConcurrencyCompatibility}
+	u := &window{
+		paths:                coreapp.Paths{Settings: filepath.Join(t.TempDir(), "settings.json")},
+		settings:             coreapp.Settings{UploadConcurrency: tgtransport.UploadConcurrencyCompatibility},
+		appliedConnection:    pending,
+		hasAppliedConnection: true,
+		pendingReconnect:     &pending,
+	}
+	u.buildFields()
+	u.handleUploadConcurrencyChanged(uploadConcurrencyFastLabel)
+
+	u.clientMu.RLock()
+	applied := u.appliedConnection.uploadConcurrency
+	pendingValue := u.pendingReconnect.uploadConcurrency
+	u.clientMu.RUnlock()
+	if applied != tgtransport.UploadConcurrencyFast || pendingValue != tgtransport.UploadConcurrencyFast {
+		t.Fatalf("updated concurrency = applied %d, pending %d; want %d", applied, pendingValue, tgtransport.UploadConcurrencyFast)
+	}
+}
+
+func TestManualReconnectImmediatelyMakesOldGatewayUnavailable(t *testing.T) {
+	application := test.NewApp()
+	defer application.Quit()
+
+	controller := coreapp.NewController(nil, nil)
+	client := &tgtransport.Client{}
+	controller.SetGateway(client)
+	cancelled := false
+	u := &window{controller: controller, connected: true, client: client, clientCancel: func() { cancelled = true }}
+	u.buildFields()
+	u.buildQueue()
+	u.apiID.SetText("12345")
+	u.apiHash.SetText("new-hash")
+	u.botToken.SetText("12345:new-token")
+	u.connectWithMode(false)
+
+	if u.connected || !u.isConnecting() || !cancelled {
+		t.Fatalf("manual reconnect state: connected=%v connecting=%v cancelled=%v", u.connected, u.isConnecting(), cancelled)
+	}
+	if err := controller.Start(context.Background()); err == nil || !strings.Contains(err.Error(), "连接 Telegram") {
+		t.Fatalf("Start() after reconnect request = %v, want old gateway unavailable", err)
+	}
+}
+
+func TestManualReconnectUsesLiveControllerRunningState(t *testing.T) {
+	application := test.NewApp()
+	defer application.Quit()
+	fyneWindow := application.NewWindow("connection guard test")
+	defer fyneWindow.Close()
+
+	store := &blockingQueueStore{
+		jobs: []model.Job{{
+			ID:       "active-job",
+			Name:     "active.mp4",
+			Path:     "unused-because-start-is-cancelled.mp4",
+			Size:     1,
+			RandomID: 991,
+			State:    model.JobQueued,
+		}},
+		channel:     model.Channel{ID: -1001, AccessHash: 7, Title: "test"},
+		saveEntered: make(chan struct{}),
+		releaseSave: make(chan struct{}),
+	}
+	controller := coreapp.NewController(store, nil)
+	if err := controller.Load(); err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	controller.SetGateway(&tgtransport.Client{})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	startDone := make(chan error, 1)
+	go func() { startDone <- controller.Start(ctx) }()
+	select {
+	case <-store.saveEntered:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for Start persistence")
+	}
+
+	startedConnection := make(chan struct{}, 1)
+	u := &window{
+		application: application,
+		window:      fyneWindow,
+		controller:  controller,
+		// Deliberately stale: the guard must consult Controller.Snapshot().
+		snapshot: coreapp.Snapshot{Running: false},
+		connectionStarter: func(connectionRequest, bool, uint64) {
+			startedConnection <- struct{}{}
+		},
+	}
+	u.buildFields()
+	u.apiID.SetText("12345")
+	u.apiHash.SetText("new-hash")
+	u.botToken.SetText("12345:new-token")
+	u.connectWithMode(false)
+	select {
+	case <-startedConnection:
+		t.Fatal("manual reconnect started while the live controller was running")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	cancel()
+	close(store.releaseSave)
+	if err := <-startDone; err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+}
+
+func TestForceCloseUsesLiveControllerRunningState(t *testing.T) {
+	application := test.NewApp()
+	defer application.Quit()
+	fyneWindow := application.NewWindow("close guard test")
+
+	store := &blockingQueueStore{
+		jobs: []model.Job{{
+			ID:       "close-active-job",
+			Name:     "close-active.mp4",
+			Path:     "unused-because-close-cancels-before-run.mp4",
+			Size:     1,
+			RandomID: 992,
+			State:    model.JobQueued,
+		}},
+		channel:     model.Channel{ID: -1002, AccessHash: 8, Title: "test"},
+		saveEntered: make(chan struct{}),
+		releaseSave: make(chan struct{}),
+	}
+	controller := coreapp.NewController(store, nil)
+	if err := controller.Load(); err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	controller.SetGateway(&tgtransport.Client{})
+	startDone := make(chan error, 1)
+	go func() { startDone <- controller.Start(context.Background()) }()
+	select {
+	case <-store.saveEntered:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for Start persistence")
+	}
+
+	rootCtx, rootCancel := context.WithCancel(context.Background())
+	u := &window{
+		application: application,
+		window:      fyneWindow,
+		controller:  controller,
+		rootCtx:     rootCtx,
+		rootCancel:  rootCancel,
+		// Deliberately stale: forceClose must inspect the controller directly.
+		snapshot: coreapp.Snapshot{Running: false},
+	}
+	closeDone := make(chan struct{})
+	go func() {
+		u.forceClose()
+		close(closeDone)
+	}()
+	close(store.releaseSave)
+	if err := <-startDone; err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	select {
+	case <-closeDone:
+	case <-time.After(time.Second):
+		t.Fatal("forceClose did not finish")
+	}
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		snapshot := controller.Snapshot()
+		if !snapshot.Running && len(snapshot.Jobs) == 1 && snapshot.Jobs[0].State == model.JobCancelled {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("queue after forceClose = %+v, want cancelled live queue", controller.Snapshot())
+}
+
+func TestSettingsNavigationUsesDedicatedSameWindowPage(t *testing.T) {
+	u := &window{
+		mainPage:     container.NewVBox(),
+		settingsPage: container.NewVBox(),
+	}
+	u.settingsPage.Hide()
+	u.showSettingsPage()
+	if u.settingsPage.Hidden || !u.mainPage.Hidden {
+		t.Fatal("showSettingsPage did not switch from queue to settings")
+	}
+	u.showMainPage()
+	if u.mainPage.Hidden || !u.settingsPage.Hidden {
+		t.Fatal("showMainPage did not switch back to queue")
 	}
 }
 
@@ -211,7 +670,7 @@ func TestQueueSelectionUsesJobIDsAndPrunesRemovedRows(t *testing.T) {
 	u.snapshot = coreapp.Snapshot{Jobs: jobs}
 	u.refreshQueueRows(jobs)
 	u.selectAllJobs()
-	if len(u.selectedJobs) != 2 || !u.jobRows["first"].selected.Checked || !u.jobRows["second"].selected.Checked {
+	if len(u.selectedJobs) != 2 {
 		t.Fatalf("selection = %#v, want both job IDs selected", u.selectedJobs)
 	}
 	if u.removeSelected.Disabled() || u.removeCompleted.Disabled() {
@@ -222,10 +681,13 @@ func TestQueueSelectionUsesJobIDsAndPrunesRemovedRows(t *testing.T) {
 	remaining[0].Position = 0
 	u.snapshot = coreapp.Snapshot{Jobs: remaining}
 	u.refreshQueueRows(remaining)
-	if u.selectedJobs["first"] || u.jobRows["first"] != nil {
-		t.Fatalf("removed job selection/row was retained: selection=%#v rows=%#v", u.selectedJobs, u.jobRows)
+	if u.selectedJobs["first"] {
+		t.Fatalf("removed job selection was retained: selection=%#v", u.selectedJobs)
 	}
-	if !u.selectedJobs["second"] || !u.jobRows["second"].selected.Checked {
+	if _, exists := u.queueIndex["first"]; exists {
+		t.Fatal("removed job remained in the virtual-list index")
+	}
+	if !u.selectedJobs["second"] {
 		t.Fatal("remaining job lost its ID-based selection")
 	}
 }
@@ -251,7 +713,7 @@ func TestResetJobCountsIncludeOnlySafeRecoverableStates(t *testing.T) {
 	}
 }
 
-func TestResetControlRequiresIdleRecoverableJobs(t *testing.T) {
+func TestResetControlAllowsRecoverableJobsWhileRunning(t *testing.T) {
 	application := test.NewApp()
 	defer application.Quit()
 
@@ -259,6 +721,7 @@ func TestResetControlRequiresIdleRecoverableJobs(t *testing.T) {
 	u.buildFields()
 	u.buildQueue()
 	u.snapshot = coreapp.Snapshot{Jobs: []model.Job{{ID: "cancelled", State: model.JobCancelled}}}
+	u.refreshQueueRows(u.snapshot.Jobs)
 	u.updateActionAvailability()
 	if u.resetJobsButton.Disabled() {
 		t.Fatal("reset button disabled for an idle cancelled task")
@@ -266,14 +729,65 @@ func TestResetControlRequiresIdleRecoverableJobs(t *testing.T) {
 
 	u.snapshot.Running = true
 	u.updateActionAvailability()
-	if !u.resetJobsButton.Disabled() {
-		t.Fatal("reset button enabled while the queue is running")
+	if u.resetJobsButton.Disabled() {
+		t.Fatal("reset button disabled while the queue is running")
 	}
 
 	u.snapshot = coreapp.Snapshot{Jobs: []model.Job{{ID: "sent", State: model.JobSent}}}
+	u.refreshQueueRows(u.snapshot.Jobs)
 	u.updateActionAvailability()
 	if !u.resetJobsButton.Disabled() {
 		t.Fatal("reset button enabled when the queue only contains completed tasks")
+	}
+}
+
+func TestRunnableQueueKeepsStartEnabledWhileTelegramIsDisconnected(t *testing.T) {
+	application := test.NewApp()
+	defer application.Quit()
+
+	u := &window{}
+	u.buildFields()
+	u.buildQueue()
+	u.snapshot = coreapp.Snapshot{
+		Channel: model.Channel{ID: 1},
+		Jobs:    []model.Job{{ID: "queued", State: model.JobQueued}},
+	}
+	u.refreshQueueRows(u.snapshot.Jobs)
+	u.updateActionAvailability()
+	if u.startButton.Disabled() {
+		t.Fatal("start button disabled for a runnable disconnected queue; clicking it should explain how to connect")
+	}
+	if !u.bindButton.Disabled() {
+		t.Fatal("bind button enabled without a Telegram connection")
+	}
+}
+
+func TestQueueSelectionAndCompletedRemovalStayAvailableWhileUploading(t *testing.T) {
+	application := test.NewApp()
+	defer application.Quit()
+
+	u := &window{connected: true}
+	u.buildFields()
+	u.buildQueue()
+	u.snapshot = coreapp.Snapshot{
+		Running:  true,
+		ActiveID: "active",
+		Channel:  model.Channel{ID: 1},
+		Jobs: []model.Job{
+			{ID: "done", Position: 0, State: model.JobSent},
+			{ID: "active", Position: 1, State: model.JobUploading, Size: 100},
+			{ID: "queued", Position: 2, State: model.JobQueued},
+		},
+	}
+	u.refreshQueueRows(u.snapshot.Jobs)
+	u.selectAllJobs()
+	u.updateActionAvailability()
+
+	if len(u.selectedJobs) != 3 {
+		t.Fatalf("selected jobs = %#v, want all jobs selectable while uploading", u.selectedJobs)
+	}
+	if u.removeSelected.Disabled() || u.removeCompleted.Disabled() || u.clearQueueButton.Disabled() {
+		t.Fatal("safe queue-management controls were disabled while uploading")
 	}
 }
 
@@ -285,19 +799,28 @@ func TestCompactRowRebindsSingleActionAcrossStates(t *testing.T) {
 	u.buildQueue()
 	job := model.Job{ID: "job", Position: 0, Name: "video.mp4", Size: 100, State: model.JobQueued}
 	u.refreshQueueRows([]model.Job{job})
-	row := u.jobRows[job.ID]
+	row := newJobRow()
+	u.updateJobRow(row, job)
 	if row.action.Text != "取消" {
 		t.Fatalf("queued action = %q, want 取消", row.action.Text)
 	}
 	job.State = model.JobFailed
 	u.refreshQueueRows([]model.Job{job})
+	u.updateJobRow(row, job)
 	if row.action.Text != "处理…" {
 		t.Fatalf("failed action = %q, want 处理…", row.action.Text)
 	}
 	job.State = model.JobSent
 	u.refreshQueueRows([]model.Job{job})
+	u.updateJobRow(row, job)
 	if row.action.Text != "详情" {
 		t.Fatalf("sent action = %q, want 详情", row.action.Text)
+	}
+	job.State = model.JobInterrupted
+	u.refreshQueueRows([]model.Job{job})
+	u.updateJobRow(row, job)
+	if row.action.Text != "重试" {
+		t.Fatalf("interrupted action = %q, want 重试", row.action.Text)
 	}
 }
 
@@ -308,6 +831,30 @@ func TestCanonicalPathKeyNormalizesEquivalentPaths(t *testing.T) {
 	if got, want := canonicalPathKey(equivalent), canonicalPathKey(plain); got != want {
 		t.Fatalf("canonicalPathKey() = %q, want %q", got, want)
 	}
+}
+
+type blockingQueueStore struct {
+	jobs        []model.Job
+	channel     model.Channel
+	paused      bool
+	saveEntered chan struct{}
+	releaseSave chan struct{}
+	blockOnce   sync.Once
+}
+
+func (s *blockingQueueStore) Save(jobs []model.Job, channel model.Channel, paused bool) error {
+	s.jobs = append([]model.Job(nil), jobs...)
+	s.channel = channel
+	s.paused = paused
+	s.blockOnce.Do(func() {
+		close(s.saveEntered)
+		<-s.releaseSave
+	})
+	return nil
+}
+
+func (s *blockingQueueStore) Load() ([]model.Job, model.Channel, bool, error) {
+	return append([]model.Job(nil), s.jobs...), s.channel, s.paused, nil
 }
 
 func TestCandidateChoicesSelectOnlyFilesNotAlreadyQueued(t *testing.T) {
@@ -330,7 +877,7 @@ func TestCandidateChoicesSelectOnlyFilesNotAlreadyQueued(t *testing.T) {
 	}
 }
 
-func TestScanningDisablesStartAndMoveActions(t *testing.T) {
+func TestScanningOnlyPreventsStartingAnotherFolderScan(t *testing.T) {
 	application := test.NewApp()
 	defer application.Quit()
 
@@ -347,10 +894,11 @@ func TestScanningDisablesStartAndMoveActions(t *testing.T) {
 	u.scanMu.Lock()
 	u.scanning = true
 	u.scanMu.Unlock()
+	u.refreshQueueRows(u.snapshot.Jobs)
 	u.updateActionAvailability()
 
-	if !u.chooseFolderButton.Disabled() || !u.startButton.Disabled() || !u.moveButton.Disabled() {
-		t.Fatalf("scan availability: add=%v start=%v move=%v, want all disabled", u.chooseFolderButton.Disabled(), u.startButton.Disabled(), u.moveButton.Disabled())
+	if !u.chooseFolderButton.Disabled() || u.startButton.Disabled() || u.moveButton.Disabled() {
+		t.Fatalf("scan availability: add=%v start=%v move=%v, want only add disabled", u.chooseFolderButton.Disabled(), u.startButton.Disabled(), u.moveButton.Disabled())
 	}
 }
 
@@ -514,20 +1062,22 @@ func TestBeginUploadsRestoresScheduleWhenControllerCannotStart(t *testing.T) {
 	}
 }
 
-func TestNextScheduleRetryDelayUsesBoundedBackoff(t *testing.T) {
+func TestNextConnectionRetryDelayUsesBoundedBackoff(t *testing.T) {
 	tests := []struct {
 		previous time.Duration
 		want     time.Duration
 	}{
 		{previous: 0, want: 5 * time.Second},
 		{previous: 5 * time.Second, want: 10 * time.Second},
+		{previous: 10 * time.Second, want: 20 * time.Second},
+		{previous: 20 * time.Second, want: 40 * time.Second},
 		{previous: 40 * time.Second, want: time.Minute},
 		{previous: time.Minute, want: time.Minute},
 		{previous: 10 * time.Minute, want: time.Minute},
 	}
 	for _, test := range tests {
-		if got := nextScheduleRetryDelay(test.previous); got != test.want {
-			t.Fatalf("nextScheduleRetryDelay(%v) = %v, want %v", test.previous, got, test.want)
+		if got := nextConnectionRetryDelay(test.previous); got != test.want {
+			t.Fatalf("nextConnectionRetryDelay(%v) = %v, want %v", test.previous, got, test.want)
 		}
 	}
 }

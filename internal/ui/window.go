@@ -9,6 +9,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -31,8 +33,8 @@ import (
 )
 
 const (
-	scheduleRetryInitial = 5 * time.Second
-	scheduleRetryMaximum = time.Minute
+	connectionRetryInitial = 5 * time.Second
+	connectionRetryMaximum = time.Minute
 )
 
 const (
@@ -40,6 +42,17 @@ const (
 	uploadConcurrencyBalancedLabel      = "均衡（8 路，推荐）"
 	uploadConcurrencyFastLabel          = "高速（12 路）"
 )
+
+type connectionRequest struct {
+	appID             int
+	apiHash           string
+	botToken          string
+	proxyEnabled      bool
+	proxyAddress      string
+	proxyUsername     string
+	proxyPassword     string
+	uploadConcurrency int
+}
 
 func uploadConcurrencyOptions() []string {
 	return []string{
@@ -82,10 +95,10 @@ func normalizeUploadConcurrency(value int) int {
 	return tgtransport.DefaultUploadConcurrency
 }
 
-// Run creates and runs the single-window desktop application.  It returns
-// when the window is closed.  No credentials are required to construct the
-// window; connection is intentionally deferred until the user presses the
-// connect button.
+// Run creates and runs the single-window desktop application. It returns when
+// the window is closed. A complete saved configuration is connected
+// automatically; first-run and configuration failures remain available from
+// the settings page without blocking queue management.
 func Run(controller *coreapp.Controller, paths coreapp.Paths, secrets *credentials.Store) {
 	if controller == nil {
 		return
@@ -94,13 +107,16 @@ func Run(controller *coreapp.Controller, paths coreapp.Paths, secrets *credentia
 		secrets = credentials.NewStore()
 	}
 
-	settings, _ := coreapp.LoadSettings(paths.Settings)
+	settings, settingsErr := coreapp.LoadSettings(paths.Settings)
 	application := fyneapp.NewWithID("com.jayden.telegramvideouploader")
 	window := application.NewWindow("Telegram 视频顺序上传器")
 	u := newWindow(application, window, controller, paths, secrets, settings)
+	u.settingsLoadErr = settingsErr
 	u.build()
 	u.startObservers()
-	u.window.ShowAndRun()
+	u.window.Show()
+	u.autoConnectIfConfigured()
+	u.application.Run()
 }
 
 type window struct {
@@ -110,71 +126,100 @@ type window struct {
 	paths       coreapp.Paths
 	secrets     *credentials.Store
 
-	settingsMu sync.Mutex
-	settings   coreapp.Settings
-	scanMu     sync.Mutex
-	scanning   bool
+	settingsMu          sync.Mutex
+	settings            coreapp.Settings
+	settingsLoadErr     error
+	credentialLoadErr   error
+	connectionConfigErr error
+	scanMu              sync.Mutex
+	scanning            bool
 
 	rootCtx    context.Context
 	rootCancel context.CancelFunc
 
-	clientMu     sync.RWMutex
-	client       *tgtransport.Client
-	clientCancel context.CancelFunc
+	clientMu             sync.RWMutex
+	client               *tgtransport.Client
+	clientCancel         context.CancelFunc
+	clientGeneration     uint64
+	reconnectRequested   bool
+	appliedConnection    connectionRequest
+	hasAppliedConnection bool
+	pendingReconnect     *connectionRequest
+	// connectionStarter is a narrow test seam. Production leaves it nil and
+	// uses connectAsync; tests can observe startup policy without contacting
+	// Telegram or replacing the transport implementation.
+	connectionStarter func(connectionRequest, bool, uint64)
 
 	closedMu sync.RWMutex
 	closed   bool
 
-	connected bool
-	identity  tgtransport.Identity
-	snapshot  coreapp.Snapshot
+	connected  bool
+	connecting bool
+	identity   tgtransport.Identity
+	snapshot   coreapp.Snapshot
+
+	connectionRetryMu    sync.Mutex
+	connectionRetryTimer *time.Timer
 
 	snapshotDispatchMu     sync.Mutex
 	pendingSnapshot        coreapp.Snapshot
 	snapshotDispatchQueued bool
 
 	// Settings controls.
-	apiID             *widget.Entry
-	apiHash           *widget.Entry
-	botToken          *widget.Entry
-	proxyEnabled      *widget.Check
-	proxyAddress      *widget.Entry
-	proxyUsername     *widget.Entry
-	proxyPassword     *widget.Entry
-	uploadConcurrency *widget.Select
-	connectButton     *widget.Button
-	bindButton        *widget.Button
-	connection        *widget.Label
-	channel           *widget.Label
-	limit             *widget.Label
+	apiID                    *widget.Entry
+	apiHash                  *widget.Entry
+	botToken                 *widget.Entry
+	proxyEnabled             *widget.Check
+	proxyAddress             *widget.Entry
+	proxyUsername            *widget.Entry
+	proxyPassword            *widget.Entry
+	uploadConcurrency        *widget.Select
+	connectButton            *widget.Button
+	bindButton               *widget.Button
+	connection               *widget.Label
+	channel                  *widget.Label
+	limit                    *widget.Label
+	settingsButton           *widget.Button
+	backButton               *widget.Button
+	mainConnection           *widget.Label
+	mainChannel              *widget.Label
+	readinessHint            *widget.Label
+	mainPage                 *fyne.Container
+	settingsPage             *fyne.Container
+	connectionConfigEditable bool
+	connectionConfigStateSet bool
 
 	// Queue controls.
-	folderLabel        *widget.Label
-	chooseFolderButton *widget.Button
-	startButton        *widget.Button
-	pauseButton        *widget.Button
-	scheduleButton     *widget.Button
-	cancelSchedule     *widget.Button
-	scheduleLabel      *widget.Label
-	cancelAllButton    *widget.Button
-	moveButton         *widget.Button
-	cancelMoveButton   *widget.Button
-	selectAllButton    *widget.Button
-	selectNoneButton   *widget.Button
-	resetJobsButton    *widget.Button
-	removeSelected     *widget.Button
-	removeCompleted    *widget.Button
-	clearQueueButton   *widget.Button
-	selectionLabel     *widget.Label
-	queueScroll        *container.Scroll
-	queueRows          *fyne.Container
-	jobRows            map[string]*jobRow
-	jobOrder           []string
-	selectedJobs       map[string]bool
-	progress           *widget.ProgressBar
-	progressSummary    *widget.Label
-	operationProgress  *widget.ProgressBar
-	operationLabel     *widget.Label
+	folderLabel         *widget.Label
+	chooseFolderButton  *widget.Button
+	startButton         *widget.Button
+	pauseButton         *widget.Button
+	scheduleButton      *widget.Button
+	cancelSchedule      *widget.Button
+	scheduleLabel       *widget.Label
+	cancelAllButton     *widget.Button
+	moveButton          *widget.Button
+	cancelMoveButton    *widget.Button
+	selectAllButton     *widget.Button
+	selectNoneButton    *widget.Button
+	resetJobsButton     *widget.Button
+	removeSelected      *widget.Button
+	removeCompleted     *widget.Button
+	clearQueueButton    *widget.Button
+	selectionLabel      *widget.Label
+	queueList           *widget.List
+	queueJobs           []model.Job
+	queueIndex          map[string]int
+	queueRenderState    map[string]jobRenderState
+	queueStats          queueSnapshotStats
+	queueRowPool        []*jobRow
+	selectedJobs        map[string]bool
+	queueRowCreateCount int
+	queueSelectable     bool
+	progress            *widget.ProgressBar
+	progressSummary     *widget.Label
+	operationProgress   *widget.ProgressBar
+	operationLabel      *widget.Label
 
 	bindMu     sync.Mutex
 	bindDialog *dialog.CustomDialog
@@ -189,9 +234,9 @@ type window struct {
 	sleepMu    sync.Mutex
 	sleepGuard platform.SleepGuard
 
-	scheduler        *scheduleCoordinator
-	scheduleStarting bool
-	scheduleRetry    time.Duration
+	scheduler            *scheduleCoordinator
+	scheduleStarting     bool
+	connectionRetryDelay time.Duration
 }
 
 func newWindow(application fyne.App, fyneWindow fyne.Window, controller *coreapp.Controller, paths coreapp.Paths, secrets *credentials.Store, settings coreapp.Settings) *window {
@@ -210,6 +255,22 @@ func newWindow(application fyne.App, fyneWindow fyne.Window, controller *coreapp
 		u.doUI(u.tryScheduledStart)
 	})
 	return u
+}
+
+func (u *window) showSettingsPage() {
+	if u.mainPage == nil || u.settingsPage == nil {
+		return
+	}
+	u.mainPage.Hide()
+	u.settingsPage.Show()
+}
+
+func (u *window) showMainPage() {
+	if u.mainPage == nil || u.settingsPage == nil {
+		return
+	}
+	u.settingsPage.Hide()
+	u.mainPage.Show()
 }
 
 func (u *window) build() {
@@ -247,9 +308,16 @@ func (u *window) build() {
 		widget.NewLabel("提示：Bot 只需要目标频道的发帖权限，不会登录个人账号。"),
 	)
 	settingsScroll := container.NewVScroll(settingsPanel)
+	settingsHeader := container.NewBorder(
+		nil,
+		widget.NewSeparator(),
+		u.backButton,
+		nil,
+		widget.NewLabelWithStyle("设置", fyne.TextAlignCenter, fyne.TextStyle{Bold: true}),
+	)
+	u.settingsPage = container.NewBorder(settingsHeader, nil, nil, nil, container.NewPadded(settingsScroll))
 
 	queueTop := container.NewVBox(
-		widget.NewLabelWithStyle("上传队列", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
 		container.NewBorder(nil, nil, nil, u.chooseFolderButton, u.folderLabel),
 		container.NewHBox(u.selectAllButton, u.selectNoneButton, u.resetJobsButton, u.removeSelected, u.removeCompleted, u.clearQueueButton, u.selectionLabel),
 		container.NewHBox(u.startButton, u.pauseButton, u.scheduleButton, u.cancelSchedule, u.cancelAllButton, u.moveButton, u.cancelMoveButton),
@@ -259,11 +327,16 @@ func (u *window) build() {
 		u.operationProgress,
 		u.operationLabel,
 	)
-	queueContent := container.NewBorder(queueTop, nil, nil, nil, u.queueScroll)
-
-	split := container.NewHSplit(settingsScroll, queueContent)
-	split.SetOffset(0.30)
-	u.window.SetContent(container.NewPadded(split))
+	queueContent := container.NewBorder(queueTop, nil, nil, nil, u.queueList)
+	status := container.NewVBox(
+		widget.NewLabelWithStyle("Telegram 视频顺序上传器", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		container.NewHBox(u.mainConnection, widget.NewLabel("·"), u.mainChannel),
+		u.readinessHint,
+	)
+	mainHeader := container.NewBorder(nil, widget.NewSeparator(), nil, u.settingsButton, status)
+	u.mainPage = container.NewBorder(mainHeader, nil, nil, nil, queueContent)
+	u.settingsPage.Hide()
+	u.window.SetContent(container.NewPadded(container.NewStack(u.mainPage, u.settingsPage)))
 	u.window.Resize(fyne.NewSize(1180, 760))
 	u.window.SetCloseIntercept(u.closeIntercept)
 
@@ -294,6 +367,12 @@ func (u *window) buildFields() {
 	u.limit = widget.NewLabel("当前上传上限：未获取")
 	u.connectButton = widget.NewButton("连接 Telegram", u.connect)
 	u.bindButton = widget.NewButton("绑定频道", u.beginBinding)
+	u.settingsButton = widget.NewButton("设置", u.showSettingsPage)
+	u.backButton = widget.NewButton("返回队列", u.showMainPage)
+	u.mainConnection = widget.NewLabel("Telegram：未连接")
+	u.mainChannel = widget.NewLabel("频道：未绑定")
+	u.readinessHint = widget.NewLabel("请在设置中完成 Telegram 配置")
+	u.readinessHint.Wrapping = fyne.TextWrapWord
 
 	u.chooseFolderButton = widget.NewButton("添加文件夹…", u.chooseFolder)
 	u.folderLabel = widget.NewLabel("尚未添加来源文件夹")
@@ -337,10 +416,28 @@ func (u *window) buildFields() {
 }
 
 func (u *window) buildQueue() {
-	u.queueRows = container.NewVBox()
-	u.queueScroll = container.NewVScroll(u.queueRows)
-	u.jobRows = make(map[string]*jobRow)
+	u.queueIndex = make(map[string]int)
+	u.queueRenderState = make(map[string]jobRenderState)
 	u.selectedJobs = make(map[string]bool)
+	u.queueSelectable = true
+	u.queueList = widget.NewList(
+		func() int { return len(u.queueJobs) },
+		func() fyne.CanvasObject {
+			u.queueRowCreateCount++
+			return newJobRow()
+		},
+		func(id widget.ListItemID, object fyne.CanvasObject) {
+			row, ok := object.(*jobRow)
+			if !ok || id < 0 || id >= len(u.queueJobs) {
+				return
+			}
+			if !row.registered {
+				row.registered = true
+				u.queueRowPool = append(u.queueRowPool, row)
+			}
+			u.updateJobRow(row, u.queueJobs[id])
+		},
+	)
 }
 
 func newJobRow() *jobRow {
@@ -364,107 +461,227 @@ func newJobRow() *jobRow {
 	}
 }
 
-// jobRow is stable for a job ID. Keeping the widgets instead of relying on a
-// virtual list row pool makes file names and per-file progress deterministic
-// across refreshes while the surrounding scroll container still bounds the
-// visible window.
+// jobRow is a pooled virtual-list row. boundID ensures recycled callbacks never
+// act on the job that previously occupied the same visible widget.
 type jobRow struct {
 	*fyne.Container
-	selected *widget.Check
-	name     *widget.Label
-	status   *widget.Label
-	progress *widget.ProgressBar
-	action   *widget.Button
+	selected      *widget.Check
+	name          *widget.Label
+	status        *widget.Label
+	progress      *widget.ProgressBar
+	action        *widget.Button
+	boundID       string
+	nameText      string
+	statusText    string
+	actionText    string
+	progressValue float64
+	checked       bool
+	selectable    bool
+	registered    bool
+}
+
+type jobRenderState struct {
+	Position   int
+	Name       string
+	Status     string
+	Action     string
+	Progress   float64
+	Checked    bool
+	Selectable bool
+}
+
+type queueSnapshotStats struct {
+	Runnable  bool
+	Oversize  bool
+	Completed int
+	Reset     resetJobCounts
+}
+
+func (stats *queueSnapshotStats) add(job model.Job) {
+	switch job.State {
+	case model.JobQueued:
+		stats.Runnable = true
+	case model.JobInterrupted:
+		stats.Runnable = true
+		stats.Reset.Failed++
+		stats.Reset.All++
+	case model.JobOversize:
+		stats.Oversize = true
+	case model.JobSent, model.JobMoved:
+		stats.Completed++
+	case model.JobCancelled:
+		stats.Reset.Cancelled++
+		stats.Reset.All++
+	case model.JobFailed:
+		stats.Reset.Failed++
+		stats.Reset.All++
+	case model.JobSkipped:
+		stats.Reset.Skipped++
+		stats.Reset.All++
+	}
 }
 
 func (u *window) updateJobRow(row *jobRow, job model.Job) {
-	row.name.SetText(fmt.Sprintf("%d. %s", job.Position+1, job.Name))
-	row.status.SetText(compactJobStatus(job))
-	row.progress.SetValue(jobFraction(job))
-
 	jobID := job.ID
-	row.selected.OnChanged = nil
-	row.selected.SetChecked(u.selectedJobs[jobID])
-	row.selected.OnChanged = func(checked bool) {
-		if checked {
-			u.selectedJobs[jobID] = true
-		} else {
-			delete(u.selectedJobs, jobID)
-		}
-		u.updateSelectionControls()
+	nameText := fmt.Sprintf("%d. %s", job.Position+1, job.Name)
+	statusText := u.compactJobStatusForSnapshot(job)
+	progressValue := jobFraction(job)
+	selectable := u.queueSelectable
+	checked := u.selectedJobs[jobID]
+
+	if row.nameText != nameText {
+		row.name.SetText(nameText)
+		row.nameText = nameText
 	}
-	if u.snapshot.Running || u.isMoveInFlight() {
+	if row.statusText != statusText {
+		row.status.SetText(statusText)
+		row.statusText = statusText
+	}
+	if row.progressValue != progressValue {
+		row.progress.SetValue(progressValue)
+		row.progressValue = progressValue
+	}
+
+	rebind := row.boundID != jobID
+	if row.checked != checked || rebind {
+		previousCallback := row.selected.OnChanged
+		row.selected.OnChanged = nil
+		row.selected.SetChecked(checked)
+		row.checked = checked
+		if !rebind {
+			row.selected.OnChanged = previousCallback
+		}
+	}
+	if rebind {
+		row.selected.OnChanged = func(checked bool) {
+			if row.boundID != jobID {
+				return
+			}
+			if checked {
+				u.selectedJobs[jobID] = true
+			} else {
+				delete(u.selectedJobs, jobID)
+			}
+			u.updateSelectionControls()
+		}
+	}
+	if !selectable && row.selectable {
 		row.selected.Disable()
-	} else {
+	} else if selectable && !row.selectable {
 		row.selected.Enable()
 	}
+	row.selectable = selectable
 
-	row.action.Show()
-	row.action.SetText("详情")
-	row.action.OnTapped = func() { u.showJobDetails(jobID) }
-	switch job.State {
-	case model.JobQueued, model.JobInterrupted, model.JobUploading, model.JobSending:
-		row.action.SetText("取消")
-		row.action.OnTapped = func() { u.cancelJob(jobID) }
-	case model.JobFailed, model.JobConfirming:
-		row.action.SetText("处理…")
-		row.action.OnTapped = func() { u.showJobActions(jobID) }
-	case model.JobCancelled, model.JobSkipped:
-		row.action.SetText("重试")
-		row.action.OnTapped = func() { u.retryJob(jobID) }
+	actionText := jobActionLabel(job)
+	actionChanged := rebind || row.actionText != actionText
+	if row.actionText != actionText {
+		row.action.SetText(actionText)
+		row.actionText = actionText
 	}
-	row.Container.Refresh()
+	if actionChanged {
+		row.action.OnTapped = func() {
+			if row.boundID == jobID {
+				switch actionText {
+				case "取消":
+					u.cancelJob(jobID)
+				case "处理…":
+					u.showJobActions(jobID)
+				case "重试":
+					u.retryJob(jobID)
+				default:
+					u.showJobDetails(jobID)
+				}
+			}
+		}
+	}
+	row.boundID = jobID
 }
 
 func (u *window) refreshQueueRows(jobs []model.Job) {
-	validIDs := make(map[string]struct{}, len(jobs))
-	for _, job := range jobs {
-		validIDs[job.ID] = struct{}{}
-	}
-	for id := range u.selectedJobs {
-		if _, exists := validIDs[id]; !exists {
-			delete(u.selectedJobs, id)
-		}
-	}
-
-	orderChanged := len(u.jobOrder) != len(jobs)
+	orderChanged := len(u.queueJobs) != len(jobs)
 	if !orderChanged {
 		for i, job := range jobs {
-			if u.jobOrder[i] != job.ID {
+			if u.queueJobs[i].ID != job.ID {
 				orderChanged = true
 				break
 			}
 		}
 	}
 
-	if orderChanged {
-		nextRows := make(map[string]*jobRow, len(jobs))
-		nextOrder := make([]string, 0, len(jobs))
-		objects := make([]fyne.CanvasObject, 0, len(jobs))
-		for _, job := range jobs {
-			row := u.jobRows[job.ID]
-			if row == nil {
-				row = newJobRow()
-			}
-			nextRows[job.ID] = row
-			nextOrder = append(nextOrder, job.ID)
-			objects = append(objects, row.Container)
+	// Reuse the index and render-state maps. At 10 Hz with a 1000-item queue,
+	// allocating three full maps per snapshot creates avoidable UI-thread GC.
+	clear(u.queueIndex)
+	for index, job := range jobs {
+		u.queueIndex[job.ID] = index
+	}
+	for id := range u.selectedJobs {
+		if _, exists := u.queueIndex[id]; !exists {
+			delete(u.selectedJobs, id)
 		}
-		u.jobRows = nextRows
-		u.jobOrder = nextOrder
-		u.queueRows.Objects = objects
+	}
+	for id := range u.queueRenderState {
+		if _, exists := u.queueIndex[id]; !exists {
+			delete(u.queueRenderState, id)
+		}
 	}
 
-	for _, job := range jobs {
-		if row := u.jobRows[job.ID]; row != nil {
-			u.updateJobRow(row, job)
+	selectable := !u.isMoveInFlight()
+	u.queueSelectable = selectable
+	var stats queueSnapshotStats
+	changed := make([]int, 0, 1)
+	for index, job := range jobs {
+		stats.add(job)
+		state := jobRenderState{
+			Position:   job.Position,
+			Name:       job.Name,
+			Status:     u.compactJobStatusForSnapshot(job),
+			Action:     jobActionLabel(job),
+			Progress:   jobFraction(job),
+			Checked:    u.selectedJobs[job.ID],
+			Selectable: selectable,
+		}
+		if previous, ok := u.queueRenderState[job.ID]; !ok || previous != state {
+			changed = append(changed, index)
+		}
+		u.queueRenderState[job.ID] = state
+	}
+	u.queueStats = stats
+	u.queueJobs = append(u.queueJobs[:0], jobs...)
+	if orderChanged || len(changed) > 8 {
+		u.queueList.Refresh()
+	} else {
+		for _, index := range changed {
+			job := u.queueJobs[index]
+			for _, row := range u.queueRowPool {
+				if row.boundID == job.ID {
+					u.updateJobRow(row, job)
+				}
+			}
 		}
 	}
-	if orderChanged {
-		u.queueRows.Refresh()
-		u.queueScroll.Refresh()
-	}
 	u.updateSelectionControls()
+}
+
+func jobActionLabel(job model.Job) string {
+	switch job.State {
+	case model.JobQueued, model.JobUploading, model.JobSending:
+		return "取消"
+	case model.JobFailed, model.JobConfirming:
+		return "处理…"
+	case model.JobCancelled, model.JobSkipped, model.JobInterrupted:
+		return "重试"
+	default:
+		return "详情"
+	}
+}
+
+func (u *window) compactJobStatusForSnapshot(job model.Job) string {
+	for _, id := range u.snapshot.PendingRemovalIDs {
+		if id == job.ID {
+			return "正在取消并删除…"
+		}
+	}
+	return compactJobStatus(job)
 }
 
 func (u *window) applyLoadedSettings() {
@@ -488,12 +705,96 @@ func (u *window) applyLoadedSettings() {
 	// not show their implementation errors as startup failures.
 	if token, err := u.secrets.GetBotToken(); err == nil {
 		u.botToken.SetText(token)
+	} else if !errors.Is(err, credentials.ErrNotFound) {
+		u.credentialLoadErr = err
 	}
 	if hash, err := u.secrets.GetAPIHash(); err == nil {
 		u.apiHash.SetText(hash)
+	} else if !errors.Is(err, credentials.ErrNotFound) && u.credentialLoadErr == nil {
+		u.credentialLoadErr = err
 	}
 	if password, err := u.secrets.GetProxyPassword(); err == nil {
 		u.proxyPassword.SetText(password)
+	} else if !errors.Is(err, credentials.ErrNotFound) && u.credentialLoadErr == nil {
+		u.credentialLoadErr = err
+	}
+	u.updateReadinessHint()
+}
+
+func (u *window) autoConnectIfConfigured() {
+	if u.settingsLoadErr != nil {
+		u.connection.SetText("设置文件读取失败")
+		u.updateReadinessHint()
+		return
+	}
+	if u.credentialLoadErr != nil {
+		u.connection.SetText("无法读取系统凭证")
+		u.updateReadinessHint()
+		return
+	}
+	if !u.hasCompleteConnectionConfig() {
+		u.updateReadinessHint()
+		return
+	}
+	u.connectWithMode(true)
+}
+
+func (u *window) hasCompleteConnectionConfig() bool {
+	appID, err := strconv.Atoi(strings.TrimSpace(u.apiID.Text))
+	return err == nil && appID > 0 && strings.TrimSpace(u.apiHash.Text) != "" && strings.TrimSpace(u.botToken.Text) != ""
+}
+
+func (u *window) canAttemptAutomaticConnection() bool {
+	u.clientMu.RLock()
+	hasApplied := u.hasAppliedConnection
+	u.clientMu.RUnlock()
+	return hasApplied || u.hasCompleteConnectionConfig()
+}
+
+func (u *window) updateReadinessHint() {
+	if u.readinessHint == nil || u.mainConnection == nil || u.mainChannel == nil {
+		return
+	}
+	channelText := "频道：未绑定"
+	if u.snapshot.Channel.ID != 0 {
+		title := u.snapshot.Channel.Title
+		if title == "" {
+			title = fmt.Sprintf("%d", u.snapshot.Channel.ID)
+		}
+		channelText = "频道：" + title
+	}
+	u.mainChannel.SetText(channelText)
+	connecting := u.isConnecting()
+	switch {
+	case u.settingsLoadErr != nil:
+		u.mainConnection.SetText("Telegram：配置读取失败")
+		u.readinessHint.SetText("设置文件无法读取，请打开设置检查并重新保存")
+	case u.credentialLoadErr != nil:
+		u.mainConnection.SetText("Telegram：凭证不可用")
+		u.readinessHint.SetText("无法读取系统钥匙串，请检查系统权限后重试")
+	case u.connectionConfigErr != nil:
+		u.mainConnection.SetText("Telegram：连接配置错误")
+		u.readinessHint.SetText(u.connectionConfigErr.Error() + "；请打开设置修正后重新连接")
+	case u.connected:
+		identity := "已连接"
+		if u.identity.Username != "" {
+			identity += " @" + u.identity.Username
+		}
+		u.mainConnection.SetText("Telegram：" + identity)
+		if u.snapshot.Channel.ID == 0 {
+			u.readinessHint.SetText("Telegram 已连接，请在设置中绑定目标频道")
+		} else {
+			u.readinessHint.SetText("已就绪，可以开始或定时上传")
+		}
+	case connecting:
+		u.mainConnection.SetText("Telegram：正在连接")
+		u.readinessHint.SetText("正在连接 Telegram，请稍候…")
+	case !u.canAttemptAutomaticConnection():
+		u.mainConnection.SetText("Telegram：未配置")
+		u.readinessHint.SetText("请打开设置，填写并保存 Telegram 凭证")
+	default:
+		u.mainConnection.SetText("Telegram：未连接")
+		u.readinessHint.SetText("Telegram 当前未连接；程序会自动重试，也可以在设置中重新连接")
 	}
 }
 
@@ -514,7 +815,16 @@ func (u *window) handleUploadConcurrencyChanged(option string) {
 		u.showError(err)
 		return
 	}
-	if client := u.currentClient(); client != nil {
+	u.clientMu.Lock()
+	if u.hasAppliedConnection {
+		u.appliedConnection.uploadConcurrency = concurrency
+	}
+	if u.pendingReconnect != nil {
+		u.pendingReconnect.uploadConcurrency = concurrency
+	}
+	client := u.client
+	u.clientMu.Unlock()
+	if client != nil {
 		concurrency = client.SetUploadConcurrency(concurrency)
 	}
 	u.operationLabel.SetText(fmt.Sprintf("上传并发已设置为 %d 路；当前视频不受影响，将从下一个视频开始生效", concurrency))
@@ -583,13 +893,14 @@ func (u *window) applySnapshot(snapshot coreapp.Snapshot) {
 			title = fmt.Sprintf("频道 %d", snapshot.Channel.ID)
 		}
 		u.channel.SetText("已绑定：" + title)
+	} else {
+		u.channel.SetText("尚未绑定频道")
 	}
 	if snapshot.TotalBytes > 0 {
 		u.progress.SetValue(float64(snapshot.DoneBytes) / float64(snapshot.TotalBytes))
 	} else {
 		u.progress.SetValue(0)
 	}
-	u.progressSummary.SetText(formatSummary(snapshot))
 	if snapshot.LastError != "" && !snapshot.Running {
 		// The controller keeps the last error for restart diagnostics.  The UI
 		// displays it in the row/state summary rather than opening a dialog on
@@ -601,8 +912,10 @@ func (u *window) applySnapshot(snapshot coreapp.Snapshot) {
 		u.operationLabel.SetText("队列已暂停；点击“继续上传”后将从下一条待上传视频开始")
 	}
 	u.refreshQueueRows(snapshot.Jobs)
+	u.progressSummary.SetText(formatSummaryWithCompleted(snapshot, u.queueStats.Completed))
 	u.updateActionAvailability()
 	u.updateScheduleStatus()
+	u.updateReadinessHint()
 	if !snapshot.Running {
 		u.stopSleepGuard()
 		if u.scheduler != nil {
@@ -612,13 +925,18 @@ func (u *window) applySnapshot(snapshot coreapp.Snapshot) {
 }
 
 func (u *window) updateActionAvailability() {
-	if u.isMoveInFlight() {
+	moving := u.isMoveInFlight()
+	connecting := u.isConnecting()
+	u.setConnectionConfigurationEnabled(!u.snapshot.Running && !moving && !connecting)
+	if moving {
 		u.startButton.SetText("开始上传")
 		u.startButton.Disable()
 		u.pauseButton.Disable()
 		u.chooseFolderButton.Disable()
 		u.moveButton.Disable()
 		u.cancelAllButton.Disable()
+		u.connectButton.Disable()
+		u.bindButton.Disable()
 		u.disableQueueEditing()
 		u.cancelMoveButton.Show()
 		u.updateScheduleControls()
@@ -626,6 +944,7 @@ func (u *window) updateActionAvailability() {
 		return
 	}
 	if u.snapshot.Running {
+		u.clearQueueButton.SetText("取消并清空")
 		u.startButton.SetText("开始上传")
 		u.startButton.Disable()
 		if u.snapshot.PauseRequested {
@@ -633,11 +952,16 @@ func (u *window) updateActionAvailability() {
 		} else {
 			u.pauseButton.Enable()
 		}
-		u.chooseFolderButton.Disable()
+		if u.scanInProgress() {
+			u.chooseFolderButton.Disable()
+		} else {
+			u.chooseFolderButton.Enable()
+		}
 		u.moveButton.Disable()
 		u.cancelAllButton.Enable()
-		u.disableQueueEditing()
+		u.updateSelectionControls()
 	} else {
+		u.clearQueueButton.SetText("清空队列")
 		if u.snapshot.Paused {
 			u.startButton.SetText("继续上传")
 		} else {
@@ -650,29 +974,68 @@ func (u *window) updateActionAvailability() {
 			u.chooseFolderButton.Enable()
 		}
 		u.cancelAllButton.Disable()
-		if u.hasOversizeJobs() {
+		if u.queueStats.Oversize {
 			u.moveButton.Enable()
 		} else {
 			u.moveButton.Disable()
 		}
-		if u.connected && u.snapshot.Channel.ID != 0 && hasRunnableJobs(u.snapshot.Jobs) {
+		if u.queueStats.Runnable {
 			u.startButton.Enable()
 		} else {
 			u.startButton.Disable()
 		}
 		u.updateSelectionControls()
 	}
-	if !u.connected {
+	switch {
+	case u.snapshot.Running:
+		u.connectButton.Disable()
+		u.bindButton.Disable()
+	case connecting:
+		u.connectButton.Disable()
+		u.bindButton.Disable()
+	case u.connected:
+		u.connectButton.Enable()
+		u.bindButton.Enable()
+	default:
+		u.connectButton.Enable()
 		u.bindButton.Disable()
 	}
 	if u.scanInProgress() {
 		u.chooseFolderButton.Disable()
-		u.startButton.Disable()
-		u.pauseButton.Disable()
-		u.moveButton.Disable()
 	}
 	u.updateScheduleControls()
 	u.refreshQueueSelectionAvailability()
+	u.updateReadinessHint()
+}
+
+func (u *window) setConnectionConfigurationEnabled(enabled bool) {
+	if u.connectionConfigStateSet && u.connectionConfigEditable == enabled {
+		return
+	}
+	u.connectionConfigStateSet = true
+	u.connectionConfigEditable = enabled
+	controls := []interface {
+		Enable()
+		Disable()
+	}{
+		u.apiID,
+		u.apiHash,
+		u.botToken,
+		u.proxyEnabled,
+		u.proxyAddress,
+		u.proxyUsername,
+		u.proxyPassword,
+	}
+	for _, control := range controls {
+		if control == nil {
+			continue
+		}
+		if enabled {
+			control.Enable()
+		} else {
+			control.Disable()
+		}
+	}
 }
 
 func (u *window) updateScheduleControls() {
@@ -680,7 +1043,7 @@ func (u *window) updateScheduleControls() {
 		return
 	}
 	_, set, _ := u.scheduler.State()
-	if !u.snapshot.Running && !u.snapshot.Paused && !u.snapshot.PauseRequested && !u.isMoveInFlight() && !u.scanInProgress() && hasRunnableJobs(u.snapshot.Jobs) && !u.scheduleStarting {
+	if !u.snapshot.Running && !u.snapshot.Paused && !u.snapshot.PauseRequested && !u.isMoveInFlight() && u.queueStats.Runnable && !u.scheduleStarting {
 		u.scheduleButton.Enable()
 	} else {
 		u.scheduleButton.Disable()
@@ -707,7 +1070,7 @@ func (u *window) updateSelectionControls() {
 	}
 	selected := len(u.selectedJobs)
 	u.selectionLabel.SetText(fmt.Sprintf("已选择 %d 项", selected))
-	if u.snapshot.Running || u.isMoveInFlight() || u.scanInProgress() {
+	if u.isMoveInFlight() {
 		u.disableQueueEditing()
 		return
 	}
@@ -717,7 +1080,7 @@ func (u *window) updateSelectionControls() {
 	}
 	u.selectAllButton.Enable()
 	u.clearQueueButton.Enable()
-	if resetJobCountsFor(u.snapshot.Jobs, u.selectedJobs).All > 0 {
+	if u.queueStats.Reset.All > 0 {
 		u.resetJobsButton.Enable()
 	} else {
 		u.resetJobsButton.Disable()
@@ -729,7 +1092,7 @@ func (u *window) updateSelectionControls() {
 		u.selectNoneButton.Disable()
 		u.removeSelected.Disable()
 	}
-	if hasCompletedJobs(u.snapshot.Jobs) {
+	if u.queueStats.Completed > 0 {
 		u.removeCompleted.Enable()
 	} else {
 		u.removeCompleted.Disable()
@@ -737,12 +1100,10 @@ func (u *window) updateSelectionControls() {
 }
 
 func (u *window) refreshQueueSelectionAvailability() {
-	for _, row := range u.jobRows {
-		if u.snapshot.Running || u.isMoveInFlight() || u.scanInProgress() {
-			row.selected.Disable()
-		} else {
-			row.selected.Enable()
-		}
+	selectable := !u.isMoveInFlight()
+	if u.queueList != nil && selectable != u.queueSelectable {
+		u.queueSelectable = selectable
+		u.queueList.Refresh()
 	}
 }
 
@@ -756,104 +1117,239 @@ func (u *window) connect() {
 	u.connectWithMode(false)
 }
 
+func (u *window) queueRunning() bool {
+	if u.controller != nil {
+		return u.controller.Snapshot().Running
+	}
+	return u.snapshot.Running
+}
+
 func (u *window) connectWithMode(automatic bool) {
+	if !automatic && u.queueRunning() {
+		u.showError(errors.New("上传进行中不能更换 Telegram 凭证；上传并发仍可随时调整"))
+		return
+	}
+	if !automatic {
+		u.resetConnectionRetry()
+	}
+	var request connectionRequest
+	hasApplied := false
+	if automatic {
+		u.clientMu.RLock()
+		request = u.appliedConnection
+		hasApplied = u.hasAppliedConnection
+		u.clientMu.RUnlock()
+	}
+	if !hasApplied {
+		var err error
+		request, err = u.connectionRequestFromFields()
+		if err != nil {
+			if automatic && u.hasCompleteConnectionConfig() {
+				u.connectionConfigErr = err
+				u.connection.SetText("连接配置错误，请检查设置")
+				u.updateReadinessHint()
+			} else if !automatic {
+				u.showError(err)
+			}
+			return
+		}
+	}
+	u.connectWithRequest(request, automatic)
+}
+
+func (u *window) connectionRequestFromFields() (connectionRequest, error) {
 	appID, err := strconv.Atoi(strings.TrimSpace(u.apiID.Text))
 	if err != nil || appID <= 0 {
-		if !automatic {
-			u.showError(errors.New("API ID 必须是正整数"))
-		}
-		return
+		return connectionRequest{}, errors.New("API ID 必须是正整数")
 	}
 	apiHash := strings.TrimSpace(u.apiHash.Text)
 	botToken := strings.TrimSpace(u.botToken.Text)
 	if apiHash == "" || botToken == "" {
-		if !automatic {
-			u.showError(errors.New("API Hash 和 Bot Token 不能为空"))
-		}
-		return
+		return connectionRequest{}, errors.New("API Hash 和 Bot Token 不能为空")
 	}
-
-	proxyEnabled := u.proxyEnabled.Checked
-	proxyAddress := strings.TrimSpace(u.proxyAddress.Text)
-	proxyUsername := strings.TrimSpace(u.proxyUsername.Text)
-	proxyPassword := u.proxyPassword.Text
-	uploadConcurrency := u.selectedUploadConcurrency()
-
-	u.connectButton.Disable()
-	u.connection.SetText("正在保存凭据并连接……")
-	go u.connectAsync(appID, apiHash, botToken, proxyEnabled, proxyAddress, proxyUsername, proxyPassword, uploadConcurrency, automatic)
+	request := connectionRequest{
+		appID:             appID,
+		apiHash:           apiHash,
+		botToken:          botToken,
+		proxyEnabled:      u.proxyEnabled.Checked,
+		proxyAddress:      strings.TrimSpace(u.proxyAddress.Text),
+		proxyUsername:     strings.TrimSpace(u.proxyUsername.Text),
+		proxyPassword:     u.proxyPassword.Text,
+		uploadConcurrency: u.selectedUploadConcurrency(),
+	}
+	if request.proxyEnabled && request.proxyAddress == "" {
+		return connectionRequest{}, errors.New("已启用 SOCKS5 代理，但代理地址为空")
+	}
+	return request, nil
 }
 
-func (u *window) connectAsync(appID int, apiHash, botToken string, proxyEnabled bool, proxyAddress, proxyUsername, proxyPassword string, uploadConcurrency int, automatic bool) {
-	if err := u.updateSettings(func(settings *coreapp.Settings) {
-		settings.APIID = appID
-		settings.ProxyEnabled = proxyEnabled
-		settings.ProxyAddress = proxyAddress
-		settings.ProxyUsername = proxyUsername
-		settings.UploadConcurrency = normalizeUploadConcurrency(uploadConcurrency)
-	}); err != nil {
-		u.handleConnectionFailure(err, automatic)
+func (u *window) connectWithRequest(request connectionRequest, automatic bool) {
+	if !automatic && u.queueRunning() {
+		u.showError(errors.New("上传进行中不能更换 Telegram 凭证；上传并发仍可随时调整"))
 		return
 	}
-	if err := u.secrets.SetAPIHash(apiHash); err != nil {
-		u.handleConnectionFailure(err, automatic)
-		return
-	}
-	if err := u.secrets.SetBotToken(botToken); err != nil {
-		u.handleConnectionFailure(err, automatic)
-		return
-	}
-	if proxyPassword == "" {
-		if err := u.secrets.DeleteProxyPassword(); err != nil && !errors.Is(err, credentials.ErrNotFound) {
-			u.handleConnectionFailure(err, automatic)
+	u.connectionConfigErr = nil
+
+	u.clientMu.Lock()
+	if u.client != nil {
+		if automatic || u.connecting {
+			u.clientMu.Unlock()
 			return
 		}
-	} else if err := u.secrets.SetProxyPassword(proxyPassword); err != nil {
-		u.handleConnectionFailure(err, automatic)
+		pending := request
+		u.pendingReconnect = &pending
+		u.reconnectRequested = true
+		u.connecting = true
+		cancel := u.clientCancel
+		u.clientMu.Unlock()
+		u.connected = false
+		u.identity = tgtransport.Identity{}
+		u.controller.SetGateway(nil)
+		u.connectButton.Disable()
+		u.bindButton.Disable()
+		u.limit.SetText("当前上传上限：未获取")
+		u.connection.SetText("正在断开旧连接并应用新设置……")
+		u.updateActionAvailability()
+		if cancel != nil {
+			cancel()
+		}
 		return
 	}
+	if u.connecting || u.isClosed() {
+		u.clientMu.Unlock()
+		return
+	}
+	u.connecting = true
+	u.clientGeneration++
+	generation := u.clientGeneration
+	if automatic && !u.hasAppliedConnection {
+		u.appliedConnection = request
+		u.hasAppliedConnection = true
+	}
+	u.clientMu.Unlock()
+	u.stopConnectionRetryTimer()
+	u.connectButton.Disable()
+	if automatic {
+		u.connection.SetText("正在自动连接……")
+	} else {
+		u.connection.SetText("正在保存凭据并连接……")
+	}
+	u.updateActionAvailability()
+	go u.startConnectionAttempt(request, automatic, generation)
+}
+
+func (u *window) startConnectionAttempt(request connectionRequest, automatic bool, generation uint64) {
+	if u.connectionStarter != nil {
+		u.connectionStarter(request, automatic, generation)
+		return
+	}
+	u.connectAsync(request, automatic, generation)
+}
+
+func (u *window) connectAsync(request connectionRequest, automatic bool, generation uint64) {
+	if !automatic {
+		if err := u.updateSettings(func(settings *coreapp.Settings) {
+			settings.APIID = request.appID
+			settings.ProxyEnabled = request.proxyEnabled
+			settings.ProxyAddress = request.proxyAddress
+			settings.ProxyUsername = request.proxyUsername
+			settings.UploadConcurrency = normalizeUploadConcurrency(request.uploadConcurrency)
+		}); err != nil {
+			u.handleConnectionFailure(err, automatic, false, generation)
+			return
+		}
+		if err := u.secrets.SetAPIHash(request.apiHash); err != nil {
+			u.handleConnectionFailure(err, automatic, false, generation)
+			return
+		}
+		if err := u.secrets.SetBotToken(request.botToken); err != nil {
+			u.handleConnectionFailure(err, automatic, false, generation)
+			return
+		}
+		if request.proxyPassword == "" {
+			if err := u.secrets.DeleteProxyPassword(); err != nil && !errors.Is(err, credentials.ErrNotFound) {
+				u.handleConnectionFailure(err, automatic, false, generation)
+				return
+			}
+		} else if err := u.secrets.SetProxyPassword(request.proxyPassword); err != nil {
+			u.handleConnectionFailure(err, automatic, false, generation)
+			return
+		}
+		request.uploadConcurrency = normalizeUploadConcurrency(u.settingsSnapshot().UploadConcurrency)
+		u.clientMu.Lock()
+		if generation == u.clientGeneration && !u.isClosed() {
+			u.appliedConnection = request
+			u.hasAppliedConnection = true
+		}
+		u.clientMu.Unlock()
+		u.doUI(func() {
+			u.settingsLoadErr = nil
+			u.credentialLoadErr = nil
+			u.updateReadinessHint()
+		})
+	}
+	request.uploadConcurrency = normalizeUploadConcurrency(u.settingsSnapshot().UploadConcurrency)
 
 	var proxyConfig *tgtransport.ProxyConfig
-	if proxyEnabled && proxyAddress != "" {
+	if request.proxyEnabled && request.proxyAddress != "" {
 		proxyConfig = &tgtransport.ProxyConfig{
-			Address:  proxyAddress,
-			Username: proxyUsername,
-			Password: proxyPassword,
+			Address:  request.proxyAddress,
+			Username: request.proxyUsername,
+			Password: request.proxyPassword,
 		}
 	}
 	var stateClient *tgtransport.Client
 	client, err := tgtransport.NewClient(tgtransport.Config{
-		AppID:             appID,
-		APIHash:           apiHash,
-		BotToken:          botToken,
+		AppID:             request.appID,
+		APIHash:           request.apiHash,
+		BotToken:          request.botToken,
 		Proxy:             proxyConfig,
-		UploadConcurrency: normalizeUploadConcurrency(uploadConcurrency),
+		UploadConcurrency: normalizeUploadConcurrency(request.uploadConcurrency),
 		SessionStorage:    credentials.NewSessionStorage(u.secrets, u.paths.Session),
 	}, tgtransport.Events{
 		OnConnectionState: func(state tgtransport.ConnectionState) {
-			u.handleConnectionState(stateClient, state)
+			u.handleConnectionState(stateClient, generation, state)
 		},
 		OnFloodWait: func(wait time.Duration) {
+			if stateClient == nil || !u.isUsableCurrentClient(stateClient, generation) {
+				return
+			}
 			u.setConnectionStatus("Telegram 要求等待 " + formatDuration(wait))
 		},
 	})
 	if err != nil {
-		u.handleConnectionFailure(err, automatic)
+		u.handleConnectionFailure(err, automatic, false, generation)
 		return
 	}
 	stateClient = client
+	request.uploadConcurrency = normalizeUploadConcurrency(u.settingsSnapshot().UploadConcurrency)
+	client.SetUploadConcurrency(request.uploadConcurrency)
 
 	ctx, cancel := context.WithCancel(u.rootCtx)
 	u.clientMu.Lock()
+	if generation != u.clientGeneration || u.isClosed() {
+		if generation == u.clientGeneration {
+			u.connecting = false
+		}
+		u.clientMu.Unlock()
+		cancel()
+		return
+	}
 	u.client = client
 	u.clientCancel = cancel
-	u.clientMu.Unlock()
+	if u.hasAppliedConnection {
+		u.appliedConnection.uploadConcurrency = request.uploadConcurrency
+	}
+	// Publish the transport while holding the same lifecycle lock used by
+	// forceClose. This prevents a closing window from clearing the gateway and
+	// then being overwritten by this now-stale connection attempt.
 	u.controller.SetGateway(client)
+	u.clientMu.Unlock()
 
 	u.doUI(func() { u.connection.SetText("正在启动 Telegram 客户端……") })
-	go u.runClient(client, ctx, automatic)
-	go u.waitClientReady(client, ctx, automatic)
-	go u.observeBinding(client, ctx)
+	go u.runClient(client, ctx, automatic, generation)
+	go u.waitClientReady(client, ctx, automatic, generation)
+	go u.observeBinding(client, ctx, generation)
 }
 
 func (u *window) selectedUploadConcurrency() int {
@@ -865,28 +1361,54 @@ func (u *window) selectedUploadConcurrency() int {
 	return normalizeUploadConcurrency(u.settingsSnapshot().UploadConcurrency)
 }
 
-func (u *window) handleConnectionFailure(err error, automatic bool) {
+func (u *window) handleConnectionFailure(err error, automatic, retryable bool, generation uint64) {
+	u.clientMu.Lock()
+	if generation != u.clientGeneration {
+		u.clientMu.Unlock()
+		return
+	}
+	u.connecting = false
+	u.clientMu.Unlock()
 	if !automatic {
 		u.showError(err)
 	}
 	u.doUI(func() {
+		u.clientMu.RLock()
+		currentGeneration := generation == u.clientGeneration
+		u.clientMu.RUnlock()
+		if !currentGeneration {
+			return
+		}
 		u.connected = false
-		u.connectButton.Enable()
-		if automatic {
-			u.connection.SetText("自动连接失败，将稍后重试")
-			u.operationLabel.SetText("定时启动正在等待 Telegram 恢复连接")
+		if !retryable {
+			u.resetConnectionRetry()
+		}
+		if retryable {
+			u.connectionConfigErr = nil
 		} else {
-			u.connection.SetText("未连接")
+			u.connectionConfigErr = err
+		}
+		u.connectButton.SetText("保存并连接")
+		u.connectButton.Enable()
+		if retryable {
+			u.connection.SetText("自动连接失败，将稍后重试")
+			u.operationLabel.SetText("Telegram 连接暂时不可用，正在等待自动重试")
+		} else {
+			u.connection.SetText("连接失败，请检查设置")
+			u.operationLabel.SetText(err.Error())
 		}
 		u.updateActionAvailability()
-		u.scheduleConnectionRetry()
+		if retryable {
+			u.scheduleConnectionRetry()
+		}
 		u.updateScheduleStatus()
+		u.updateReadinessHint()
 	})
 }
 
-func (u *window) handleConnectionState(client *tgtransport.Client, state tgtransport.ConnectionState) {
+func (u *window) handleConnectionState(client *tgtransport.Client, generation uint64, state tgtransport.ConnectionState) {
 	u.doUI(func() {
-		if client == nil || u.currentClient() != client || u.isClosed() {
+		if client == nil || !u.isUsableCurrentClient(client, generation) || u.isClosed() {
 			return
 		}
 		switch state {
@@ -897,7 +1419,7 @@ func (u *window) handleConnectionState(client *tgtransport.Client, state tgtrans
 			u.connection.SetText("Telegram 连接已建立")
 			if u.identity.Username != "" {
 				u.connected = true
-				u.resetScheduleConnectionRetry()
+				u.resetConnectionRetry()
 				if u.scheduler != nil {
 					u.scheduler.RetryDue()
 				}
@@ -905,14 +1427,14 @@ func (u *window) handleConnectionState(client *tgtransport.Client, state tgtrans
 		case tgtransport.StateDisconnected:
 			u.connected = false
 			u.connection.SetText("Telegram 连接已断开")
-			u.scheduleConnectionRetry()
 		}
 		u.updateActionAvailability()
 		u.updateScheduleStatus()
+		u.updateReadinessHint()
 	})
 }
 
-func (u *window) runClient(client *tgtransport.Client, ctx context.Context, automatic bool) {
+func (u *window) runClient(client *tgtransport.Client, ctx context.Context, automatic bool, generation uint64) {
 	err := client.Run(ctx)
 	if errors.Is(err, tgtransport.ErrWrongBotSession) {
 		if removeErr := os.Remove(u.paths.Session); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
@@ -924,60 +1446,111 @@ func (u *window) runClient(client *tgtransport.Client, ctx context.Context, auto
 	// A failed Run must also stop the readiness and binding observers.  A
 	// normal close already cancelled this context, so this is harmless there.
 	u.clientMu.Lock()
-	wasCurrent := u.client == client
+	wasCurrent := u.client == client && u.clientGeneration == generation
+	reconnect := false
+	var reconnectRequest *connectionRequest
 	if wasCurrent {
 		if u.clientCancel != nil {
 			u.clientCancel()
 		}
 		u.clientCancel = nil
 		u.client = nil
+		// Keep other automatic connection paths out until the UI-side cleanup
+		// below either starts the requested replacement or schedules retry.
+		u.connecting = true
+		reconnect = u.reconnectRequested
+		if reconnect && u.pendingReconnect != nil {
+			pending := *u.pendingReconnect
+			reconnectRequest = &pending
+		}
+		u.reconnectRequested = false
+		u.pendingReconnect = nil
 	}
 	u.clientMu.Unlock()
-	if err != nil && !errors.Is(err, context.Canceled) && !u.isClosed() && !automatic {
+	if wasCurrent {
+		// Clear the transport immediately. UI delivery may be coalesced or
+		// delayed, while the controller's retry loop must never reuse a finished
+		// one-shot Client.
+		u.controller.SetGateway(nil)
+	}
+	retryable := shouldRetryConnection(err, ctx.Err(), u.isClosed())
+	if err != nil && !errors.Is(err, context.Canceled) && !u.isClosed() && !automatic && !retryable {
 		u.showError(err)
 	}
 	u.doUI(func() {
 		if !wasCurrent {
 			return
 		}
+		u.clientMu.Lock()
+		if u.clientGeneration != generation || u.client != nil {
+			u.clientMu.Unlock()
+			return
+		}
+		u.connecting = false
+		u.clientMu.Unlock()
 		u.connected = false
+		if !retryable {
+			u.resetConnectionRetry()
+		}
 		u.identity = tgtransport.Identity{}
-		u.controller.SetGateway(nil)
+		if retryable {
+			u.connectionConfigErr = nil
+		} else if err != nil && !errors.Is(err, context.Canceled) {
+			u.connectionConfigErr = err
+		}
+		u.connectButton.SetText("保存并连接")
 		u.connectButton.Enable()
 		u.bindButton.Disable()
 		u.limit.SetText("当前上传上限：未获取")
-		if err != nil && !errors.Is(err, context.Canceled) && automatic {
+		if retryable {
 			u.connection.SetText("自动连接失败，将稍后重试")
-			u.operationLabel.SetText("定时启动正在等待 Telegram 恢复连接")
+			u.operationLabel.SetText("Telegram 连接暂时不可用，正在等待自动重试")
+		} else if err != nil && !errors.Is(err, context.Canceled) {
+			u.connection.SetText("连接失败，请检查设置")
+			u.operationLabel.SetText(err.Error())
+		} else {
+			u.connection.SetText("未连接")
 		}
 		u.updateActionAvailability()
-		u.scheduleConnectionRetry()
+		if retryable {
+			u.scheduleConnectionRetry()
+		}
 		u.updateScheduleStatus()
+		u.updateReadinessHint()
+		if reconnect && reconnectRequest != nil && !u.isClosed() {
+			u.connectWithRequest(*reconnectRequest, false)
+		}
 	})
 }
 
-func (u *window) waitClientReady(client *tgtransport.Client, ctx context.Context, automatic bool) {
+func (u *window) waitClientReady(client *tgtransport.Client, ctx context.Context, automatic bool, generation uint64) {
 	identity, err := client.WaitReady(ctx)
 	if err != nil {
-		if !errors.Is(err, context.Canceled) && !u.isClosed() && !automatic {
-			u.showError(err)
-		}
-		u.doUI(func() {
-			if u.currentClient() == client {
-				u.connectButton.Enable()
-				u.connection.SetText("未连接")
-			}
-		})
+		// runClient owns cleanup and retry scheduling. Waiting here prevents a
+		// failed readiness observer from racing a still-running one-shot Client.
+		return
+	}
+	if !u.isUsableCurrentClient(client, generation) || u.isClosed() {
 		return
 	}
 	u.doUI(func() {
-		if u.currentClient() != client || u.isClosed() {
+		u.clientMu.Lock()
+		if client == nil || u.client != client || u.clientGeneration != generation || u.reconnectRequested || u.isClosed() {
+			u.clientMu.Unlock()
 			return
 		}
+		u.connecting = false
+		u.clientMu.Unlock()
 		u.connected = true
+		u.connectionConfigErr = nil
 		u.identity = identity
-		u.resetScheduleConnectionRetry()
-		u.connectButton.Disable()
+		u.resetConnectionRetry()
+		u.connectButton.SetText("保存并重新连接")
+		if u.snapshot.Running {
+			u.connectButton.Disable()
+		} else {
+			u.connectButton.Enable()
+		}
 		u.bindButton.Enable()
 		u.connection.SetText("已连接 Bot：@" + identity.Username)
 		limitPrefix := "当前上传上限："
@@ -985,23 +1558,30 @@ func (u *window) waitClientReady(client *tgtransport.Client, ctx context.Context
 			limitPrefix = "协议上限（服务端动态值未确认）："
 		}
 		u.limit.SetText(limitPrefix + formatBytes(identity.MaxUploadBytes))
+		u.updateActionAvailability()
 		u.dispatchControllerSnapshot(u.controller.Snapshot())
+		if u.scheduler != nil {
+			u.scheduler.RetryDue()
+		}
 	})
 
 	// Queue entries may have been added while Telegram was disconnected. Apply
 	// the server limit in place; never rescan LastFolder because the durable
 	// queue can now contain selections from several different folders.
-	if len(u.controller.Snapshot().Jobs) > 0 {
-		if err := u.controller.ApplyUploadLimit(identity.MaxUploadBytes); err != nil {
-			u.showError(err)
-		}
+	if !u.isUsableCurrentClient(client, generation) || u.isClosed() {
+		return
 	}
-	if u.scheduler != nil {
-		u.scheduler.RetryDue()
+	queueSnapshot := u.controller.Snapshot()
+	if len(queueSnapshot.Jobs) > 0 {
+		if err := u.controller.ApplyUploadLimit(identity.MaxUploadBytes); err != nil {
+			if u.isUsableCurrentClient(client, generation) {
+				u.showError(err)
+			}
+		}
 	}
 }
 
-func (u *window) observeBinding(client *tgtransport.Client, ctx context.Context) {
+func (u *window) observeBinding(client *tgtransport.Client, ctx context.Context, generation uint64) {
 	for {
 		select {
 		case event, ok := <-client.BindingEvents():
@@ -1009,15 +1589,27 @@ func (u *window) observeBinding(client *tgtransport.Client, ctx context.Context)
 				return
 			}
 			if event.Err != nil {
-				u.showError(event.Err)
+				if u.isUsableCurrentClient(client, generation) {
+					u.showError(event.Err)
+				}
 				continue
 			}
 			channel := event.Channel
-			if err := u.controller.SetChannel(channel); err != nil {
+			u.clientMu.RLock()
+			if u.client != client || u.clientGeneration != generation || u.reconnectRequested || u.isClosed() {
+				u.clientMu.RUnlock()
+				continue
+			}
+			err := u.controller.SetChannel(channel)
+			u.clientMu.RUnlock()
+			if err != nil {
 				u.showError(err)
 				continue
 			}
 			u.doUI(func() {
+				if !u.isUsableCurrentClient(client, generation) {
+					return
+				}
 				u.bindMu.Lock()
 				d := u.bindDialog
 				u.bindDialog = nil
@@ -1031,6 +1623,7 @@ func (u *window) observeBinding(client *tgtransport.Client, ctx context.Context)
 				}
 				u.channel.SetText("已绑定：" + title)
 				u.operationLabel.SetText("频道绑定成功")
+				u.updateReadinessHint()
 				u.updateActionAvailability()
 				u.updateScheduleStatus()
 				if u.scheduler != nil {
@@ -1079,8 +1672,8 @@ func (u *window) beginBinding() {
 }
 
 func (u *window) chooseFolder() {
-	if u.snapshot.Running || u.isMoveInFlight() {
-		u.showError(errors.New("请先暂停或等待当前操作完成，再添加文件夹"))
+	if u.isMoveInFlight() {
+		u.showError(errors.New("请等待当前文件移动完成，再添加文件夹"))
 		return
 	}
 	dialog.ShowFolderOpen(func(uri fyne.ListableURI, err error) {
@@ -1132,8 +1725,8 @@ func (u *window) scanFolder(folder string, maxBytes int64) {
 		u.doUI(func() {
 			u.updateActionAvailability()
 			if err == nil {
-				if u.snapshot.Running || u.isMoveInFlight() {
-					u.operationLabel.SetText("扫描已完成；当前队列正在处理，请稍后重新添加")
+				if u.isMoveInFlight() {
+					u.operationLabel.SetText("扫描已完成；当前正在移动文件，请稍后重新添加")
 					return
 				}
 				u.showCandidateDialog(folder, candidates)
@@ -1272,17 +1865,18 @@ func (u *window) showCandidateDialog(folder string, candidates []model.Job) {
 		if len(selected) == 0 {
 			return
 		}
-		if err := u.controller.AddJobs(selected); err != nil {
+		added, err := u.controller.AddJobs(selected)
+		if err != nil {
 			u.showError(err)
 			return
 		}
-		if u.connected && u.identity.MaxUploadBytes > 0 {
-			if err := u.controller.ApplyUploadLimit(u.identity.MaxUploadBytes); err != nil {
-				u.showError(err)
-			}
-		}
 		candidateDialog.Dismiss()
-		u.operationLabel.SetText(fmt.Sprintf("已从当前文件夹添加 %d 个视频", len(selected)))
+		skipped := len(selected) - added
+		if skipped > 0 {
+			u.operationLabel.SetText(fmt.Sprintf("已添加 %d 个视频；%d 个因已在队列中而跳过", added, skipped))
+		} else {
+			u.operationLabel.SetText(fmt.Sprintf("已从当前文件夹添加 %d 个视频", added))
+		}
 	})
 	candidateDialog = dialog.NewCustom("添加到上传队列", "取消", content, u.window)
 	u.candidateDialog = candidateDialog
@@ -1330,7 +1924,7 @@ func (u *window) scanInProgress() bool {
 }
 
 func (u *window) selectAllJobs() {
-	if u.snapshot.Running || u.isMoveInFlight() {
+	if u.isMoveInFlight() {
 		return
 	}
 	for _, job := range u.snapshot.Jobs {
@@ -1340,7 +1934,7 @@ func (u *window) selectAllJobs() {
 }
 
 func (u *window) selectNoJobs() {
-	if u.snapshot.Running || u.isMoveInFlight() {
+	if u.isMoveInFlight() {
 		return
 	}
 	clear(u.selectedJobs)
@@ -1363,23 +1957,53 @@ func (u *window) confirmRemoveSelected() {
 		return
 	}
 	message := fmt.Sprintf("从本地队列删除所选的 %d 个条目？\n\n不会删除磁盘上的视频，也不会删除 Telegram 中已经发送的消息。", len(ids))
+	for _, id := range ids {
+		if id == u.snapshot.ActiveID {
+			message += "\n\n当前正在上传的任务会先被取消，安全结束后自动删除；如果消息提交结果未知，则会保留为“待确认”。"
+			break
+		}
+	}
 	dialog.ShowConfirm("删除所选条目", message, func(ok bool) {
 		if !ok {
 			return
 		}
-		if err := u.controller.RemoveJobs(ids); err != nil {
+		result, err := u.controller.RemoveJobs(ids)
+		if err != nil {
 			u.showError(err)
 			return
 		}
-		for _, id := range ids {
-			delete(u.selectedJobs, id)
+		current := u.controller.Snapshot()
+		existing := make(map[string]struct{}, len(current.Jobs))
+		for _, job := range current.Jobs {
+			existing[job.ID] = struct{}{}
 		}
-		u.operationLabel.SetText(fmt.Sprintf("已从本地队列删除 %d 个条目", len(ids)))
+		pending := make(map[string]struct{}, len(result.PendingRemovalIDs))
+		for _, id := range result.PendingRemovalIDs {
+			pending[id] = struct{}{}
+		}
+		retained := 0
+		for _, id := range ids {
+			_, stillExists := existing[id]
+			if !stillExists {
+				delete(u.selectedJobs, id)
+				continue
+			}
+			if _, waiting := pending[id]; !waiting {
+				retained++
+			}
+		}
+		if len(result.PendingRemovalIDs) > 0 {
+			u.operationLabel.SetText(fmt.Sprintf("已删除 %d 个条目；%d 个活动任务正在取消；%d 个受保护条目已保留", result.Removed, len(result.PendingRemovalIDs), retained))
+		} else if retained > 0 {
+			u.operationLabel.SetText(fmt.Sprintf("已删除 %d 个条目；%d 个待确认或正在移动的条目因安全原因保留", result.Removed, retained))
+		} else {
+			u.operationLabel.SetText(fmt.Sprintf("已从本地队列删除 %d 个条目", result.Removed))
+		}
 	}, u.window)
 }
 
 func (u *window) showResetJobsDialog() {
-	if u.snapshot.Running || u.isMoveInFlight() || u.scanInProgress() {
+	if u.isMoveInFlight() {
 		return
 	}
 	counts := resetJobCountsFor(u.snapshot.Jobs, u.selectedJobs)
@@ -1400,7 +2024,7 @@ func (u *window) showResetJobsDialog() {
 		return button
 	}
 
-	note := widget.NewLabel("重置会把任务恢复为“待上传”，不会立即开始上传，也不需要重新扫描文件夹。为避免重复消息，待确认、已发送、已移动和超限任务不会被批量重置。")
+	note := widget.NewLabel("重置会把任务恢复为“待上传”，不需要重新扫描文件夹。队列运行中时，会在当前文件结束后按原队列位置继续处理。为避免重复消息，待确认、已发送、已移动和超限任务不会被批量重置。")
 	note.Wrapping = fyne.TextWrapWord
 	content := container.NewVBox(
 		note,
@@ -1430,7 +2054,7 @@ func (u *window) resetJobs(mode coreapp.ResetMode, ids []string, label string) {
 }
 
 func (u *window) confirmRemoveCompleted() {
-	count := completedJobCount(u.snapshot.Jobs)
+	count := u.queueStats.Completed
 	if count == 0 {
 		return
 	}
@@ -1439,11 +2063,12 @@ func (u *window) confirmRemoveCompleted() {
 		if !ok {
 			return
 		}
-		if err := u.controller.RemoveCompleted(); err != nil {
+		result, err := u.controller.RemoveCompleted()
+		if err != nil {
 			u.showError(err)
 			return
 		}
-		u.operationLabel.SetText(fmt.Sprintf("已删除 %d 个已完成条目", count))
+		u.operationLabel.SetText(fmt.Sprintf("已删除 %d 个已完成条目", result.Removed))
 	}, u.window)
 }
 
@@ -1452,16 +2077,39 @@ func (u *window) confirmClearQueue() {
 		return
 	}
 	message := fmt.Sprintf("清空本地队列中的全部 %d 个条目？\n\n此操作不会删除磁盘文件或 Telegram 消息。", len(u.snapshot.Jobs))
-	dialog.ShowConfirm("清空队列", message, func(ok bool) {
+	if u.snapshot.Running {
+		message += "\n\n当前上传会先取消；安全结束后自动删除。消息提交结果未知的任务会保留为“待确认”。"
+	}
+	title := "清空队列"
+	if u.snapshot.Running {
+		title = "取消并清空队列"
+	}
+	dialog.ShowConfirm(title, message, func(ok bool) {
 		if !ok {
 			return
 		}
-		if err := u.controller.ClearQueue(); err != nil {
+		result, err := u.controller.ClearQueue()
+		if err != nil {
 			u.showError(err)
 			return
 		}
-		clear(u.selectedJobs)
-		u.operationLabel.SetText("本地上传队列已清空")
+		current := u.controller.Snapshot()
+		pending := make(map[string]struct{}, len(result.PendingRemovalIDs))
+		for _, id := range result.PendingRemovalIDs {
+			pending[id] = struct{}{}
+		}
+		retained := 0
+		for _, job := range current.Jobs {
+			if _, waiting := pending[job.ID]; !waiting {
+				retained++
+			}
+		}
+		if len(result.PendingRemovalIDs) == 0 && retained == 0 {
+			clear(u.selectedJobs)
+			u.operationLabel.SetText("本地上传队列已清空")
+		} else {
+			u.operationLabel.SetText(fmt.Sprintf("已清理 %d 个条目；%d 个活动任务正在取消；%d 个待确认或正在移动的条目因安全原因保留", result.Removed, len(result.PendingRemovalIDs), retained))
+		}
 	}, u.window)
 }
 
@@ -1480,7 +2128,7 @@ func (u *window) restoreScheduledStart() {
 }
 
 func (u *window) showScheduleDialog() {
-	if u.snapshot.Running || u.isMoveInFlight() || u.scanInProgress() {
+	if u.snapshot.Running || u.isMoveInFlight() {
 		return
 	}
 	now := time.Now()
@@ -1527,7 +2175,7 @@ func (u *window) showScheduleDialog() {
 			validation.SetText(err.Error())
 			return
 		}
-		u.resetScheduleConnectionRetry()
+		u.resetConnectionRetry()
 		u.scheduler.Set(startAt)
 		u.updateScheduleStatus()
 		u.updateActionAvailability()
@@ -1570,7 +2218,6 @@ func (u *window) cancelScheduledStart() {
 		return
 	}
 	u.scheduler.Cancel()
-	u.scheduleRetry = 0
 	u.updateScheduleStatus()
 	u.updateActionAvailability()
 	u.operationLabel.SetText("已取消定时开始")
@@ -1596,60 +2243,87 @@ func (u *window) updateScheduleStatus() {
 		suffix = "时间已到，等待手动继续"
 	case !u.connected:
 		suffix = "时间已到，等待 Telegram 连接"
-		if u.scheduleRetry > 0 {
+		if u.connectionRetryDelay > 0 {
 			suffix += "（将自动重试）"
 		}
 	case u.snapshot.Channel.ID == 0:
 		suffix = "时间已到，等待绑定频道"
-	case !hasRunnableJobs(u.snapshot.Jobs):
+	case !u.queueStats.Runnable:
 		suffix = "时间已到，等待队列加入待上传视频"
 	case u.snapshot.Running:
 		suffix = "时间已到，队列正在运行"
-	case u.isMoveInFlight() || u.scanInProgress() || u.candidateDialog != nil:
+	case u.isMoveInFlight():
 		suffix = "时间已到，等待当前文件操作完成"
 	}
 	u.scheduleLabel.SetText("定时：" + display + " · " + suffix)
 }
 
 func (u *window) ensureScheduledConnection() {
-	if u.currentClient() != nil || u.connectButton == nil || u.connectButton.Disabled() {
+	u.ensureConnection()
+}
+
+func (u *window) ensureConnection() {
+	if u.currentClient() != nil || u.isClosed() || u.connectionConfigErr != nil {
+		return
+	}
+	u.clientMu.RLock()
+	connecting := u.connecting
+	u.clientMu.RUnlock()
+	if connecting {
 		return
 	}
 	u.connected = false
-	appID, err := strconv.Atoi(strings.TrimSpace(u.apiID.Text))
-	if err != nil || appID <= 0 || strings.TrimSpace(u.apiHash.Text) == "" || strings.TrimSpace(u.botToken.Text) == "" {
+	if !u.canAttemptAutomaticConnection() {
 		u.updateScheduleStatus()
+		u.updateReadinessHint()
 		return
 	}
 	u.connectWithMode(true)
 }
 
 func (u *window) scheduleConnectionRetry() {
-	if u.scheduler == nil || u.isClosed() {
+	if u.isClosed() || u.connected || !u.canAttemptAutomaticConnection() {
 		return
 	}
-	_, set, due := u.scheduler.State()
-	if !set || !due || u.connected {
+	u.connectionRetryMu.Lock()
+	if u.connectionRetryTimer != nil {
+		u.connectionRetryMu.Unlock()
 		return
 	}
-	u.scheduleRetry = nextScheduleRetryDelay(u.scheduleRetry)
-	u.scheduler.RetryDueAfter(u.scheduleRetry)
+	u.connectionRetryDelay = nextConnectionRetryDelay(u.connectionRetryDelay)
+	delay := u.connectionRetryDelay
+	u.connectionRetryTimer = time.AfterFunc(delay, func() {
+		u.connectionRetryMu.Lock()
+		u.connectionRetryTimer = nil
+		u.connectionRetryMu.Unlock()
+		u.doUI(u.ensureConnection)
+	})
+	u.connectionRetryMu.Unlock()
+	u.operationLabel.SetText(fmt.Sprintf("Telegram 连接将在 %s 后自动重试", formatDuration(delay)))
+	u.updateScheduleStatus()
 }
 
-func (u *window) resetScheduleConnectionRetry() {
-	u.scheduleRetry = 0
-	if u.scheduler != nil {
-		u.scheduler.CancelRetry()
+func (u *window) resetConnectionRetry() {
+	u.connectionRetryDelay = 0
+	u.stopConnectionRetryTimer()
+}
+
+func (u *window) stopConnectionRetryTimer() {
+	u.connectionRetryMu.Lock()
+	if u.connectionRetryTimer != nil {
+		u.connectionRetryTimer.Stop()
+		u.connectionRetryTimer = nil
 	}
+	u.connectionRetryMu.Unlock()
 }
 
-func nextScheduleRetryDelay(previous time.Duration) time.Duration {
-	if previous < scheduleRetryInitial {
-		return scheduleRetryInitial
+func nextConnectionRetryDelay(previous time.Duration) time.Duration {
+	if previous < connectionRetryInitial {
+		return connectionRetryInitial
 	}
 	next := previous * 2
-	if next > scheduleRetryMaximum {
-		return scheduleRetryMaximum
+	if next > connectionRetryMaximum {
+		return connectionRetryMaximum
 	}
 	return next
 }
@@ -1663,7 +2337,7 @@ func (u *window) tryScheduledStart() {
 		return
 	}
 	u.updateScheduleStatus()
-	if u.snapshot.Running || u.isMoveInFlight() || u.scanInProgress() || u.candidateDialog != nil {
+	if u.snapshot.Running || u.isMoveInFlight() {
 		return
 	}
 	// A scheduled start must never clear a manual pause. The user must press
@@ -1676,7 +2350,7 @@ func (u *window) tryScheduledStart() {
 		u.ensureScheduledConnection()
 		return
 	}
-	if u.snapshot.Channel.ID == 0 || !hasRunnableJobs(u.snapshot.Jobs) {
+	if u.snapshot.Channel.ID == 0 || !u.queueStats.Runnable {
 		return
 	}
 
@@ -1692,6 +2366,24 @@ func (u *window) tryScheduledStart() {
 }
 
 func (u *window) startUploads() {
+	if !u.queueStats.Runnable {
+		return
+	}
+	if !u.connected || u.currentClient() == nil {
+		u.ensureConnection()
+		if u.isConnecting() {
+			u.operationLabel.SetText("Telegram 正在自动连接；连接完成后请再次点击开始上传")
+		} else {
+			u.operationLabel.SetText("尚未连接 Telegram，请先在设置中完成连接")
+		}
+		u.showSettingsPage()
+		return
+	}
+	if u.snapshot.Channel.ID == 0 {
+		u.operationLabel.SetText("尚未绑定目标频道，请先在设置中完成绑定")
+		u.showSettingsPage()
+		return
+	}
 	if err := u.beginUploads(false); err != nil {
 		u.showError(err)
 	}
@@ -1727,7 +2419,6 @@ func (u *window) beginUploads(scheduled bool) error {
 			return err
 		}
 		u.scheduler.Cancel()
-		u.scheduleRetry = 0
 	}
 
 	if err := u.controller.Start(u.rootCtx); err != nil {
@@ -1763,7 +2454,7 @@ func (u *window) beginUploads(scheduled bool) error {
 		}
 	}
 	u.operationLabel.SetText(status)
-	u.resetScheduleConnectionRetry()
+	u.resetConnectionRetry()
 	u.updateScheduleStatus()
 	return nil
 }
@@ -1882,7 +2573,7 @@ func (u *window) retryJobNow(id string) {
 }
 
 func (u *window) confirmMarkSent(id string) {
-	dialog.ShowConfirm("标记为已发送", "仅当你已在频道中看到这条视频时使用。标记后程序会继续后续任务，确定吗？", func(ok bool) {
+	dialog.ShowConfirm("标记为已发送", "仅当你已在频道中看到这条视频时使用。标记后可重新开始后续任务，确定吗？", func(ok bool) {
 		if !ok {
 			return
 		}
@@ -1983,7 +2674,7 @@ func (u *window) moveProgress(progress model.Progress) {
 }
 
 func (u *window) closeIntercept() {
-	if u.snapshot.Running {
+	if u.queueRunning() {
 		dialog.ShowConfirm("退出并取消上传", "当前仍有上传任务。退出会取消当前和排队中的上传，但不会删除已经发送的消息。确定退出吗？", func(ok bool) {
 			if ok {
 				u.forceClose()
@@ -2013,9 +2704,10 @@ func (u *window) forceClose() {
 	}
 	u.closed = true
 	u.closedMu.Unlock()
+	u.stopConnectionRetryTimer()
 
-	if u.snapshot.Running {
-		u.controller.CancelAll()
+	if u.queueRunning() && u.controller != nil {
+		_ = u.controller.CancelAll()
 	}
 	u.moveMu.Lock()
 	if u.moveCancel != nil {
@@ -2023,11 +2715,17 @@ func (u *window) forceClose() {
 	}
 	u.moveMu.Unlock()
 	u.clientMu.Lock()
+	u.clientGeneration++
+	u.connecting = false
+	u.reconnectRequested = false
+	u.pendingReconnect = nil
 	if u.clientCancel != nil {
 		u.clientCancel()
 	}
 	u.clientCancel = nil
+	u.client = nil
 	u.clientMu.Unlock()
+	u.controller.SetGateway(nil)
 	u.rootCancel()
 	if u.scheduler != nil {
 		u.scheduler.Stop()
@@ -2074,6 +2772,40 @@ func (u *window) currentClient() *tgtransport.Client {
 	return u.client
 }
 
+func (u *window) isConnecting() bool {
+	u.clientMu.RLock()
+	defer u.clientMu.RUnlock()
+	return u.connecting
+}
+
+func (u *window) isUsableCurrentClient(client *tgtransport.Client, generation uint64) bool {
+	u.clientMu.RLock()
+	defer u.clientMu.RUnlock()
+	return client != nil && u.client == client && u.clientGeneration == generation && !u.reconnectRequested
+}
+
+func isTransientConnectionError(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, tgtransport.ErrWrongBotSession) {
+		return false
+	}
+	if errors.Is(err, tgtransport.ErrNotConnected) || errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, net.ErrClosed) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	var networkErr net.Error
+	return errors.As(err, &networkErr)
+}
+
+func shouldRetryConnection(runErr, contextErr error, closed bool) bool {
+	if closed {
+		return false
+	}
+	if runErr == nil {
+		return contextErr == nil
+	}
+	return isTransientConnectionError(runErr)
+}
+
 func (u *window) isClosed() bool {
 	u.closedMu.RLock()
 	defer u.closedMu.RUnlock()
@@ -2092,7 +2824,10 @@ func (u *window) doUI(fn func()) {
 }
 
 func (u *window) setConnectionStatus(status string) {
-	u.doUI(func() { u.connection.SetText(status) })
+	u.doUI(func() {
+		u.connection.SetText(status)
+		u.updateReadinessHint()
+	})
 }
 
 func (u *window) showError(err error) {
@@ -2100,15 +2835,6 @@ func (u *window) showError(err error) {
 		return
 	}
 	u.doUI(func() { dialog.ShowError(err, u.window) })
-}
-
-func hasRunnableJobs(jobs []model.Job) bool {
-	for _, job := range jobs {
-		if job.State == model.JobQueued || job.State == model.JobInterrupted {
-			return true
-		}
-	}
-	return false
 }
 
 func completedJobCount(jobs []model.Job) int {
@@ -2119,10 +2845,6 @@ func completedJobCount(jobs []model.Job) int {
 		}
 	}
 	return count
-}
-
-func hasCompletedJobs(jobs []model.Job) bool {
-	return completedJobCount(jobs) > 0
 }
 
 type resetJobCounts struct {
@@ -2171,15 +2893,6 @@ func canonicalPathKey(path string) string {
 		path = strings.ToLower(path)
 	}
 	return path
-}
-
-func (u *window) hasOversizeJobs() bool {
-	for _, job := range u.snapshot.Jobs {
-		if job.State == model.JobOversize {
-			return true
-		}
-	}
-	return false
 }
 
 func jobFraction(job model.Job) float64 {
@@ -2286,13 +2999,11 @@ func baseJobStatus(job model.Job) string {
 }
 
 func formatSummary(snapshot coreapp.Snapshot) string {
-	countSent := 0
-	for _, job := range snapshot.Jobs {
-		if job.State == model.JobSent || job.State == model.JobMoved {
-			countSent++
-		}
-	}
-	message := fmt.Sprintf("总进度：%s / %s · 已完成 %d / %d", formatBytes(snapshot.DoneBytes), formatBytes(snapshot.TotalBytes), countSent, len(snapshot.Jobs))
+	return formatSummaryWithCompleted(snapshot, completedJobCount(snapshot.Jobs))
+}
+
+func formatSummaryWithCompleted(snapshot coreapp.Snapshot, completed int) string {
+	message := fmt.Sprintf("总进度：%s / %s · 已完成 %d / %d", formatBytes(snapshot.DoneBytes), formatBytes(snapshot.TotalBytes), completed, len(snapshot.Jobs))
 	if snapshot.BytesPerSecond > 0 {
 		message += fmt.Sprintf(" · %s/s · ETA %s", formatBytes(int64(snapshot.BytesPerSecond)), formatDuration(snapshot.ETA))
 	}
