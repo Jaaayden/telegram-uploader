@@ -118,6 +118,18 @@ func TestVirtualQueueListCreatesOnlyVisibleRows(t *testing.T) {
 	}
 	u.snapshot = coreapp.Snapshot{Jobs: jobs}
 	u.refreshQueueRows(jobs)
+	template := u.queueList.CreateItem()
+	if _, ok := template.(*fyne.Container); !ok {
+		t.Fatalf("queue template type = %T, want native *fyne.Container for cross-platform rendering", template)
+	}
+	u.queueList.UpdateItem(0, template)
+	row, ok := jobRowFromObject(template)
+	if !ok || !strings.Contains(row.name.Text, jobs[0].Name) {
+		t.Fatalf("native queue template was not populated: row=%+v", row)
+	}
+	if markup := test.RenderObjectToMarkup(template); !strings.Contains(markup, "取消") || !strings.Contains(markup, "0%") {
+		t.Fatalf("rendered native queue row does not contain populated child widgets; markup=%s", markup)
+	}
 
 	window := test.NewWindow(u.queueList)
 	defer window.Close()
@@ -127,6 +139,26 @@ func TestVirtualQueueListCreatesOnlyVisibleRows(t *testing.T) {
 
 	if u.queueRowCreateCount == 0 || u.queueRowCreateCount >= len(jobs) {
 		t.Fatalf("created queue rows = %d, want a visible pool smaller than %d jobs", u.queueRowCreateCount, len(jobs))
+	}
+	if len(u.queueRowPool) == 0 || u.queueRowPool[0].boundID == "" || u.queueRowPool[0].name.Text == "文件名" {
+		t.Fatalf("visible native rows were not populated: pool=%d", len(u.queueRowPool))
+	}
+}
+
+func TestMainStatusHeaderStaysOnOneLine(t *testing.T) {
+	application := test.NewApp()
+	defer application.Quit()
+
+	u := &window{}
+	u.buildFields()
+	statusLine := u.buildMainStatusLine()
+
+	if u.readinessHint.Wrapping != fyne.TextWrapOff || u.readinessHint.Truncation != fyne.TextTruncateEllipsis {
+		t.Fatalf("readiness label wrapping/truncation = %v/%v, want off/ellipsis", u.readinessHint.Wrapping, u.readinessHint.Truncation)
+	}
+	maxLabelHeight := max(u.mainConnection.MinSize().Height, u.mainChannel.MinSize().Height, u.readinessHint.MinSize().Height)
+	if statusLine.MinSize().Height > maxLabelHeight {
+		t.Fatalf("status line minimum height = %.1f, want one label line %.1f", statusLine.MinSize().Height, maxLabelHeight)
 	}
 }
 
@@ -593,6 +625,19 @@ func TestJobStatusShowsRetryWaitInsteadOfZeroUploadSpeed(t *testing.T) {
 	}
 	if got := jobStatus(job); got != job.Error {
 		t.Fatalf("jobStatus() = %q, want retry detail %q", got, job.Error)
+	}
+}
+
+func TestCompactUploadingStatusIncludesTransferredTotalAndSpeed(t *testing.T) {
+	job := model.Job{
+		State:          model.JobUploading,
+		Uploaded:       512 * 1024 * 1024,
+		Size:           1024 * 1024 * 1024,
+		BytesPerSecond: 10 * 1024 * 1024,
+	}
+	want := "上传中 · 512.0 MiB / 1.0 GiB · 10.0 MiB/s"
+	if got := compactJobStatus(job); got != want {
+		t.Fatalf("compactJobStatus() = %q, want %q", got, want)
 	}
 }
 

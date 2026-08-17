@@ -328,11 +328,7 @@ func (u *window) build() {
 		u.operationLabel,
 	)
 	queueContent := container.NewBorder(queueTop, nil, nil, nil, u.queueList)
-	status := container.NewVBox(
-		widget.NewLabelWithStyle("Telegram 视频顺序上传器", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
-		container.NewHBox(u.mainConnection, widget.NewLabel("·"), u.mainChannel),
-		u.readinessHint,
-	)
+	status := u.buildMainStatusLine()
 	mainHeader := container.NewBorder(nil, widget.NewSeparator(), nil, u.settingsButton, status)
 	u.mainPage = container.NewBorder(mainHeader, nil, nil, nil, queueContent)
 	u.settingsPage.Hide()
@@ -342,6 +338,16 @@ func (u *window) build() {
 
 	u.applyLoadedSettings()
 	u.applySnapshot(u.controller.Snapshot())
+}
+
+func (u *window) buildMainStatusLine() *fyne.Container {
+	return container.NewBorder(
+		nil,
+		nil,
+		container.NewHBox(u.mainConnection, widget.NewLabel("·"), u.mainChannel, widget.NewLabel("·")),
+		nil,
+		u.readinessHint,
+	)
 }
 
 func (u *window) buildFields() {
@@ -372,7 +378,8 @@ func (u *window) buildFields() {
 	u.mainConnection = widget.NewLabel("Telegram：未连接")
 	u.mainChannel = widget.NewLabel("频道：未绑定")
 	u.readinessHint = widget.NewLabel("请在设置中完成 Telegram 配置")
-	u.readinessHint.Wrapping = fyne.TextWrapWord
+	u.readinessHint.Wrapping = fyne.TextWrapOff
+	u.readinessHint.Truncation = fyne.TextTruncateEllipsis
 
 	u.chooseFolderButton = widget.NewButton("添加文件夹…", u.chooseFolder)
 	u.folderLabel = widget.NewLabel("尚未添加来源文件夹")
@@ -424,20 +431,58 @@ func (u *window) buildQueue() {
 		func() int { return len(u.queueJobs) },
 		func() fyne.CanvasObject {
 			u.queueRowCreateCount++
-			return newJobRow()
+			row := newJobRow()
+			// Fyne's canvas drivers dispatch renderers by the concrete object
+			// type. Return the native container, not the jobRow bookkeeping
+			// wrapper, or some platforms render an empty list item.
+			return row.Container
 		},
 		func(id widget.ListItemID, object fyne.CanvasObject) {
-			row, ok := object.(*jobRow)
+			row, ok := jobRowFromObject(object)
 			if !ok || id < 0 || id >= len(u.queueJobs) {
 				return
 			}
-			if !row.registered {
-				row.registered = true
-				u.queueRowPool = append(u.queueRowPool, row)
-			}
+			row = u.registerQueueRow(row)
 			u.updateJobRow(row, u.queueJobs[id])
 		},
 	)
+}
+
+func (u *window) registerQueueRow(row *jobRow) *jobRow {
+	for _, existing := range u.queueRowPool {
+		if existing.Container == row.Container {
+			return existing
+		}
+	}
+	u.queueRowPool = append(u.queueRowPool, row)
+	return row
+}
+
+func jobRowFromObject(object fyne.CanvasObject) (*jobRow, bool) {
+	rowContainer, ok := object.(*fyne.Container)
+	if !ok || len(rowContainer.Objects) != 4 {
+		return nil, false
+	}
+	body, ok := rowContainer.Objects[0].(*fyne.Container)
+	if !ok || len(body.Objects) != 3 {
+		return nil, false
+	}
+	name, nameOK := body.Objects[0].(*widget.Label)
+	progress, progressOK := body.Objects[1].(*widget.ProgressBar)
+	status, statusOK := body.Objects[2].(*widget.Label)
+	selected, selectedOK := rowContainer.Objects[2].(*widget.Check)
+	action, actionOK := rowContainer.Objects[3].(*widget.Button)
+	if !nameOK || !progressOK || !statusOK || !selectedOK || !actionOK {
+		return nil, false
+	}
+	return &jobRow{
+		Container: rowContainer,
+		selected:  selected,
+		name:      name,
+		status:    status,
+		progress:  progress,
+		action:    action,
+	}, true
 }
 
 func newJobRow() *jobRow {
@@ -461,23 +506,17 @@ func newJobRow() *jobRow {
 	}
 }
 
-// jobRow is a pooled virtual-list row. boundID ensures recycled callbacks never
-// act on the job that previously occupied the same visible widget.
+// jobRow is bookkeeping around a native Fyne container. The wrapper itself is
+// never returned as a CanvasObject because platform renderers dispatch native
+// containers by their concrete type.
 type jobRow struct {
 	*fyne.Container
-	selected      *widget.Check
-	name          *widget.Label
-	status        *widget.Label
-	progress      *widget.ProgressBar
-	action        *widget.Button
-	boundID       string
-	nameText      string
-	statusText    string
-	actionText    string
-	progressValue float64
-	checked       bool
-	selectable    bool
-	registered    bool
+	selected *widget.Check
+	name     *widget.Label
+	status   *widget.Label
+	progress *widget.ProgressBar
+	action   *widget.Button
+	boundID  string
 }
 
 type jobRenderState struct {
@@ -529,68 +568,65 @@ func (u *window) updateJobRow(row *jobRow, job model.Job) {
 	selectable := u.queueSelectable
 	checked := u.selectedJobs[jobID]
 
-	if row.nameText != nameText {
+	if row.name.Text != nameText {
 		row.name.SetText(nameText)
-		row.nameText = nameText
 	}
-	if row.statusText != statusText {
+	if row.status.Text != statusText {
 		row.status.SetText(statusText)
-		row.statusText = statusText
 	}
-	if row.progressValue != progressValue {
+	if row.progress.Value != progressValue {
 		row.progress.SetValue(progressValue)
-		row.progressValue = progressValue
 	}
 
+	// A List recycles native containers for different IDs. Always detach the
+	// previous callback before updating the checkbox, then bind this job ID.
 	rebind := row.boundID != jobID
-	if row.checked != checked || rebind {
+	if row.selected.Checked != checked || rebind {
 		previousCallback := row.selected.OnChanged
 		row.selected.OnChanged = nil
-		row.selected.SetChecked(checked)
-		row.checked = checked
-		if !rebind {
+		if row.selected.Checked != checked {
+			row.selected.SetChecked(checked)
+		}
+		if rebind {
+			row.selected.OnChanged = func(checked bool) {
+				if row.boundID != jobID {
+					return
+				}
+				if checked {
+					u.selectedJobs[jobID] = true
+				} else {
+					delete(u.selectedJobs, jobID)
+				}
+				u.updateSelectionControls()
+			}
+		} else {
 			row.selected.OnChanged = previousCallback
 		}
 	}
-	if rebind {
-		row.selected.OnChanged = func(checked bool) {
+	if !selectable && !row.selected.Disabled() {
+		row.selected.Disable()
+	} else if selectable && row.selected.Disabled() {
+		row.selected.Enable()
+	}
+
+	actionText := jobActionLabel(job)
+	if rebind || row.action.Text != actionText {
+		if row.action.Text != actionText {
+			row.action.SetText(actionText)
+		}
+		row.action.OnTapped = func() {
 			if row.boundID != jobID {
 				return
 			}
-			if checked {
-				u.selectedJobs[jobID] = true
-			} else {
-				delete(u.selectedJobs, jobID)
-			}
-			u.updateSelectionControls()
-		}
-	}
-	if !selectable && row.selectable {
-		row.selected.Disable()
-	} else if selectable && !row.selectable {
-		row.selected.Enable()
-	}
-	row.selectable = selectable
-
-	actionText := jobActionLabel(job)
-	actionChanged := rebind || row.actionText != actionText
-	if row.actionText != actionText {
-		row.action.SetText(actionText)
-		row.actionText = actionText
-	}
-	if actionChanged {
-		row.action.OnTapped = func() {
-			if row.boundID == jobID {
-				switch actionText {
-				case "取消":
-					u.cancelJob(jobID)
-				case "处理…":
-					u.showJobActions(jobID)
-				case "重试":
-					u.retryJob(jobID)
-				default:
-					u.showJobDetails(jobID)
-				}
+			switch actionText {
+			case "取消":
+				u.cancelJob(jobID)
+			case "处理…":
+				u.showJobActions(jobID)
+			case "重试":
+				u.retryJob(jobID)
+			default:
+				u.showJobDetails(jobID)
 			}
 		}
 	}
@@ -2926,7 +2962,12 @@ func compactJobStatus(job model.Job) string {
 		if job.Error != "" {
 			return prefix + job.Error
 		}
-		return prefix + fmt.Sprintf("上传中 · %s/s", formatBytes(int64(job.BytesPerSecond)))
+		return prefix + fmt.Sprintf(
+			"上传中 · %s / %s · %s/s",
+			formatBytes(job.Uploaded),
+			formatBytes(job.Size),
+			formatBytes(int64(job.BytesPerSecond)),
+		)
 	case model.JobSending:
 		return prefix + "正在提交频道消息…"
 	case model.JobConfirming:
