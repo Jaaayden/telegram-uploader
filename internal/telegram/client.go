@@ -33,13 +33,14 @@ type Client struct {
 	gaps        *updates.Manager
 	flood       *floodGate
 
-	mu       sync.RWMutex
-	api      *tg.Client
-	runCtx   context.Context
-	identity Identity
-	runErr   error
-	running  bool
-	started  bool
+	mu        sync.RWMutex
+	api       *tg.Client
+	uploadAPI *tg.Client
+	runCtx    context.Context
+	identity  Identity
+	runErr    error
+	running   bool
+	started   bool
 
 	ready     chan struct{}
 	runDone   chan struct{}
@@ -52,8 +53,12 @@ type Client struct {
 	binding           chan BindingEvent
 
 	uploadSem chan struct{}
-	sendMu    sync.Mutex
-	lastSend  time.Time
+	// uploadConcurrency is read once for each video. The connection pool is
+	// created at the largest supported profile and grows lazily, so changing
+	// this value does not require reconnecting Telegram.
+	uploadConcurrency int
+	sendMu            sync.Mutex
+	lastSend          time.Time
 }
 
 func NewClient(cfg Config, events Events) (*Client, error) {
@@ -69,14 +74,16 @@ func NewClient(cfg Config, events Events) (*Client, error) {
 	if cfg.SessionStorage == nil {
 		cfg.SessionStorage = &session.StorageMemory{}
 	}
+	cfg.UploadConcurrency = normalizeUploadConcurrency(cfg.UploadConcurrency)
 
 	c := &Client{
-		cfg:       cfg,
-		events:    events,
-		ready:     make(chan struct{}),
-		runDone:   make(chan struct{}),
-		binding:   make(chan BindingEvent, 4),
-		uploadSem: make(chan struct{}, 1),
+		cfg:               cfg,
+		events:            events,
+		ready:             make(chan struct{}),
+		runDone:           make(chan struct{}),
+		binding:           make(chan BindingEvent, 4),
+		uploadSem:         make(chan struct{}, 1),
+		uploadConcurrency: cfg.UploadConcurrency,
 	}
 	c.flood = &floodGate{onWait: events.OnFloodWait}
 
@@ -119,7 +126,7 @@ func NewClient(cfg Config, events Events) (*Client, error) {
 		Device: gotdtelegram.DeviceConfig{
 			DeviceModel:    "Desktop",
 			SystemVersion:  "Windows/macOS",
-			AppVersion:     "1.0.0",
+			AppVersion:     "1.1.0",
 			SystemLangCode: "zh-Hans",
 			LangCode:       "zh-Hans",
 		},
@@ -187,6 +194,7 @@ func (c *Client) Run(ctx context.Context) (retErr error) {
 		c.mu.Lock()
 		c.runErr = retErr
 		c.api = nil
+		c.uploadAPI = nil
 		c.runCtx = nil
 		c.running = false
 		c.mu.Unlock()
@@ -219,9 +227,19 @@ func (c *Client) Run(ctx context.Context) (retErr error) {
 		}
 
 		maxBytes, maxUploadExact := c.queryMaxUploadBytes(runCtx)
+		// gotd pools open connections on demand. Keeping the ceiling at the
+		// largest supported profile lets a setting change take effect for the
+		// next video without eagerly creating twelve connections.
+		uploadPool, err := c.raw.Pool(uploadConnectionPoolMaximum)
+		if err != nil {
+			return fmt.Errorf("创建上传连接池失败：%w", err)
+		}
+		defer func() { _ = uploadPool.Close() }()
+
 		username, _ := status.User.GetUsername()
 		c.mu.Lock()
 		c.api = c.raw.API()
+		c.uploadAPI = tg.NewClient(uploadPool)
 		c.runCtx = runCtx
 		c.identity = Identity{BotID: status.User.ID, Username: username, MaxUploadBytes: maxBytes, MaxUploadExact: maxUploadExact}
 		c.mu.Unlock()
@@ -236,12 +254,37 @@ func (c *Client) Run(ctx context.Context) (retErr error) {
 	})
 }
 
+func normalizeUploadConcurrency(value int) int {
+	switch value {
+	case UploadConcurrencyCompatibility, UploadConcurrencyBalanced, UploadConcurrencyFast:
+		return value
+	default:
+		return DefaultUploadConcurrency
+	}
+}
+
+// SetUploadConcurrency changes the part concurrency used by the next video.
+// It returns the normalized supported value that was applied.
+func (c *Client) SetUploadConcurrency(value int) int {
+	value = normalizeUploadConcurrency(value)
+	c.mu.Lock()
+	c.uploadConcurrency = value
+	c.mu.Unlock()
+	return value
+}
+
+func (c *Client) currentUploadConcurrency() int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return normalizeUploadConcurrency(c.uploadConcurrency)
+}
+
 func (c *Client) WaitReady(ctx context.Context) (Identity, error) {
 	select {
 	case <-c.ready:
 		c.mu.RLock()
 		defer c.mu.RUnlock()
-		if !c.running || c.api == nil {
+		if !c.running || c.api == nil || c.uploadAPI == nil {
 			if c.runErr != nil {
 				return Identity{}, c.runErr
 			}
@@ -267,6 +310,15 @@ func (c *Client) connectedAPI() (*tg.Client, error) {
 		return nil, ErrNotConnected
 	}
 	return c.api, nil
+}
+
+func (c *Client) connectedUploadAPI() (*tg.Client, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.uploadAPI == nil {
+		return nil, ErrNotConnected
+	}
+	return c.uploadAPI, nil
 }
 
 func (c *Client) BeginChannelBinding() (string, error) {

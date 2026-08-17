@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -82,21 +84,59 @@ type Controller struct {
 	lastError     string
 
 	activeCancel       context.CancelFunc
+	activeAttempt      uint64
+	attemptRevision    uint64
 	allCancel          context.CancelFunc
 	cancelJobID        string
 	cancelAllRequested bool
+	retryWaitActive    bool
 	updates            chan Snapshot
-	lastPersist        time.Time
+	uploadRetryDelays  []time.Duration
+	uploadRetryWait    func(context.Context, time.Duration) error
 }
+
+var defaultUploadRetryDelays = []time.Duration{
+	2 * time.Second,
+	5 * time.Second,
+	10 * time.Second,
+	20 * time.Second,
+	40 * time.Second,
+}
+
+var (
+	errQueuePaused          = errors.New("上传队列已暂停")
+	errQueuePersistenceLost = errors.New("无法可靠保存上传队列状态")
+)
 
 func NewController(store QueueStore, fileMover *mover.Mover) *Controller {
 	if fileMover == nil {
 		fileMover = mover.New()
 	}
 	return &Controller{
-		store:   store,
-		mover:   fileMover,
-		updates: make(chan Snapshot, 1),
+		store:             store,
+		mover:             fileMover,
+		updates:           make(chan Snapshot, 1),
+		uploadRetryDelays: append([]time.Duration(nil), defaultUploadRetryDelays...),
+		uploadRetryWait:   waitForUploadRetry,
+	}
+}
+
+func waitForUploadRetry(ctx context.Context, delay time.Duration) error {
+	if delay <= 0 {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			return nil
+		}
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
@@ -236,9 +276,13 @@ func (c *Controller) Pause() error {
 	}
 	wasPaused := c.paused
 	wasRequested := c.pauseRequested
+	var cancelRetryWait context.CancelFunc
 	c.paused = true
 	if c.running {
 		c.pauseRequested = true
+		if c.retryWaitActive {
+			cancelRetryWait = c.activeCancel
+		}
 	}
 	stateChanged := !wasPaused || wasRequested != c.pauseRequested
 	if stateChanged {
@@ -261,6 +305,13 @@ func (c *Controller) Pause() error {
 		c.mu.Unlock()
 		c.setPersistenceError(err)
 		return err
+	}
+	// A normal upload remains a soft pause and is allowed to finish. Waiting
+	// after a failed pre-send attempt is different: no Telegram request is in
+	// flight, so interrupt the backoff immediately and leave the job
+	// recoverable instead of making Pause wait for the longest retry delay.
+	if cancelRetryWait != nil {
+		cancelRetryWait()
 	}
 	return nil
 }
@@ -887,6 +938,8 @@ func (c *Controller) runQueue(ctx context.Context) {
 		c.pauseRequested = false
 		c.activeID = ""
 		c.activeCancel = nil
+		c.activeAttempt = 0
+		c.retryWaitActive = false
 		c.allCancel = nil
 		c.cancelJobID = ""
 		c.cancelAllRequested = false
@@ -899,92 +952,68 @@ func (c *Controller) runQueue(ctx context.Context) {
 	}()
 
 	for {
-		index, job, gateway, channel, ok := c.nextJob()
+		index, job, channel, ok := c.nextJob()
 		if !ok {
 			return
 		}
 		if err := ctx.Err(); err != nil {
 			return
 		}
-		if gateway == nil {
-			c.failJob(index, job.ID, tgtransport.ErrNotConnected)
-			return
-		}
 
-		file, metadata, err := openVerifiedJob(job)
-		if err != nil {
-			c.failJob(index, job.ID, err)
-			return
-		}
-
-		fileCtx, fileCancel := context.WithCancel(ctx)
-		now := time.Now()
-		c.mu.Lock()
-		// Pause may have been requested after nextJob selected this entry but
-		// before the file was opened. Re-check under the same mutex used by
-		// Pause so a between-files pause cannot start a new Telegram request.
-		if c.paused || c.pauseRequested {
-			c.mu.Unlock()
-			fileCancel()
-			_ = file.Close()
-			return
-		}
-		c.jobs[index].Metadata = metadata
-		c.jobs[index].State = model.JobUploading
-		c.jobs[index].Uploaded = 0
-		c.jobs[index].BytesPerSecond = 0
-		c.jobs[index].StartedAt = &now
-		c.jobs[index].Error = ""
-		c.activeID = job.ID
-		c.activeCancel = fileCancel
-		c.notifyLocked()
-		c.mu.Unlock()
-		if err := c.persist(); err != nil {
-			fileCancel()
-			_ = file.Close()
-			c.failJob(index, job.ID, fmt.Errorf("保存上传状态失败：%w", err))
-			return
-		}
-
-		messageID, err := gateway.UploadVideo(fileCtx, tgtransport.UploadRequest{
-			Channel:  channel,
-			Path:     job.Path,
-			File:     file,
-			Name:     job.Name,
-			Caption:  captionFromFilename(job.Name),
-			RandomID: job.RandomID,
-			Metadata: metadata,
-		}, func(progress model.Progress) {
-			c.applyProgress(index, job.ID, progress)
-		})
-		fileCancel()
-		if closeErr := file.Close(); err == nil && closeErr != nil {
-			err = fmt.Errorf("关闭视频文件失败：%w", closeErr)
-		}
+		jobCtx, jobCancel := context.WithCancel(ctx)
+		messageID, err := c.uploadJobWithRetry(jobCtx, index, job, channel, jobCancel)
+		jobContextCancelled := jobCtx.Err() != nil
 
 		c.mu.Lock()
 		c.activeCancel = nil
 		c.activeID = ""
-		stateAtReturn := c.jobs[index].State
+		c.activeAttempt = 0
+		c.retryWaitActive = false
 		cancelCurrent := c.cancelJobID == job.ID
 		if cancelCurrent {
 			c.cancelJobID = ""
 		}
 		cancelAll := c.cancelAllRequested
 		c.mu.Unlock()
+		jobCancel()
 
 		if err != nil {
-			if errors.Is(err, context.Canceled) {
+			if errors.Is(err, errQueuePaused) {
 				c.mu.Lock()
-				if stateAtReturn == model.JobSending || stateAtReturn == model.JobConfirming {
-					c.jobs[index].State = model.JobConfirming
-					c.jobs[index].Error = "取消发生在消息提交阶段，结果可能已送达；请先检查频道"
-					c.lastError = c.jobs[index].Error
+				if index >= 0 && index < len(c.jobs) && c.jobs[index].ID == job.ID &&
+					(c.jobs[index].State == model.JobUploading || c.jobs[index].State == model.JobSending) {
+					c.jobs[index].State = model.JobInterrupted
+					c.jobs[index].BytesPerSecond = 0
+					c.jobs[index].Error = "队列已暂停，可重新开始当前任务"
 					c.notifyLocked()
+				}
+				c.mu.Unlock()
+				if persistErr := c.persist(); persistErr != nil {
+					c.setPersistenceError(persistErr)
+				}
+				return
+			}
+			if errors.Is(err, tgtransport.ErrSendOutcomeUnknown) {
+				c.mu.Lock()
+				c.jobs[index].State = model.JobConfirming
+				c.jobs[index].BytesPerSecond = 0
+				c.jobs[index].Error = "消息可能已经送达；请先检查频道，再选择“已发送”或“重试”"
+				c.lastError = c.jobs[index].Error
+				c.notifyLocked()
+				c.mu.Unlock()
+				if persistErr := c.persist(); persistErr != nil {
+					c.setPersistenceError(persistErr)
+				}
+				return
+			}
+			if errors.Is(err, errQueuePersistenceLost) {
+				c.failJob(index, job.ID, err)
+				return
+			}
+			if jobContextCancelled || cancelCurrent || cancelAll || ctx.Err() != nil {
+				c.mu.Lock()
+				if index < 0 || index >= len(c.jobs) || c.jobs[index].ID != job.ID {
 					c.mu.Unlock()
-					if persistErr := c.persist(); persistErr != nil {
-						c.setPersistenceError(persistErr)
-					}
 					return
 				}
 				if cancelCurrent || cancelAll {
@@ -992,8 +1021,13 @@ func (c *Controller) runQueue(ctx context.Context) {
 					c.jobs[index].Error = ""
 				} else {
 					c.jobs[index].State = model.JobInterrupted
-					c.jobs[index].Error = "程序关闭或连接中断，可重新开始上传"
+					if c.paused || c.pauseRequested {
+						c.jobs[index].Error = "队列已暂停，可重新开始当前任务"
+					} else {
+						c.jobs[index].Error = "程序关闭或连接中断，可重新开始上传"
+					}
 				}
+				c.jobs[index].BytesPerSecond = 0
 				c.notifyLocked()
 				c.mu.Unlock()
 				if persistErr := c.persist(); persistErr != nil {
@@ -1004,20 +1038,8 @@ func (c *Controller) runQueue(ctx context.Context) {
 				}
 				continue
 			}
-			if errors.Is(err, tgtransport.ErrSendOutcomeUnknown) {
-				c.mu.Lock()
-				c.jobs[index].State = model.JobConfirming
-				c.jobs[index].Error = "消息可能已经送达；请先检查频道，再选择“已发送”或“重试”"
-				c.lastError = c.jobs[index].Error
-				c.notifyLocked()
-				c.mu.Unlock()
-				if persistErr := c.persist(); persistErr != nil {
-					c.setPersistenceError(persistErr)
-				}
-				return
-			}
 			c.failJob(index, job.ID, err)
-			return
+			continue
 		}
 
 		completed := time.Now()
@@ -1040,18 +1062,263 @@ func (c *Controller) runQueue(ctx context.Context) {
 	}
 }
 
-func (c *Controller) nextJob() (int, model.Job, tgtransport.Gateway, model.Channel, bool) {
+func (c *Controller) uploadJobWithRetry(
+	ctx context.Context,
+	index int,
+	job model.Job,
+	channel model.Channel,
+	cancel context.CancelFunc,
+) (int, error) {
+	for retryIndex := 0; ; retryIndex++ {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
+		if c.queuePaused() {
+			return 0, errQueuePaused
+		}
+
+		// Reopen and revalidate the source for every attempt. Telegram uploads
+		// cannot resume a partially transferred file, and reusing an os.File at
+		// EOF would make the next attempt incomplete.
+		file, metadata, err := openVerifiedJob(job)
+		if err != nil {
+			return 0, err
+		}
+		if err := ctx.Err(); err != nil {
+			_ = file.Close()
+			return 0, err
+		}
+
+		now := time.Now()
+		c.mu.Lock()
+		if err := ctx.Err(); err != nil {
+			c.mu.Unlock()
+			_ = file.Close()
+			return 0, err
+		}
+		// Pause may have been requested after the file check. Re-check while
+		// holding the same mutex used by Pause so no new request starts between
+		// files or retry attempts.
+		if c.paused || c.pauseRequested {
+			c.mu.Unlock()
+			_ = file.Close()
+			return 0, errQueuePaused
+		}
+		if index < 0 || index >= len(c.jobs) || c.jobs[index].ID != job.ID {
+			c.mu.Unlock()
+			_ = file.Close()
+			return 0, errors.New("上传队列在运行期间发生了变化")
+		}
+		current := &c.jobs[index]
+		validState := retryIndex == 0 && (current.State == model.JobQueued || current.State == model.JobInterrupted) ||
+			retryIndex > 0 && (current.State == model.JobUploading || current.State == model.JobSending)
+		if !validState {
+			c.mu.Unlock()
+			_ = file.Close()
+			return 0, fmt.Errorf("任务状态已变为 %s，停止上传", current.State)
+		}
+		current.Metadata = metadata
+		current.State = model.JobUploading
+		current.Uploaded = 0
+		current.BytesPerSecond = 0
+		if retryIndex == 0 {
+			current.StartedAt = &now
+		}
+		current.Error = ""
+		c.activeID = job.ID
+		c.activeCancel = cancel
+		c.attemptRevision++
+		attemptID := c.attemptRevision
+		c.activeAttempt = attemptID
+		c.retryWaitActive = false
+		c.notifyLocked()
+		c.mu.Unlock()
+		if err := c.persist(); err != nil {
+			_ = file.Close()
+			return 0, fmt.Errorf("%w：保存上传状态失败：%v", errQueuePersistenceLost, err)
+		}
+		// Persist can overlap a Pause or CancelAll call. Treat this locked check
+		// as the attempt's start boundary: an intent recorded before it prevents
+		// a new Telegram request; an intent recorded afterwards applies the
+		// existing soft-pause/cancel semantics to an already-started attempt.
+		c.mu.Lock()
+		ctxErr := ctx.Err()
+		paused := c.paused || c.pauseRequested
+		if ctxErr != nil || paused {
+			if c.activeID == job.ID && c.activeAttempt == attemptID {
+				c.activeAttempt = 0
+			}
+		}
+		c.mu.Unlock()
+		if ctxErr != nil {
+			_ = file.Close()
+			return 0, ctxErr
+		}
+		if paused {
+			_ = file.Close()
+			return 0, errQueuePaused
+		}
+
+		gateway := c.currentGateway()
+		if gateway == nil {
+			err = tgtransport.ErrNotConnected
+		} else {
+			messageID, uploadErr := gateway.UploadVideo(ctx, tgtransport.UploadRequest{
+				Channel:  channel,
+				Path:     job.Path,
+				File:     file,
+				Name:     job.Name,
+				Caption:  captionFromFilename(job.Name),
+				RandomID: job.RandomID,
+				Metadata: metadata,
+				BeforeSend: func() error {
+					return c.prepareSendForAttempt(index, job.ID, attemptID)
+				},
+			}, func(progress model.Progress) {
+				c.applyProgressForAttempt(index, job.ID, attemptID, progress)
+			})
+			err = uploadErr
+			if err == nil {
+				// A read-only file close failure after Telegram confirmed the send
+				// must not turn a successful message into a retryable failure.
+				_ = file.Close()
+				return messageID, nil
+			}
+		}
+		_ = file.Close()
+		c.mu.Lock()
+		if c.activeID == job.ID && c.activeAttempt == attemptID {
+			c.activeAttempt = 0
+		}
+		c.mu.Unlock()
+
+		if !isRetryableUploadError(ctx, err) {
+			return 0, err
+		}
+		if retryIndex >= len(c.uploadRetryDelays) {
+			if len(c.uploadRetryDelays) == 0 {
+				return 0, err
+			}
+			return 0, fmt.Errorf("自动重试 %d 次后仍失败：%w", len(c.uploadRetryDelays), err)
+		}
+
+		delay := c.uploadRetryDelays[retryIndex]
+		if err := c.waitBeforeUploadRetry(ctx, index, job.ID, err, delay, retryIndex+1); err != nil {
+			return 0, err
+		}
+	}
+}
+
+func (c *Controller) waitBeforeUploadRetry(
+	ctx context.Context,
+	index int,
+	jobID string,
+	uploadErr error,
+	delay time.Duration,
+	retryNumber int,
+) error {
+	retryMessage := fmt.Sprintf(
+		"连接中断，%s 后自动重试（%d/%d）：%v",
+		formatRetryDelay(delay),
+		retryNumber,
+		len(c.uploadRetryDelays),
+		uploadErr,
+	)
+
+	c.mu.Lock()
+	if c.paused || c.pauseRequested {
+		c.mu.Unlock()
+		return errQueuePaused
+	}
+	if index < 0 || index >= len(c.jobs) || c.jobs[index].ID != jobID {
+		c.mu.Unlock()
+		return errors.New("上传队列在重试期间发生了变化")
+	}
+	c.jobs[index].State = model.JobUploading
+	c.jobs[index].Uploaded = 0
+	c.jobs[index].BytesPerSecond = 0
+	c.jobs[index].Error = retryMessage
+	c.retryWaitActive = true
+	c.notifyLocked()
+	c.mu.Unlock()
+
+	if err := c.persist(); err != nil {
+		c.mu.Lock()
+		c.retryWaitActive = false
+		c.mu.Unlock()
+		return fmt.Errorf("%w：保存重试状态失败：%v", errQueuePersistenceLost, err)
+	}
+
+	wait := c.uploadRetryWait
+	if wait == nil {
+		wait = waitForUploadRetry
+	}
+	waitErr := wait(ctx, delay)
+	c.mu.Lock()
+	c.retryWaitActive = false
+	paused := c.paused || c.pauseRequested
+	c.mu.Unlock()
+	if waitErr != nil {
+		return waitErr
+	}
+	if paused {
+		return errQueuePaused
+	}
+	return nil
+}
+
+func formatRetryDelay(delay time.Duration) string {
+	if delay%time.Second == 0 {
+		return fmt.Sprintf("%d 秒", int(delay/time.Second))
+	}
+	return delay.String()
+}
+
+func isRetryableUploadError(ctx context.Context, err error) bool {
+	if err == nil || errors.Is(err, tgtransport.ErrSendOutcomeUnknown) {
+		return false
+	}
+	if errors.Is(err, context.Canceled) {
+		// A caller cancellation is deliberate. A transport-internal
+		// cancellation while our job context is still live is safe to retry
+		// because UploadVideo wraps every messages.sendMedia error as an
+		// unknown outcome before it reaches this controller.
+		return ctx.Err() == nil
+	}
+	if errors.Is(err, tgtransport.ErrNotConnected) || errors.Is(err, tgtransport.ErrUploadData) {
+		return true
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, net.ErrClosed) {
+		return true
+	}
+	var networkErr net.Error
+	return errors.As(err, &networkErr)
+}
+
+func (c *Controller) currentGateway() tgtransport.Gateway {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.gateway
+}
+
+func (c *Controller) queuePaused() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.paused || c.pauseRequested
+}
+
+func (c *Controller) nextJob() (int, model.Job, model.Channel, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	if c.paused || c.pauseRequested {
-		return 0, model.Job{}, nil, model.Channel{}, false
+		return 0, model.Job{}, model.Channel{}, false
 	}
 	for i, job := range c.jobs {
 		if job.State == model.JobQueued || job.State == model.JobInterrupted {
-			return i, job, c.gateway, c.channel, true
+			return i, job, c.channel, true
 		}
 	}
-	return 0, model.Job{}, nil, model.Channel{}, false
+	return 0, model.Job{}, model.Channel{}, false
 }
 
 func captionFromFilename(name string) string {
@@ -1063,8 +1330,16 @@ func captionFromFilename(name string) string {
 }
 
 func (c *Controller) applyProgress(index int, jobID string, progress model.Progress) {
+	c.applyProgressForAttempt(index, jobID, 0, progress)
+}
+
+func (c *Controller) applyProgressForAttempt(index int, jobID string, attemptID uint64, progress model.Progress) {
 	c.mu.Lock()
 	if index < 0 || index >= len(c.jobs) || c.jobs[index].ID != jobID {
+		c.mu.Unlock()
+		return
+	}
+	if attemptID != 0 && (c.activeID != jobID || c.activeAttempt != attemptID) {
 		c.mu.Unlock()
 		return
 	}
@@ -1073,30 +1348,61 @@ func (c *Controller) applyProgress(index int, jobID string, progress model.Progr
 		c.mu.Unlock()
 		return
 	}
-	if progress.BytesDone > job.Uploaded {
-		job.Uploaded = progress.BytesDone
+	// Several gotd part workers can finish almost simultaneously. A callback
+	// that was prepared first may acquire the controller after a newer one; do
+	// not let it overwrite newer byte or speed information.
+	if progress.BytesDone < job.Uploaded {
+		c.mu.Unlock()
+		return
 	}
+	job.Uploaded = progress.BytesDone
 	job.BytesPerSecond = progress.BytesPerSecond
-	if progress.BytesTotal > 0 && progress.BytesDone >= progress.BytesTotal {
-		job.State = model.JobSending
-	}
 	c.notifyLocked()
-	shouldPersist := time.Since(c.lastPersist) >= time.Second
-	if shouldPersist {
-		c.lastPersist = time.Now()
-	}
 	c.mu.Unlock()
-	if shouldPersist {
-		if err := c.persist(); err != nil {
-			c.setPersistenceError(err)
-		}
+}
+
+func (c *Controller) prepareSendForAttempt(index int, jobID string, attemptID uint64) error {
+	c.mu.Lock()
+	if index < 0 || index >= len(c.jobs) || c.jobs[index].ID != jobID {
+		c.mu.Unlock()
+		return errors.New("消息提交前上传队列发生了变化")
 	}
+	if c.activeID != jobID || c.activeAttempt != attemptID {
+		c.mu.Unlock()
+		return errors.New("消息提交前上传任务已失效")
+	}
+	job := &c.jobs[index]
+	if job.State != model.JobUploading && job.State != model.JobSending {
+		state := job.State
+		c.mu.Unlock()
+		return fmt.Errorf("消息提交前任务状态已变为 %s", state)
+	}
+	if job.State == model.JobSending {
+		c.mu.Unlock()
+		return nil
+	}
+	job.State = model.JobSending
+	job.Uploaded = job.Size
+	job.BytesPerSecond = 0
+	c.notifyLocked()
+	c.mu.Unlock()
+
+	// Partial file parts cannot resume, so intermediate byte counters stay in
+	// memory. This one transition is different: it is the durable boundary that
+	// makes a crash during messages.sendMedia recover as Confirming rather than
+	// blindly retrying a possibly delivered message.
+	if err := c.persist(); err != nil {
+		c.setPersistenceError(err)
+		return fmt.Errorf("%w：保存消息提交状态失败：%v", errQueuePersistenceLost, err)
+	}
+	return nil
 }
 
 func (c *Controller) failJob(index int, jobID string, err error) {
 	c.mu.Lock()
 	if index >= 0 && index < len(c.jobs) && c.jobs[index].ID == jobID {
 		c.jobs[index].State = model.JobFailed
+		c.jobs[index].BytesPerSecond = 0
 		c.jobs[index].Error = err.Error()
 	}
 	c.lastError = err.Error()

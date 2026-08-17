@@ -90,3 +90,34 @@ func TestWaitReadyReportsRunFailure(t *testing.T) {
 		t.Fatalf("WaitReady() error = %v, want %v", err, want)
 	}
 }
+
+func TestClientUploadConcurrencyDefaultsAndCanChangeWithoutReconnect(t *testing.T) {
+	client := newOfflineClient(t)
+	if got := client.currentUploadConcurrency(); got != DefaultUploadConcurrency {
+		t.Fatalf("default upload concurrency = %d, want %d", got, DefaultUploadConcurrency)
+	}
+	if got := client.SetUploadConcurrency(UploadConcurrencyFast); got != UploadConcurrencyFast {
+		t.Fatalf("SetUploadConcurrency(fast) = %d, want %d", got, UploadConcurrencyFast)
+	}
+	if got := client.currentUploadConcurrency(); got != UploadConcurrencyFast {
+		t.Fatalf("current upload concurrency = %d, want %d", got, UploadConcurrencyFast)
+	}
+	if got := client.SetUploadConcurrency(123); got != DefaultUploadConcurrency {
+		t.Fatalf("SetUploadConcurrency(invalid) = %d, want default %d", got, DefaultUploadConcurrency)
+	}
+}
+
+func TestClientUsesConfiguredUploadConcurrency(t *testing.T) {
+	client, err := NewClient(Config{
+		AppID:             12345,
+		APIHash:           "test-api-hash",
+		BotToken:          "12345:test-bot-token",
+		UploadConcurrency: UploadConcurrencyFast,
+	}, Events{})
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	if got := client.currentUploadConcurrency(); got != UploadConcurrencyFast {
+		t.Fatalf("configured upload concurrency = %d, want %d", got, UploadConcurrencyFast)
+	}
+}

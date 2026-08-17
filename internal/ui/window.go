@@ -35,6 +35,53 @@ const (
 	scheduleRetryMaximum = time.Minute
 )
 
+const (
+	uploadConcurrencyCompatibilityLabel = "兼容（4 路）"
+	uploadConcurrencyBalancedLabel      = "均衡（8 路，推荐）"
+	uploadConcurrencyFastLabel          = "高速（12 路）"
+)
+
+func uploadConcurrencyOptions() []string {
+	return []string{
+		uploadConcurrencyCompatibilityLabel,
+		uploadConcurrencyBalancedLabel,
+		uploadConcurrencyFastLabel,
+	}
+}
+
+func uploadConcurrencyForOption(option string) (int, bool) {
+	switch option {
+	case uploadConcurrencyCompatibilityLabel:
+		return tgtransport.UploadConcurrencyCompatibility, true
+	case uploadConcurrencyBalancedLabel:
+		return tgtransport.UploadConcurrencyBalanced, true
+	case uploadConcurrencyFastLabel:
+		return tgtransport.UploadConcurrencyFast, true
+	default:
+		return 0, false
+	}
+}
+
+func uploadConcurrencyOptionFor(value int) string {
+	switch value {
+	case tgtransport.UploadConcurrencyCompatibility:
+		return uploadConcurrencyCompatibilityLabel
+	case tgtransport.UploadConcurrencyFast:
+		return uploadConcurrencyFastLabel
+	case tgtransport.UploadConcurrencyBalanced:
+		fallthrough
+	default:
+		return uploadConcurrencyBalancedLabel
+	}
+}
+
+func normalizeUploadConcurrency(value int) int {
+	if normalized, ok := uploadConcurrencyForOption(uploadConcurrencyOptionFor(value)); ok {
+		return normalized
+	}
+	return tgtransport.DefaultUploadConcurrency
+}
+
 // Run creates and runs the single-window desktop application.  It returns
 // when the window is closed.  No credentials are required to construct the
 // window; connection is intentionally deferred until the user presses the
@@ -82,19 +129,24 @@ type window struct {
 	identity  tgtransport.Identity
 	snapshot  coreapp.Snapshot
 
+	snapshotDispatchMu     sync.Mutex
+	pendingSnapshot        coreapp.Snapshot
+	snapshotDispatchQueued bool
+
 	// Settings controls.
-	apiID         *widget.Entry
-	apiHash       *widget.Entry
-	botToken      *widget.Entry
-	proxyEnabled  *widget.Check
-	proxyAddress  *widget.Entry
-	proxyUsername *widget.Entry
-	proxyPassword *widget.Entry
-	connectButton *widget.Button
-	bindButton    *widget.Button
-	connection    *widget.Label
-	channel       *widget.Label
-	limit         *widget.Label
+	apiID             *widget.Entry
+	apiHash           *widget.Entry
+	botToken          *widget.Entry
+	proxyEnabled      *widget.Check
+	proxyAddress      *widget.Entry
+	proxyUsername     *widget.Entry
+	proxyPassword     *widget.Entry
+	uploadConcurrency *widget.Select
+	connectButton     *widget.Button
+	bindButton        *widget.Button
+	connection        *widget.Label
+	channel           *widget.Label
+	limit             *widget.Label
 
 	// Queue controls.
 	folderLabel        *widget.Label
@@ -163,6 +215,8 @@ func newWindow(application fyne.App, fyneWindow fyne.Window, controller *coreapp
 func (u *window) build() {
 	u.buildFields()
 	u.buildQueue()
+	uploadPerformanceHint := widget.NewLabel("高速档可能改善高延迟网络，也会使用更多连接；若速度没有提升，请使用均衡档。切换后从下一个视频生效。")
+	uploadPerformanceHint.Wrapping = fyne.TextWrapWord
 
 	settingsPanel := container.NewVBox(
 		widget.NewLabelWithStyle("Telegram 连接", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
@@ -178,6 +232,11 @@ func (u *window) build() {
 		u.proxyAddress,
 		u.proxyUsername,
 		u.proxyPassword,
+		widget.NewSeparator(),
+		widget.NewLabelWithStyle("上传性能", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		widget.NewLabel("上传并发"),
+		u.uploadConcurrency,
+		uploadPerformanceHint,
 		u.connectButton,
 		u.connection,
 		widget.NewSeparator(),
@@ -227,6 +286,8 @@ func (u *window) buildFields() {
 	u.proxyUsername.SetPlaceHolder("代理用户名（可选）")
 	u.proxyPassword = widget.NewPasswordEntry()
 	u.proxyPassword.SetPlaceHolder("代理密码（可选）")
+	u.uploadConcurrency = widget.NewSelect(uploadConcurrencyOptions(), nil)
+	u.uploadConcurrency.PlaceHolder = uploadConcurrencyBalancedLabel
 
 	u.connection = widget.NewLabel("未连接")
 	u.channel = widget.NewLabel("尚未绑定频道")
@@ -407,6 +468,12 @@ func (u *window) refreshQueueRows(jobs []model.Job) {
 }
 
 func (u *window) applyLoadedSettings() {
+	if u.uploadConcurrency != nil {
+		uploadConcurrency := normalizeUploadConcurrency(u.settingsSnapshot().UploadConcurrency)
+		u.uploadConcurrency.OnChanged = nil
+		u.uploadConcurrency.SetSelected(uploadConcurrencyOptionFor(uploadConcurrency))
+		u.uploadConcurrency.OnChanged = u.handleUploadConcurrencyChanged
+	}
 	if u.settings.APIID > 0 {
 		u.apiID.SetText(strconv.Itoa(u.settings.APIID))
 	}
@@ -430,6 +497,29 @@ func (u *window) applyLoadedSettings() {
 	}
 }
 
+func (u *window) handleUploadConcurrencyChanged(option string) {
+	concurrency, ok := uploadConcurrencyForOption(option)
+	if !ok {
+		return
+	}
+	previous := normalizeUploadConcurrency(u.settingsSnapshot().UploadConcurrency)
+	if err := u.updateSettings(func(settings *coreapp.Settings) {
+		settings.UploadConcurrency = concurrency
+	}); err != nil {
+		if u.uploadConcurrency != nil {
+			u.uploadConcurrency.OnChanged = nil
+			u.uploadConcurrency.SetSelected(uploadConcurrencyOptionFor(previous))
+			u.uploadConcurrency.OnChanged = u.handleUploadConcurrencyChanged
+		}
+		u.showError(err)
+		return
+	}
+	if client := u.currentClient(); client != nil {
+		concurrency = client.SetUploadConcurrency(concurrency)
+	}
+	u.operationLabel.SetText(fmt.Sprintf("上传并发已设置为 %d 路；当前视频不受影响，将从下一个视频开始生效", concurrency))
+}
+
 func (u *window) startObservers() {
 	go u.observeController()
 	u.restoreScheduledStart()
@@ -438,13 +528,48 @@ func (u *window) startObservers() {
 func (u *window) observeController() {
 	for {
 		select {
-		case snapshot := <-u.controller.Updates():
-			current := snapshot
-			u.doUI(func() { u.applySnapshot(current) })
+		case snapshot, ok := <-u.controller.Updates():
+			if !ok {
+				return
+			}
+			u.dispatchControllerSnapshot(snapshot)
 		case <-u.rootCtx.Done():
 			return
 		}
 	}
+}
+
+func (u *window) dispatchControllerSnapshot(snapshot coreapp.Snapshot) {
+	if u.enqueueControllerSnapshot(snapshot) {
+		u.doUI(func() {
+			if current, ok := u.takeControllerSnapshot(); ok {
+				u.applySnapshot(current)
+			}
+		})
+	}
+}
+
+func (u *window) enqueueControllerSnapshot(snapshot coreapp.Snapshot) bool {
+	u.snapshotDispatchMu.Lock()
+	defer u.snapshotDispatchMu.Unlock()
+	u.pendingSnapshot = snapshot
+	if u.snapshotDispatchQueued {
+		return false
+	}
+	u.snapshotDispatchQueued = true
+	return true
+}
+
+func (u *window) takeControllerSnapshot() (coreapp.Snapshot, bool) {
+	u.snapshotDispatchMu.Lock()
+	defer u.snapshotDispatchMu.Unlock()
+	if !u.snapshotDispatchQueued {
+		return coreapp.Snapshot{}, false
+	}
+	snapshot := u.pendingSnapshot
+	u.pendingSnapshot = coreapp.Snapshot{}
+	u.snapshotDispatchQueued = false
+	return snapshot, true
 }
 
 func (u *window) applySnapshot(snapshot coreapp.Snapshot) {
@@ -652,18 +777,20 @@ func (u *window) connectWithMode(automatic bool) {
 	proxyAddress := strings.TrimSpace(u.proxyAddress.Text)
 	proxyUsername := strings.TrimSpace(u.proxyUsername.Text)
 	proxyPassword := u.proxyPassword.Text
+	uploadConcurrency := u.selectedUploadConcurrency()
 
 	u.connectButton.Disable()
 	u.connection.SetText("正在保存凭据并连接……")
-	go u.connectAsync(appID, apiHash, botToken, proxyEnabled, proxyAddress, proxyUsername, proxyPassword, automatic)
+	go u.connectAsync(appID, apiHash, botToken, proxyEnabled, proxyAddress, proxyUsername, proxyPassword, uploadConcurrency, automatic)
 }
 
-func (u *window) connectAsync(appID int, apiHash, botToken string, proxyEnabled bool, proxyAddress, proxyUsername, proxyPassword string, automatic bool) {
+func (u *window) connectAsync(appID int, apiHash, botToken string, proxyEnabled bool, proxyAddress, proxyUsername, proxyPassword string, uploadConcurrency int, automatic bool) {
 	if err := u.updateSettings(func(settings *coreapp.Settings) {
 		settings.APIID = appID
 		settings.ProxyEnabled = proxyEnabled
 		settings.ProxyAddress = proxyAddress
 		settings.ProxyUsername = proxyUsername
+		settings.UploadConcurrency = normalizeUploadConcurrency(uploadConcurrency)
 	}); err != nil {
 		u.handleConnectionFailure(err, automatic)
 		return
@@ -696,11 +823,12 @@ func (u *window) connectAsync(appID int, apiHash, botToken string, proxyEnabled 
 	}
 	var stateClient *tgtransport.Client
 	client, err := tgtransport.NewClient(tgtransport.Config{
-		AppID:          appID,
-		APIHash:        apiHash,
-		BotToken:       botToken,
-		Proxy:          proxyConfig,
-		SessionStorage: credentials.NewSessionStorage(u.secrets, u.paths.Session),
+		AppID:             appID,
+		APIHash:           apiHash,
+		BotToken:          botToken,
+		Proxy:             proxyConfig,
+		UploadConcurrency: normalizeUploadConcurrency(uploadConcurrency),
+		SessionStorage:    credentials.NewSessionStorage(u.secrets, u.paths.Session),
 	}, tgtransport.Events{
 		OnConnectionState: func(state tgtransport.ConnectionState) {
 			u.handleConnectionState(stateClient, state)
@@ -726,6 +854,15 @@ func (u *window) connectAsync(appID int, apiHash, botToken string, proxyEnabled 
 	go u.runClient(client, ctx, automatic)
 	go u.waitClientReady(client, ctx, automatic)
 	go u.observeBinding(client, ctx)
+}
+
+func (u *window) selectedUploadConcurrency() int {
+	if u.uploadConcurrency != nil {
+		if value, ok := uploadConcurrencyForOption(u.uploadConcurrency.Selected); ok {
+			return value
+		}
+	}
+	return normalizeUploadConcurrency(u.settingsSnapshot().UploadConcurrency)
 }
 
 func (u *window) handleConnectionFailure(err error, automatic bool) {
@@ -848,7 +985,7 @@ func (u *window) waitClientReady(client *tgtransport.Client, ctx context.Context
 			limitPrefix = "协议上限（服务端动态值未确认）："
 		}
 		u.limit.SetText(limitPrefix + formatBytes(identity.MaxUploadBytes))
-		u.applySnapshot(u.controller.Snapshot())
+		u.dispatchControllerSnapshot(u.controller.Snapshot())
 	})
 
 	// Queue entries may have been added while Telegram was disconnected. Apply
@@ -1572,7 +1709,7 @@ func (u *window) pauseUploads() {
 	u.operationLabel.SetText("暂停请求已收到，正在完成当前文件")
 	if err := u.controller.Pause(); err != nil {
 		u.showError(err)
-		u.applySnapshot(u.controller.Snapshot())
+		u.dispatchControllerSnapshot(u.controller.Snapshot())
 	}
 }
 
@@ -2073,6 +2210,9 @@ func compactJobStatus(job model.Job) string {
 	case model.JobOversize:
 		return prefix + "超过上限 · " + formatBytes(job.Size)
 	case model.JobUploading:
+		if job.Error != "" {
+			return prefix + job.Error
+		}
 		return prefix + fmt.Sprintf("上传中 · %s/s", formatBytes(int64(job.BytesPerSecond)))
 	case model.JobSending:
 		return prefix + "正在提交频道消息…"
@@ -2112,6 +2252,9 @@ func baseJobStatus(job model.Job) string {
 	case model.JobOversize:
 		return "超过 Bot 当前上传上限，未上传"
 	case model.JobUploading:
+		if job.Error != "" {
+			return job.Error
+		}
 		return fmt.Sprintf("上传中 · %s / %s · %s/s", formatBytes(job.Uploaded), formatBytes(job.Size), formatBytes(int64(job.BytesPerSecond)))
 	case model.JobSending:
 		return fmt.Sprintf("上传完成 · %s / %s · 正在提交频道消息……", formatBytes(job.Uploaded), formatBytes(job.Size))

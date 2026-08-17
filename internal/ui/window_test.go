@@ -10,7 +10,49 @@ import (
 	"fyne.io/fyne/v2/test"
 	coreapp "github.com/jayden/telegram-video-uploader/internal/app"
 	"github.com/jayden/telegram-video-uploader/internal/model"
+	tgtransport "github.com/jayden/telegram-video-uploader/internal/telegram"
 )
+
+func TestUploadConcurrencyOptionMapping(t *testing.T) {
+	options := uploadConcurrencyOptions()
+	wantOptions := []string{
+		uploadConcurrencyCompatibilityLabel,
+		uploadConcurrencyBalancedLabel,
+		uploadConcurrencyFastLabel,
+	}
+	if len(options) != len(wantOptions) {
+		t.Fatalf("upload concurrency options = %#v, want %#v", options, wantOptions)
+	}
+	for index := range wantOptions {
+		if options[index] != wantOptions[index] {
+			t.Fatalf("option[%d] = %q, want %q", index, options[index], wantOptions[index])
+		}
+	}
+
+	tests := []struct {
+		option string
+		value  int
+	}{
+		{option: uploadConcurrencyCompatibilityLabel, value: tgtransport.UploadConcurrencyCompatibility},
+		{option: uploadConcurrencyBalancedLabel, value: tgtransport.UploadConcurrencyBalanced},
+		{option: uploadConcurrencyFastLabel, value: tgtransport.UploadConcurrencyFast},
+	}
+	for _, test := range tests {
+		got, ok := uploadConcurrencyForOption(test.option)
+		if !ok || got != test.value {
+			t.Errorf("uploadConcurrencyForOption(%q) = (%d, %v), want (%d, true)", test.option, got, ok, test.value)
+		}
+		if got := uploadConcurrencyOptionFor(test.value); got != test.option {
+			t.Errorf("uploadConcurrencyOptionFor(%d) = %q, want %q", test.value, got, test.option)
+		}
+	}
+	if _, ok := uploadConcurrencyForOption("未知档位"); ok {
+		t.Fatal("unknown upload concurrency option was accepted")
+	}
+	if got := normalizeUploadConcurrency(0); got != tgtransport.DefaultUploadConcurrency {
+		t.Fatalf("normalizeUploadConcurrency(0) = %d, want %d", got, tgtransport.DefaultUploadConcurrency)
+	}
+}
 
 func TestRefreshQueueRowsShowsNamesProgressAndReusesRows(t *testing.T) {
 	application := test.NewApp()
@@ -50,6 +92,48 @@ func TestRefreshQueueRowsShowsNamesProgressAndReusesRows(t *testing.T) {
 	}
 	if !strings.Contains(first.status.Text, "25 B/s") {
 		t.Fatalf("refreshed first status = %q, want upload speed", first.status.Text)
+	}
+}
+
+func TestControllerSnapshotDispatchCoalescesToLatestState(t *testing.T) {
+	u := &window{}
+	first := coreapp.Snapshot{ActiveID: "first"}
+	latest := coreapp.Snapshot{ActiveID: "latest"}
+
+	if !u.enqueueControllerSnapshot(first) {
+		t.Fatal("first snapshot did not request a UI dispatch")
+	}
+	for i := 0; i < 1000; i++ {
+		if u.enqueueControllerSnapshot(coreapp.Snapshot{ActiveID: "stale"}) {
+			t.Fatal("intermediate snapshot queued a duplicate UI dispatch")
+		}
+	}
+	if u.enqueueControllerSnapshot(latest) {
+		t.Fatal("latest snapshot queued a duplicate UI dispatch")
+	}
+	got, ok := u.takeControllerSnapshot()
+	if !ok || got.ActiveID != latest.ActiveID {
+		t.Fatalf("dispatched snapshot = (%+v, %v), want latest active ID %q", got, ok, latest.ActiveID)
+	}
+	if _, ok := u.takeControllerSnapshot(); ok {
+		t.Fatal("empty dispatcher returned a snapshot")
+	}
+	if !u.enqueueControllerSnapshot(first) {
+		t.Fatal("dispatcher did not accept a new snapshot after draining")
+	}
+}
+
+func TestJobStatusShowsRetryWaitInsteadOfZeroUploadSpeed(t *testing.T) {
+	job := model.Job{
+		State: model.JobUploading,
+		Size:  100,
+		Error: "连接中断，5 秒后自动重试（2/5）",
+	}
+	if got := compactJobStatus(job); got != job.Error {
+		t.Fatalf("compactJobStatus() = %q, want retry detail %q", got, job.Error)
+	}
+	if got := jobStatus(job); got != job.Error {
+		t.Fatalf("jobStatus() = %q, want retry detail %q", got, job.Error)
 	}
 }
 

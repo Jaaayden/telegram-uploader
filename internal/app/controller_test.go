@@ -42,6 +42,12 @@ func TestControllerUploadsSeriallyWithExactRequestAndProgress(t *testing.T) {
 			BytesPerSecond: 128,
 			At:             time.Now(),
 		})
+		if request.BeforeSend == nil {
+			return 0, errors.New("missing pre-send durability callback")
+		}
+		if err := request.BeforeSend(); err != nil {
+			return 0, err
+		}
 		return int(request.RandomID), nil
 	}
 
@@ -829,10 +835,10 @@ func TestControllerCancelOneJobContinuesWithNext(t *testing.T) {
 	}
 }
 
-func TestControllerFailurePausesQueue(t *testing.T) {
+func TestControllerNonRetryableFailureContinuesQueue(t *testing.T) {
 	jobs, _ := fixtureJobs(t, []fixtureJob{
 		{Name: "failure.mp4", RandomID: 7301},
-		{Name: "must-wait.mp4", RandomID: 7302},
+		{Name: "continues.mp4", RandomID: 7302},
 	})
 	store := &memoryQueueStore{jobs: jobs, channel: testChannel()}
 	gateway := &fakeGateway{}
@@ -849,16 +855,299 @@ func TestControllerFailurePausesQueue(t *testing.T) {
 		t.Fatalf("Start() error = %v", err)
 	}
 	final := waitForSnapshot(t, controller, func(snapshot Snapshot) bool {
-		return !snapshot.Running && len(snapshot.Jobs) == 2 && snapshot.Jobs[0].State == model.JobFailed
+		return !snapshot.Running && len(snapshot.Jobs) == 2 &&
+			snapshot.Jobs[0].State == model.JobFailed && snapshot.Jobs[1].State == model.JobSent
 	})
-	if final.Jobs[1].State != model.JobQueued {
-		t.Fatalf("second job state = %s, want queued after failure pause", final.Jobs[1].State)
-	}
 	if final.LastError != failure.Error() || final.Jobs[0].Error != failure.Error() {
 		t.Fatalf("failure = lastError %q, jobError %q; want %q", final.LastError, final.Jobs[0].Error, failure.Error())
 	}
-	if calls := gateway.Calls(); len(calls) != 1 {
-		t.Fatalf("UploadVideo calls = %d, want queue paused after first failure", len(calls))
+	if calls := gateway.Calls(); len(calls) != 2 {
+		t.Fatalf("UploadVideo calls = %d, want failed task skipped and next task sent", len(calls))
+	}
+}
+
+func TestControllerPersistenceFailureStopsBeforeSendingNextJob(t *testing.T) {
+	jobs, _ := fixtureJobs(t, []fixtureJob{
+		{Name: "persistence-failure.mp4", RandomID: 7341},
+		{Name: "must-not-send.mp4", RandomID: 7342},
+	})
+	store := &memoryQueueStore{jobs: jobs, channel: testChannel()}
+	persistFailure := errors.New("disk unavailable")
+	var armFailure sync.Once
+	store.saveHook = func([]model.Job) {
+		armFailure.Do(func() {
+			store.mu.Lock()
+			store.saveErr = persistFailure
+			store.mu.Unlock()
+		})
+	}
+	gateway := &fakeGateway{}
+	controller := newLoadedController(t, store, gateway)
+	if err := controller.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	final := waitForSnapshot(t, controller, func(snapshot Snapshot) bool {
+		return !snapshot.Running && len(snapshot.Jobs) == 2 && snapshot.Jobs[0].State == model.JobFailed
+	})
+	if final.Jobs[1].State != model.JobQueued {
+		t.Fatalf("second job state = %s, want queued after persistence failure", final.Jobs[1].State)
+	}
+	if calls := gateway.Calls(); len(calls) != 0 {
+		t.Fatalf("UploadVideo calls = %d, want no send without persisted active state", len(calls))
+	}
+}
+
+func TestControllerPreSendPersistenceFailurePreventsMessageSubmission(t *testing.T) {
+	jobs, _ := fixtureJobs(t, []fixtureJob{{Name: "pre-send-persist.mp4", RandomID: 7351}})
+	store := &memoryQueueStore{jobs: jobs, channel: testChannel()}
+	persistFailure := errors.New("disk failed at pre-send boundary")
+	submitted := make(chan struct{}, 1)
+	gateway := &fakeGateway{}
+	gateway.upload = func(_ context.Context, request tgtransport.UploadRequest, progress func(model.Progress)) (int, error) {
+		progress(model.Progress{BytesDone: jobs[0].Size, BytesTotal: jobs[0].Size, At: time.Now()})
+		store.mu.Lock()
+		store.saveErr = persistFailure
+		store.mu.Unlock()
+		if request.BeforeSend == nil {
+			return 0, errors.New("missing pre-send durability callback")
+		}
+		if err := request.BeforeSend(); err != nil {
+			return 0, err
+		}
+		submitted <- struct{}{}
+		return int(request.RandomID), nil
+	}
+
+	controller := newLoadedController(t, store, gateway)
+	if err := controller.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	final := waitForSnapshot(t, controller, func(snapshot Snapshot) bool {
+		return !snapshot.Running && len(snapshot.Jobs) == 1 && snapshot.Jobs[0].State == model.JobFailed
+	})
+	select {
+	case <-submitted:
+		t.Fatal("message submission continued after pre-send state persistence failed")
+	default:
+	}
+	if !strings.Contains(final.Jobs[0].Error, "保存消息提交状态失败") {
+		t.Fatalf("failed job error = %q, want pre-send persistence detail", final.Jobs[0].Error)
+	}
+}
+
+func TestControllerRetriesPreSendFailureThenContinuesQueue(t *testing.T) {
+	jobs, _ := fixtureJobs(t, []fixtureJob{
+		{Name: "retry.mp4", RandomID: 7351},
+		{Name: "after-retry.mp4", RandomID: 7352},
+	})
+	store := &memoryQueueStore{jobs: jobs, channel: testChannel()}
+	gateway := &fakeGateway{}
+	var mu sync.Mutex
+	firstCalls := 0
+	gateway.upload = func(_ context.Context, request tgtransport.UploadRequest, _ func(model.Progress)) (int, error) {
+		if request.RandomID == jobs[0].RandomID {
+			mu.Lock()
+			firstCalls++
+			call := firstCalls
+			mu.Unlock()
+			if call <= 2 {
+				return 0, fmt.Errorf("%w: temporary disconnect", tgtransport.ErrUploadData)
+			}
+		}
+		return int(request.RandomID), nil
+	}
+
+	controller := newLoadedController(t, store, gateway)
+	controller.uploadRetryDelays = []time.Duration{2 * time.Second, 5 * time.Second}
+	var waited []time.Duration
+	controller.uploadRetryWait = func(_ context.Context, delay time.Duration) error {
+		waited = append(waited, delay)
+		return nil
+	}
+	if err := controller.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	final := waitForSnapshot(t, controller, func(snapshot Snapshot) bool {
+		return !snapshot.Running && allJobsState(snapshot.Jobs, model.JobSent)
+	})
+	if len(final.Jobs) != 2 {
+		t.Fatalf("jobs = %d, want 2", len(final.Jobs))
+	}
+	if !reflect.DeepEqual(waited, controller.uploadRetryDelays) {
+		t.Fatalf("retry waits = %v, want %v", waited, controller.uploadRetryDelays)
+	}
+	if calls := gateway.Calls(); len(calls) != 4 {
+		t.Fatalf("UploadVideo calls = %d, want 3 attempts plus next job", len(calls))
+	}
+}
+
+func TestControllerExhaustedRetriesFailCurrentAndContinue(t *testing.T) {
+	jobs, _ := fixtureJobs(t, []fixtureJob{
+		{Name: "offline.mp4", RandomID: 7361},
+		{Name: "still-runs.mp4", RandomID: 7362},
+	})
+	store := &memoryQueueStore{jobs: jobs, channel: testChannel()}
+	gateway := &fakeGateway{}
+	gateway.upload = func(_ context.Context, request tgtransport.UploadRequest, _ func(model.Progress)) (int, error) {
+		if request.RandomID == jobs[0].RandomID {
+			return 0, fmt.Errorf("%w: connection reset", tgtransport.ErrUploadData)
+		}
+		return int(request.RandomID), nil
+	}
+
+	controller := newLoadedController(t, store, gateway)
+	controller.uploadRetryDelays = []time.Duration{time.Second, 2 * time.Second}
+	controller.uploadRetryWait = func(context.Context, time.Duration) error { return nil }
+	if err := controller.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	final := waitForSnapshot(t, controller, func(snapshot Snapshot) bool {
+		return !snapshot.Running && len(snapshot.Jobs) == 2 &&
+			snapshot.Jobs[0].State == model.JobFailed && snapshot.Jobs[1].State == model.JobSent
+	})
+	if !strings.Contains(final.Jobs[0].Error, "自动重试 2 次后仍失败") {
+		t.Fatalf("failed job error = %q, want retry exhaustion detail", final.Jobs[0].Error)
+	}
+	if calls := gateway.Calls(); len(calls) != 4 {
+		t.Fatalf("UploadVideo calls = %d, want 3 failed attempts plus next job", len(calls))
+	}
+}
+
+func TestControllerCancelJobInterruptsRetryWaitAndContinues(t *testing.T) {
+	jobs, _ := fixtureJobs(t, []fixtureJob{
+		{Name: "cancel-retry.mp4", RandomID: 7371},
+		{Name: "after-cancel.mp4", RandomID: 7372},
+	})
+	store := &memoryQueueStore{jobs: jobs, channel: testChannel()}
+	gateway := &fakeGateway{}
+	gateway.upload = func(_ context.Context, request tgtransport.UploadRequest, _ func(model.Progress)) (int, error) {
+		if request.RandomID == jobs[0].RandomID {
+			return 0, fmt.Errorf("%w: offline", tgtransport.ErrUploadData)
+		}
+		return int(request.RandomID), nil
+	}
+	waitStarted := make(chan struct{})
+	var signalWait sync.Once
+
+	controller := newLoadedController(t, store, gateway)
+	controller.uploadRetryDelays = []time.Duration{time.Hour}
+	controller.uploadRetryWait = func(ctx context.Context, _ time.Duration) error {
+		signalWait.Do(func() { close(waitStarted) })
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	if err := controller.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	select {
+	case <-waitStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for retry backoff")
+	}
+	if err := controller.CancelJob(jobs[0].ID); err != nil {
+		t.Fatalf("CancelJob() error = %v", err)
+	}
+	final := waitForSnapshot(t, controller, func(snapshot Snapshot) bool {
+		return !snapshot.Running && len(snapshot.Jobs) == 2 &&
+			snapshot.Jobs[0].State == model.JobCancelled && snapshot.Jobs[1].State == model.JobSent
+	})
+	if final.Jobs[0].Error != "" {
+		t.Fatalf("cancelled retry error = %q, want empty", final.Jobs[0].Error)
+	}
+	if calls := gateway.Calls(); len(calls) != 2 {
+		t.Fatalf("UploadVideo calls = %d, want one cancelled attempt plus next job", len(calls))
+	}
+}
+
+func TestControllerPauseInterruptsRetryWaitAndCanResume(t *testing.T) {
+	jobs, _ := fixtureJobs(t, []fixtureJob{
+		{Name: "pause-retry.mp4", RandomID: 7381},
+		{Name: "after-pause.mp4", RandomID: 7382},
+	})
+	store := &memoryQueueStore{jobs: jobs, channel: testChannel()}
+	gateway := &fakeGateway{}
+	var mu sync.Mutex
+	firstCalls := 0
+	gateway.upload = func(_ context.Context, request tgtransport.UploadRequest, _ func(model.Progress)) (int, error) {
+		if request.RandomID == jobs[0].RandomID {
+			mu.Lock()
+			firstCalls++
+			call := firstCalls
+			mu.Unlock()
+			if call == 1 {
+				return 0, fmt.Errorf("%w: offline", tgtransport.ErrUploadData)
+			}
+		}
+		return int(request.RandomID), nil
+	}
+	waitStarted := make(chan struct{})
+	var signalWait sync.Once
+
+	controller := newLoadedController(t, store, gateway)
+	controller.uploadRetryDelays = []time.Duration{time.Hour}
+	controller.uploadRetryWait = func(ctx context.Context, _ time.Duration) error {
+		signalWait.Do(func() { close(waitStarted) })
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	if err := controller.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	select {
+	case <-waitStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for retry backoff")
+	}
+	if err := controller.Pause(); err != nil {
+		t.Fatalf("Pause() error = %v", err)
+	}
+	paused := waitForSnapshot(t, controller, func(snapshot Snapshot) bool {
+		return !snapshot.Running && snapshot.Paused && len(snapshot.Jobs) == 2 &&
+			snapshot.Jobs[0].State == model.JobInterrupted && snapshot.Jobs[1].State == model.JobQueued
+	})
+	if !strings.Contains(paused.Jobs[0].Error, "暂停") {
+		t.Fatalf("paused retry error = %q, want pause guidance", paused.Jobs[0].Error)
+	}
+	if err := controller.Resume(); err != nil {
+		t.Fatalf("Resume() error = %v", err)
+	}
+	if err := controller.Start(context.Background()); err != nil {
+		t.Fatalf("second Start() error = %v", err)
+	}
+	waitForSnapshot(t, controller, func(snapshot Snapshot) bool {
+		return !snapshot.Running && allJobsState(snapshot.Jobs, model.JobSent)
+	})
+}
+
+func TestControllerRetryUsesLatestGateway(t *testing.T) {
+	jobs, _ := fixtureJobs(t, []fixtureJob{{Name: "reconnect.mp4", RandomID: 7391}})
+	store := &memoryQueueStore{jobs: jobs, channel: testChannel()}
+	oldGateway := &fakeGateway{}
+	oldGateway.upload = func(context.Context, tgtransport.UploadRequest, func(model.Progress)) (int, error) {
+		return 0, tgtransport.ErrNotConnected
+	}
+	newGateway := &fakeGateway{}
+	newGateway.upload = func(_ context.Context, request tgtransport.UploadRequest, _ func(model.Progress)) (int, error) {
+		return int(request.RandomID), nil
+	}
+
+	controller := newLoadedController(t, store, oldGateway)
+	controller.uploadRetryDelays = []time.Duration{time.Second}
+	controller.uploadRetryWait = func(context.Context, time.Duration) error {
+		controller.SetGateway(newGateway)
+		return nil
+	}
+	if err := controller.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	waitForSnapshot(t, controller, func(snapshot Snapshot) bool {
+		return !snapshot.Running && allJobsState(snapshot.Jobs, model.JobSent)
+	})
+	if calls := oldGateway.Calls(); len(calls) != 1 {
+		t.Fatalf("old gateway calls = %d, want 1", len(calls))
+	}
+	if calls := newGateway.Calls(); len(calls) != 1 {
+		t.Fatalf("new gateway calls = %d, want 1", len(calls))
 	}
 }
 
@@ -979,7 +1268,10 @@ func TestControllerIgnoresLateProgressAfterTerminalState(t *testing.T) {
 }
 
 func TestControllerSendOutcomeUnknownEntersConfirming(t *testing.T) {
-	jobs, _ := fixtureJobs(t, []fixtureJob{{Name: "unknown-outcome.mp4", RandomID: 7471}})
+	jobs, _ := fixtureJobs(t, []fixtureJob{
+		{Name: "unknown-outcome.mp4", RandomID: 7471},
+		{Name: "must-not-send.mp4", RandomID: 7472},
+	})
 	store := &memoryQueueStore{jobs: jobs, channel: testChannel()}
 	gateway := &fakeGateway{}
 	gateway.upload = func(context.Context, tgtransport.UploadRequest, func(model.Progress)) (int, error) {
@@ -991,13 +1283,97 @@ func TestControllerSendOutcomeUnknownEntersConfirming(t *testing.T) {
 		t.Fatalf("Start() error = %v", err)
 	}
 	final := waitForSnapshot(t, controller, func(snapshot Snapshot) bool {
-		return !snapshot.Running && len(snapshot.Jobs) == 1 && snapshot.Jobs[0].State == model.JobConfirming
+		return !snapshot.Running && len(snapshot.Jobs) == 2 &&
+			snapshot.Jobs[0].State == model.JobConfirming && snapshot.Jobs[1].State == model.JobQueued
 	})
 	if final.Jobs[0].Error == "" || final.LastError == "" {
 		t.Fatalf("confirming job error = %q, last error = %q; want recovery guidance", final.Jobs[0].Error, final.LastError)
 	}
-	if saved := store.SnapshotJobs(); len(saved) != 1 || saved[0].State != model.JobConfirming {
+	if saved := store.SnapshotJobs(); len(saved) != 2 || saved[0].State != model.JobConfirming || saved[1].State != model.JobQueued {
 		t.Fatalf("persisted state = %#v, want confirming", saved)
+	}
+	if calls := gateway.Calls(); len(calls) != 1 {
+		t.Fatalf("UploadVideo calls = %d, want no automatic retry after unknown send outcome", len(calls))
+	}
+}
+
+func TestControllerIgnoresProgressFromPreviousRetryAttempt(t *testing.T) {
+	controller := NewController(nil, nil)
+	controller.jobs = []model.Job{{ID: "job", Size: 100, State: model.JobUploading}}
+	controller.activeID = "job"
+	controller.activeAttempt = 2
+
+	controller.applyProgressForAttempt(0, "job", 1, model.Progress{
+		BytesDone:      100,
+		BytesTotal:     100,
+		BytesPerSecond: 999,
+		At:             time.Now(),
+	})
+	if got := controller.Snapshot().Jobs[0]; got.Uploaded != 0 || got.State != model.JobUploading {
+		t.Fatalf("stale attempt changed job: %+v", got)
+	}
+
+	controller.applyProgressForAttempt(0, "job", 2, model.Progress{
+		BytesDone:      25,
+		BytesTotal:     100,
+		BytesPerSecond: 50,
+		At:             time.Now(),
+	})
+	if got := controller.Snapshot().Jobs[0]; got.Uploaded != 25 || got.BytesPerSecond != 50 {
+		t.Fatalf("current attempt progress = %+v, want 25 bytes at 50 B/s", got)
+	}
+}
+
+func TestControllerDoesNotPersistIntermediateUploadProgress(t *testing.T) {
+	store := &memoryQueueStore{}
+	controller := NewController(store, nil)
+	controller.jobs = []model.Job{{ID: "job", Size: 100, State: model.JobUploading}}
+	controller.activeID = "job"
+	controller.activeAttempt = 1
+
+	for _, uploaded := range []int64{10, 40, 80} {
+		controller.applyProgressForAttempt(0, "job", 1, model.Progress{
+			BytesDone:      uploaded,
+			BytesTotal:     100,
+			BytesPerSecond: 50,
+			At:             time.Now(),
+		})
+	}
+	if got := store.savesCount(); got != 0 {
+		t.Fatalf("intermediate progress saves = %d, want 0", got)
+	}
+
+	controller.applyProgressForAttempt(0, "job", 1, model.Progress{
+		BytesDone:      100,
+		BytesTotal:     100,
+		BytesPerSecond: 50,
+		At:             time.Now(),
+	})
+	if got := store.savesCount(); got != 0 {
+		t.Fatalf("final byte progress saves = %d, want 0", got)
+	}
+	if err := controller.prepareSendForAttempt(0, "job", 1); err != nil {
+		t.Fatalf("prepareSendForAttempt() error = %v", err)
+	}
+	if got := store.savesCount(); got != 1 {
+		t.Fatalf("explicit pre-send transition saves = %d, want 1", got)
+	}
+	if got := store.SnapshotJobs()[0]; got.State != model.JobSending || got.Uploaded != 100 {
+		t.Fatalf("persisted final progress = %+v, want sending at 100 bytes", got)
+	}
+
+	// Repeated or stale callbacks must not add disk writes or regress speed.
+	controller.applyProgressForAttempt(0, "job", 1, model.Progress{
+		BytesDone:      80,
+		BytesTotal:     100,
+		BytesPerSecond: 1,
+		At:             time.Now(),
+	})
+	if got := store.savesCount(); got != 1 {
+		t.Fatalf("repeated/stale progress saves = %d, want 1", got)
+	}
+	if got := controller.Snapshot().Jobs[0]; got.Uploaded != 100 || got.BytesPerSecond != 0 {
+		t.Fatalf("stale progress changed current snapshot: %+v", got)
 	}
 }
 
