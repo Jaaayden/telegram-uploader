@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -39,11 +40,25 @@ type Snapshot struct {
 	// can explain why the active file is still moving.
 	PauseRequested bool
 	ActiveID       string
-	LastError      string
-	DoneBytes      int64
-	TotalBytes     int64
-	BytesPerSecond float64
-	ETA            time.Duration
+	// PendingRemovalIDs contains active jobs for which the user requested a
+	// removal. The IDs are intentionally not persisted: they describe an
+	// in-flight cancellation and are rebuilt only for the lifetime of the
+	// process.
+	PendingRemovalIDs []string
+	LastError         string
+	DoneBytes         int64
+	TotalBytes        int64
+	BytesPerSecond    float64
+	ETA               time.Duration
+}
+
+// RemovalResult describes a queue removal request. Removed is the number of
+// records removed immediately. PendingRemovalIDs contains active records that
+// are being cancelled and will be removed after the upload goroutine exits.
+// A Telegram message is never deleted by a queue removal operation.
+type RemovalResult struct {
+	Removed           int
+	PendingRemovalIDs []string
 }
 
 // ResetMode selects which recoverable queue jobs should return to JobQueued.
@@ -72,8 +87,12 @@ type Controller struct {
 	jobs    []model.Job
 	channel model.Channel
 	folder  string
-	running bool
-	paused  bool
+	// queueRevision changes whenever a durable queue or channel/pause value is
+	// changed. Persistence uses it to avoid publishing an older structural
+	// snapshot after a concurrent upload update.
+	queueRevision uint64
+	running       bool
+	paused        bool
 	// pauseRequested is a transient view of a pause intent while the queue is
 	// still running. paused remains true until Resume or Start clears it.
 	pauseRequested bool
@@ -90,9 +109,13 @@ type Controller struct {
 	cancelJobID        string
 	cancelAllRequested bool
 	retryWaitActive    bool
+	pendingRemoval     map[string]struct{}
 	updates            chan Snapshot
 	uploadRetryDelays  []time.Duration
 	uploadRetryWait    func(context.Context, time.Duration) error
+	// beforeUploadAttempt is a deterministic test seam for the narrow interval
+	// after queue selection and before the job is reserved as active.
+	beforeUploadAttempt func(model.Job)
 }
 
 var defaultUploadRetryDelays = []time.Duration{
@@ -106,6 +129,9 @@ var defaultUploadRetryDelays = []time.Duration{
 var (
 	errQueuePaused          = errors.New("上传队列已暂停")
 	errQueuePersistenceLost = errors.New("无法可靠保存上传队列状态")
+	errQueueChanged         = errors.New("上传队列已发生变化")
+	errQueueJobCancelled    = errors.New("上传任务已取消")
+	errQueueJobNotRunnable  = errors.New("上传任务已不再可运行")
 )
 
 func NewController(store QueueStore, fileMover *mover.Mover) *Controller {
@@ -116,6 +142,7 @@ func NewController(store QueueStore, fileMover *mover.Mover) *Controller {
 		store:             store,
 		mover:             fileMover,
 		updates:           make(chan Snapshot, 1),
+		pendingRemoval:    make(map[string]struct{}),
 		uploadRetryDelays: append([]time.Duration(nil), defaultUploadRetryDelays...),
 		uploadRetryWait:   waitForUploadRetry,
 	}
@@ -159,6 +186,12 @@ func (c *Controller) Load() error {
 		return errors.New("另一个文件操作正在进行，请稍后重试")
 	}
 	defer c.opMu.Unlock()
+	c.mu.RLock()
+	running := c.running || c.activeID != "" || len(c.pendingRemoval) > 0
+	c.mu.RUnlock()
+	if running {
+		return errors.New("上传或活动任务清理进行中，不能重新载入队列")
+	}
 	if c.store == nil {
 		return nil
 	}
@@ -174,6 +207,7 @@ func (c *Controller) Load() error {
 	c.jobs = append([]model.Job(nil), jobs...)
 	c.channel = channel
 	c.paused = paused
+	c.queueRevision++
 	c.pauseRequested = false
 	if len(jobs) > 0 {
 		c.folder = filepath.Dir(jobs[0].Path)
@@ -250,20 +284,29 @@ func (c *Controller) Scan(folder string, maxBytes int64) error {
 	if err != nil {
 		return err
 	}
-	c.mu.Lock()
-	c.jobs = jobs
-	c.folder = folder
-	c.lastError = ""
-	c.notifyLocked()
-	c.mu.Unlock()
-	return c.persist()
+	for {
+		c.mu.RLock()
+		channel := c.channel
+		paused := c.paused
+		revision := c.queueRevision
+		c.mu.RUnlock()
+		if err := c.persistCandidate(jobs, channel, paused, revision); err != nil {
+			if errors.Is(err, errQueueChanged) {
+				continue
+			}
+			c.setPersistenceError(err)
+			return err
+		}
+		if c.commitCandidate(jobs, folder, revision) {
+			return nil
+		}
+	}
 }
 
 // Pause requests a soft pause. It never cancels the active Telegram request:
 // the current file is allowed to finish, then runQueue stops before selecting
-// another runnable job. The active-run path intentionally bypasses opMu
-// because the upload goroutine owns that lock for the duration of a run;
-// idle pauses still use opMu to serialize with queue editing.
+// another runnable job. The upload goroutine does not hold opMu for its whole
+// lifetime, so queue edits can proceed while an upload is active.
 func (c *Controller) Pause() error {
 	c.mu.Lock()
 	if !c.running {
@@ -287,6 +330,7 @@ func (c *Controller) Pause() error {
 	stateChanged := !wasPaused || wasRequested != c.pauseRequested
 	if stateChanged {
 		c.pauseRevision++
+		c.queueRevision++
 		c.notifyLocked()
 	}
 	revision := c.pauseRevision
@@ -339,6 +383,7 @@ func (c *Controller) Resume() error {
 	c.paused = false
 	c.pauseRequested = false
 	c.pauseRevision++
+	c.queueRevision++
 	revision := c.pauseRevision
 	c.notifyLocked()
 	c.mu.Unlock()
@@ -365,8 +410,8 @@ func (c *Controller) IsPaused() bool {
 	return c.paused
 }
 
-// AddJobs appends scanned candidates to the durable queue while the queue is
-// idle. Candidates are de-duplicated by their normalized absolute path. An
+// AddJobs appends scanned candidates to the durable queue, including while an
+// upload is active. Candidates are de-duplicated by normalized absolute path. An
 // existing path always wins, so a previously sent/failed job keeps its ID,
 // RandomID and state instead of being replaced by a newly scanned copy.
 //
@@ -374,112 +419,147 @@ func (c *Controller) IsPaused() bool {
 // adding candidates from another folder, their order is preserved and the
 // new group is appended after the existing queue. Positions are rebuilt for
 // the complete queue after every successful append.
-func (c *Controller) AddJobs(candidates []model.Job) error {
+func (c *Controller) AddJobs(candidates []model.Job) (int, error) {
 	if len(candidates) == 0 {
-		return nil
+		return 0, nil
 	}
 	if !c.opMu.TryLock() {
-		return errors.New("上传、扫描或移动操作正在进行，请稍后重试")
+		return 0, errors.New("扫描或移动操作正在进行，请稍后重试")
 	}
 	defer c.opMu.Unlock()
+	for {
+		c.mu.RLock()
+		current := cloneJobsForPersistence(c.jobs)
+		revision := c.queueRevision
+		channel := c.channel
+		paused := c.paused
+		folder := c.folder
+		c.mu.RUnlock()
 
-	c.mu.Lock()
-	if c.running {
-		c.mu.Unlock()
-		return errors.New("上传进行中，不能追加队列")
-	}
-
-	nextJobs := append([]model.Job(nil), c.jobs...)
-	paths := make(map[string]struct{}, len(c.jobs)+len(candidates))
-	ids := make(map[string]struct{}, len(c.jobs)+len(candidates))
-	randomIDs := make(map[int64]struct{}, len(c.jobs)+len(candidates))
-	for _, job := range c.jobs {
-		if key := jobPathKey(job.Path); key != "" {
+		nextJobs := append([]model.Job(nil), current...)
+		paths := make(map[string]struct{}, len(current)+len(candidates))
+		ids := make(map[string]struct{}, len(current)+len(candidates))
+		randomIDs := make(map[int64]struct{}, len(current)+len(candidates))
+		for _, job := range current {
+			if key := jobPathKey(job.Path); key != "" {
+				paths[key] = struct{}{}
+			}
+			if job.ID != "" {
+				ids[job.ID] = struct{}{}
+			}
+			if job.RandomID != 0 {
+				randomIDs[job.RandomID] = struct{}{}
+			}
+		}
+		added := 0
+		for _, candidate := range candidates {
+			if strings.TrimSpace(candidate.Path) == "" {
+				return 0, errors.New("追加任务失败：文件路径不能为空")
+			}
+			key := jobPathKey(candidate.Path)
+			if _, exists := paths[key]; exists {
+				continue
+			}
+			if strings.TrimSpace(candidate.ID) == "" {
+				return 0, fmt.Errorf("追加任务 %q 失败：Job ID 不能为空", candidate.Name)
+			}
+			if _, exists := ids[candidate.ID]; exists {
+				return 0, fmt.Errorf("追加任务 %q 失败：Job ID 重复", candidate.Name)
+			}
+			if candidate.RandomID == 0 {
+				return 0, fmt.Errorf("追加任务 %q 失败：Telegram RandomID 不能为空", candidate.Name)
+			}
+			if _, exists := randomIDs[candidate.RandomID]; exists {
+				return 0, fmt.Errorf("追加任务 %q 失败：Telegram RandomID 重复", candidate.Name)
+			}
+			if strings.TrimSpace(candidate.Name) == "" || candidate.Size < 0 {
+				return 0, errors.New("追加任务失败：文件名或大小无效")
+			}
+			if candidate.State == "" {
+				candidate.State = model.JobQueued
+			}
+			if candidate.State != model.JobQueued && candidate.State != model.JobOversize {
+				return 0, fmt.Errorf("追加任务 %q 失败：不允许的初始状态 %q", candidate.Name, candidate.State)
+			}
+			nextJobs = append(nextJobs, candidate)
 			paths[key] = struct{}{}
+			ids[candidate.ID] = struct{}{}
+			randomIDs[candidate.RandomID] = struct{}{}
+			added++
 		}
-		if job.ID != "" {
-			ids[job.ID] = struct{}{}
+		if added == 0 {
+			return 0, nil
 		}
-		if job.RandomID != 0 {
-			randomIDs[job.RandomID] = struct{}{}
+		reindexJobs(nextJobs)
+		if err := c.persistCandidate(nextJobs, channel, paused, revision); err != nil {
+			if errors.Is(err, errQueueChanged) {
+				continue
+			}
+			c.setPersistenceError(err)
+			return 0, err
+		}
+		if c.commitCandidate(nextJobs, folder, revision) {
+			return added, nil
 		}
 	}
-	added := 0
-	for _, candidate := range candidates {
-		if strings.TrimSpace(candidate.Path) == "" {
-			c.mu.Unlock()
-			return errors.New("追加任务失败：文件路径不能为空")
-		}
-		key := jobPathKey(candidate.Path)
-		if _, exists := paths[key]; exists {
-			continue
-		}
-		if strings.TrimSpace(candidate.ID) == "" {
-			c.mu.Unlock()
-			return fmt.Errorf("追加任务 %q 失败：Job ID 不能为空", candidate.Name)
-		}
-		if _, exists := ids[candidate.ID]; exists {
-			c.mu.Unlock()
-			return fmt.Errorf("追加任务 %q 失败：Job ID 重复", candidate.Name)
-		}
-		if candidate.RandomID == 0 {
-			c.mu.Unlock()
-			return fmt.Errorf("追加任务 %q 失败：Telegram RandomID 不能为空", candidate.Name)
-		}
-		if _, exists := randomIDs[candidate.RandomID]; exists {
-			c.mu.Unlock()
-			return fmt.Errorf("追加任务 %q 失败：Telegram RandomID 重复", candidate.Name)
-		}
-		if strings.TrimSpace(candidate.Name) == "" || candidate.Size < 0 {
-			c.mu.Unlock()
-			return errors.New("追加任务失败：文件名或大小无效")
-		}
-		if candidate.State == "" {
-			candidate.State = model.JobQueued
-		}
-		if candidate.State != model.JobQueued && candidate.State != model.JobOversize {
-			c.mu.Unlock()
-			return fmt.Errorf("追加任务 %q 失败：不允许的初始状态 %q", candidate.Name, candidate.State)
-		}
-		nextJobs = append(nextJobs, candidate)
-		paths[key] = struct{}{}
-		ids[candidate.ID] = struct{}{}
-		randomIDs[candidate.RandomID] = struct{}{}
-		added++
-	}
-	if added == 0 {
-		c.mu.Unlock()
-		return nil
-	}
-	reindexJobs(nextJobs)
-	channel := c.channel
-	paused := c.paused
-	c.mu.Unlock()
+}
 
-	if err := c.saveSnapshot(nextJobs, channel, paused); err != nil {
-		c.setPersistenceError(err)
-		return err
+func isRemovableJobState(state model.JobState) bool {
+	switch state {
+	case model.JobUploading, model.JobSending, model.JobConfirming, model.JobMoving:
+		return false
+	default:
+		return true
 	}
-	c.mu.Lock()
-	c.jobs = nextJobs
-	c.lastError = ""
-	c.notifyLocked()
-	c.mu.Unlock()
+}
+
+func pendingRemovalEligibleState(state model.JobState) bool {
+	switch state {
+	case model.JobUploading, model.JobSending, model.JobSent, model.JobCancelled, model.JobInterrupted, model.JobFailed:
+		return true
+	default:
+		return false
+	}
+}
+
+func (c *Controller) requestPendingRemovalLocked(id string) context.CancelFunc {
+	if c.pendingRemoval == nil {
+		c.pendingRemoval = make(map[string]struct{})
+	}
+	c.pendingRemoval[id] = struct{}{}
+	if c.activeID == id {
+		c.cancelJobID = id
+		return c.activeCancel
+	}
 	return nil
 }
 
-// RemoveJobs removes the specified local queue entries while the queue is
-// idle. This only changes the local queue; it never deletes a message from
-// Telegram. Unknown IDs are ignored so repeated UI actions are safe.
-func (c *Controller) RemoveJobs(ids []string) error {
-	if len(ids) == 0 {
-		return nil
+// requestActiveRemovalLocked records a cancellation only after any structural
+// queue edit in the same user operation has been durably committed. A nil
+// selected set means every active job is selected (the ClearQueue case).
+// c.mu must be held by the caller.
+func (c *Controller) requestActiveRemovalLocked(selected map[string]struct{}) ([]string, context.CancelFunc) {
+	id := c.activeID
+	if id == "" {
+		return nil, nil
 	}
-	if !c.opMu.TryLock() {
-		return errors.New("上传、扫描或移动操作正在进行，请稍后重试")
+	if selected != nil {
+		if _, ok := selected[id]; !ok {
+			return nil, nil
+		}
 	}
-	defer c.opMu.Unlock()
+	index := findJobIndexLocked(c.jobs, id)
+	if index < 0 || !pendingRemovalEligibleState(c.jobs[index].State) {
+		return nil, nil
+	}
+	cancel := c.requestPendingRemovalLocked(id)
+	c.notifyLocked()
+	return []string{id}, cancel
+}
 
+// RemoveJobs removes local records while a queue is running as well. An active
+// upload is cancelled first and removed only after its outcome is known.
+func (c *Controller) RemoveJobs(ids []string) (RemovalResult, error) {
 	selected := make(map[string]struct{}, len(ids))
 	for _, id := range ids {
 		if id != "" {
@@ -487,118 +567,148 @@ func (c *Controller) RemoveJobs(ids []string) error {
 		}
 	}
 	if len(selected) == 0 {
-		return nil
+		return RemovalResult{}, nil
 	}
-
-	c.mu.Lock()
-	if c.running {
-		c.mu.Unlock()
-		return errors.New("上传进行中，不能删除队列任务")
-	}
-	nextJobs, removed := filteredJobs(c.jobs, func(job model.Job) bool {
-		_, ok := selected[job.ID]
-		return ok
-	})
-	if removed == 0 {
-		c.mu.Unlock()
-		return nil
-	}
-	channel := c.channel
-	paused := c.paused
-	c.mu.Unlock()
-
-	if err := c.saveSnapshot(nextJobs, channel, paused); err != nil {
-		c.setPersistenceError(err)
-		return err
-	}
-	c.mu.Lock()
-	c.jobs = nextJobs
-	if len(nextJobs) == 0 {
-		c.folder = ""
-	}
-	c.lastError = ""
-	c.notifyLocked()
-	c.mu.Unlock()
-	return nil
-}
-
-// ClearQueue removes every local queue entry while idle. It does not affect
-// already uploaded Telegram messages.
-func (c *Controller) ClearQueue() error {
 	if !c.opMu.TryLock() {
-		return errors.New("上传、扫描或移动操作正在进行，请稍后重试")
+		return RemovalResult{}, errors.New("扫描或移动操作正在进行，请稍后重试")
 	}
 	defer c.opMu.Unlock()
-
-	c.mu.Lock()
-	if c.running {
+	for {
+		c.mu.Lock()
+		current := cloneJobsForPersistence(c.jobs)
+		revision := c.queueRevision
+		channel := c.channel
+		paused := c.paused
+		folder := c.folder
+		nextJobs, removed := filteredJobs(current, func(job model.Job) bool {
+			_, selectedJob := selected[job.ID]
+			return selectedJob && isRemovableJobState(job.State) && job.ID != c.activeID
+		})
+		if removed == 0 {
+			pending, cancel := c.requestActiveRemovalLocked(selected)
+			c.mu.Unlock()
+			if cancel != nil {
+				cancel()
+			}
+			return RemovalResult{PendingRemovalIDs: pending}, nil
+		}
 		c.mu.Unlock()
-		return errors.New("上传进行中，不能清空队列")
+		if err := c.persistCandidate(nextJobs, channel, paused, revision); err != nil {
+			if errors.Is(err, errQueueChanged) {
+				continue
+			}
+			c.setPersistenceError(err)
+			return RemovalResult{}, err
+		}
+		committed, pending, cancel := c.commitRemovalCandidate(
+			nextJobs,
+			folderIfJobs(nextJobs, folder),
+			revision,
+			selected,
+		)
+		if committed {
+			if cancel != nil {
+				cancel()
+			}
+			return RemovalResult{Removed: removed, PendingRemovalIDs: pending}, nil
+		}
 	}
-	if len(c.jobs) == 0 {
-		c.mu.Unlock()
-		return nil
-	}
-	channel := c.channel
-	paused := c.paused
-	c.mu.Unlock()
-
-	if err := c.saveSnapshot(nil, channel, paused); err != nil {
-		c.setPersistenceError(err)
-		return err
-	}
-	c.mu.Lock()
-	c.jobs = nil
-	c.folder = ""
-	c.lastError = ""
-	c.notifyLocked()
-	c.mu.Unlock()
-	return nil
 }
 
-// RemoveCompleted removes jobs whose local terminal state means the file was
-// already handled: sent to Telegram or moved as an oversize file. Failed,
-// skipped and cancelled entries remain available for recovery or inspection.
-func (c *Controller) RemoveCompleted() error {
+func folderIfJobs(jobs []model.Job, current string) string {
+	if len(jobs) == 0 {
+		return ""
+	}
+	return current
+}
+
+// ClearQueue removes every removable local record. The active upload follows
+// the same cancel-then-remove path as RemoveJobs; confirming/moving records are
+// retained because their external outcome is not safely reversible.
+func (c *Controller) ClearQueue() (RemovalResult, error) {
 	if !c.opMu.TryLock() {
-		return errors.New("上传、扫描或移动操作正在进行，请稍后重试")
+		return RemovalResult{}, errors.New("扫描或移动操作正在进行，请稍后重试")
 	}
 	defer c.opMu.Unlock()
-
-	c.mu.Lock()
-	if c.running {
+	for {
+		c.mu.Lock()
+		current := cloneJobsForPersistence(c.jobs)
+		revision := c.queueRevision
+		channel := c.channel
+		paused := c.paused
+		folder := c.folder
+		nextJobs, removed := filteredJobs(current, func(job model.Job) bool {
+			return isRemovableJobState(job.State) && job.ID != c.activeID
+		})
+		if removed == 0 {
+			pending, cancel := c.requestActiveRemovalLocked(nil)
+			c.mu.Unlock()
+			if cancel != nil {
+				cancel()
+			}
+			return RemovalResult{PendingRemovalIDs: pending}, nil
+		}
 		c.mu.Unlock()
-		return errors.New("上传进行中，不能删除已完成任务")
+		if err := c.persistCandidate(nextJobs, channel, paused, revision); err != nil {
+			if errors.Is(err, errQueueChanged) {
+				continue
+			}
+			c.setPersistenceError(err)
+			return RemovalResult{}, err
+		}
+		committed, pending, cancel := c.commitRemovalCandidate(
+			nextJobs,
+			folderIfJobs(nextJobs, folder),
+			revision,
+			nil,
+		)
+		if committed {
+			if cancel != nil {
+				cancel()
+			}
+			return RemovalResult{Removed: removed, PendingRemovalIDs: pending}, nil
+		}
 	}
-	nextJobs, removed := filteredJobs(c.jobs, func(job model.Job) bool {
-		return job.State == model.JobSent || job.State == model.JobMoved
-	})
-	if removed == 0 {
-		c.mu.Unlock()
-		return nil
-	}
-	channel := c.channel
-	paused := c.paused
-	c.mu.Unlock()
-
-	if err := c.saveSnapshot(nextJobs, channel, paused); err != nil {
-		c.setPersistenceError(err)
-		return err
-	}
-	c.mu.Lock()
-	c.jobs = nextJobs
-	if len(nextJobs) == 0 {
-		c.folder = ""
-	}
-	c.lastError = ""
-	c.notifyLocked()
-	c.mu.Unlock()
-	return nil
 }
 
-// ResetJobs returns recoverable terminal jobs to the queued state while the
-// queue is idle. ResetSelected applies the same safety rules to the supplied
-// job IDs; the other modes ignore ids and select jobs by durable state.
+// RemoveCompleted can run concurrently with uploads and removes only jobs
+// whose Telegram/file operation has already reached a terminal success state.
+func (c *Controller) RemoveCompleted() (RemovalResult, error) {
+	if !c.opMu.TryLock() {
+		return RemovalResult{}, errors.New("扫描或移动操作正在进行，请稍后重试")
+	}
+	defer c.opMu.Unlock()
+	for {
+		c.mu.RLock()
+		current := cloneJobsForPersistence(c.jobs)
+		revision := c.queueRevision
+		channel := c.channel
+		paused := c.paused
+		folder := c.folder
+		c.mu.RUnlock()
+		nextJobs, removed := filteredJobs(current, func(job model.Job) bool {
+			return job.State == model.JobSent || job.State == model.JobMoved
+		})
+		result := RemovalResult{Removed: removed}
+		if removed == 0 {
+			return result, nil
+		}
+		if err := c.persistCandidate(nextJobs, channel, paused, revision); err != nil {
+			if errors.Is(err, errQueueChanged) {
+				continue
+			}
+			c.setPersistenceError(err)
+			return RemovalResult{}, err
+		}
+		if c.commitCandidate(nextJobs, folderIfJobs(nextJobs, folder), revision) {
+			return result, nil
+		}
+	}
+}
+
+// ResetJobs returns recoverable terminal jobs to the queued state. It is safe
+// to invoke while the queue is active; the current upload is never reset and
+// newly queued jobs are picked up by the next selection pass.
 //
 // The complete next queue is persisted before it is published to observers,
 // so a storage failure cannot leave the UI and queue.json disagreeing.
@@ -618,46 +728,51 @@ func (c *Controller) ResetJobs(mode ResetMode, ids []string) (int, error) {
 			return 0, nil
 		}
 	}
-
 	if !c.opMu.TryLock() {
-		return 0, errors.New("上传、扫描或移动操作正在进行，请稍后重试")
+		return 0, errors.New("扫描或移动操作正在进行，请稍后重试")
 	}
 	defer c.opMu.Unlock()
 
-	c.mu.Lock()
-	if c.running {
-		c.mu.Unlock()
-		return 0, errors.New("上传进行中，不能重置队列任务")
-	}
-	nextJobs := append([]model.Job(nil), c.jobs...)
-	channel := c.channel
-	paused := c.paused
-	c.mu.Unlock()
-
-	resetCount := 0
-	for i := range nextJobs {
-		job := &nextJobs[i]
-		if !matchesResetMode(*job, mode, selected) {
-			continue
+	for {
+		c.mu.RLock()
+		current := cloneJobsForPersistence(c.jobs)
+		revision := c.queueRevision
+		channel := c.channel
+		paused := c.paused
+		folder := c.folder
+		activeID := c.activeID
+		pendingRemoval := make(map[string]struct{}, len(c.pendingRemoval))
+		for id := range c.pendingRemoval {
+			pendingRemoval[id] = struct{}{}
 		}
-		job.State = model.JobQueued
-		resetPendingJobProgress(job)
-		resetCount++
-	}
-	if resetCount == 0 {
-		return 0, nil
-	}
+		c.mu.RUnlock()
 
-	if err := c.saveSnapshot(nextJobs, channel, paused); err != nil {
-		c.setPersistenceError(err)
-		return 0, err
+		nextJobs := append([]model.Job(nil), current...)
+		resetCount := 0
+		for i := range nextJobs {
+			job := &nextJobs[i]
+			_, pending := pendingRemoval[job.ID]
+			if job.ID == activeID || pending || !matchesResetMode(*job, mode, selected) {
+				continue
+			}
+			job.State = model.JobQueued
+			resetPendingJobProgress(job)
+			resetCount++
+		}
+		if resetCount == 0 {
+			return 0, nil
+		}
+		if err := c.persistCandidate(nextJobs, channel, paused, revision); err != nil {
+			if errors.Is(err, errQueueChanged) {
+				continue
+			}
+			c.setPersistenceError(err)
+			return 0, err
+		}
+		if c.commitCandidate(nextJobs, folder, revision) {
+			return resetCount, nil
+		}
 	}
-	c.mu.Lock()
-	c.jobs = nextJobs
-	c.lastError = ""
-	c.notifyLocked()
-	c.mu.Unlock()
-	return resetCount, nil
 }
 
 func validResetMode(mode ResetMode) bool {
@@ -715,6 +830,131 @@ func filteredJobs(jobs []model.Job, remove func(model.Job) bool) ([]model.Job, i
 	return kept, removed
 }
 
+func findJobIndexLocked(jobs []model.Job, id string) int {
+	if id == "" {
+		return -1
+	}
+	for index := range jobs {
+		if jobs[index].ID == id {
+			return index
+		}
+	}
+	return -1
+}
+
+// persistCandidate serializes writes and validates the queue revision before
+// and after Save. The disk write is deliberately outside c.mu so a slow fsync
+// cannot stall upload progress callbacks; callers retry with a fresh candidate
+// when a concurrent durable update is detected.
+func (c *Controller) persistCandidate(jobs []model.Job, channel model.Channel, paused bool, revision uint64) error {
+	if c.store == nil {
+		return nil
+	}
+	c.persistMu.Lock()
+	defer c.persistMu.Unlock()
+	c.mu.RLock()
+	if c.queueRevision != revision {
+		c.mu.RUnlock()
+		return errQueueChanged
+	}
+	copyJobs := cloneJobsForPersistence(jobs)
+	c.mu.RUnlock()
+	if err := c.store.Save(copyJobs, channel, paused); err != nil {
+		return err
+	}
+	c.mu.RLock()
+	changed := c.queueRevision != revision
+	c.mu.RUnlock()
+	if changed {
+		return errQueueChanged
+	}
+	return nil
+}
+
+func cloneJobsForPersistence(jobs []model.Job) []model.Job {
+	copyJobs := append([]model.Job(nil), jobs...)
+	for i := range copyJobs {
+		if jobs[i].StartedAt != nil {
+			started := *jobs[i].StartedAt
+			copyJobs[i].StartedAt = &started
+		}
+		if jobs[i].CompletedAt != nil {
+			completed := *jobs[i].CompletedAt
+			copyJobs[i].CompletedAt = &completed
+		}
+	}
+	return copyJobs
+}
+
+// commitCandidate publishes a candidate only if the revision used to persist
+// it is still current. The caller must not hold c.mu.
+func (c *Controller) commitCandidate(jobs []model.Job, folder string, revision uint64) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.queueRevision != revision {
+		return false
+	}
+	c.preserveActiveProgressLocked(jobs)
+	c.jobs = cloneJobsForPersistence(jobs)
+	if folder != "" || len(jobs) == 0 {
+		c.folder = folder
+	}
+	c.queueRevision++
+	c.lastError = ""
+	c.notifyLocked()
+	return true
+}
+
+// commitRemovalCandidate atomically publishes a durably saved structural
+// deletion and records cancellation of the selected active job. Keeping these
+// actions under one lock prevents an active job from reaching a terminal state
+// in the gap between the queue commit and the pending-removal marker.
+func (c *Controller) commitRemovalCandidate(
+	jobs []model.Job,
+	folder string,
+	revision uint64,
+	selected map[string]struct{},
+) (bool, []string, context.CancelFunc) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.queueRevision != revision {
+		return false, nil, nil
+	}
+	c.preserveActiveProgressLocked(jobs)
+	c.jobs = cloneJobsForPersistence(jobs)
+	if folder != "" || len(jobs) == 0 {
+		c.folder = folder
+	}
+	c.queueRevision++
+	c.lastError = ""
+	pending, cancel := c.requestActiveRemovalLocked(selected)
+	if len(pending) == 0 {
+		c.notifyLocked()
+	}
+	return true, pending, cancel
+}
+
+func (c *Controller) preserveActiveProgressLocked(jobs []model.Job) {
+	// Progress callbacks intentionally do not advance queueRevision. Preserve
+	// the current active record when a structural edit was prepared from an
+	// earlier snapshot, otherwise an edit completing just after Save could
+	// roll Uploaded/BytesPerSecond/attempt state back to stale values.
+	if c.activeID != "" {
+		if currentIndex := findJobIndexLocked(c.jobs, c.activeID); currentIndex >= 0 {
+			for index := range jobs {
+				if jobs[index].ID == c.activeID {
+					// Only progress fields are intentionally omitted from
+					// queueRevision. Keep the candidate's Position and all
+					// durable state so deletion/reindex edits remain coherent.
+					jobs[index].Uploaded = c.jobs[currentIndex].Uploaded
+					jobs[index].BytesPerSecond = c.jobs[currentIndex].BytesPerSecond
+					break
+				}
+			}
+		}
+	}
+}
+
 func reindexJobs(jobs []model.Job) bool {
 	changed := false
 	for index := range jobs {
@@ -756,43 +996,49 @@ func (c *Controller) ApplyUploadLimit(maxBytes int64) error {
 	}
 	defer c.opMu.Unlock()
 
-	c.mu.Lock()
-	if c.running {
-		c.mu.Unlock()
-		return errors.New("上传进行中，不能更新文件上限")
-	}
-	changed := false
-	for i := range c.jobs {
-		job := &c.jobs[i]
-		switch job.State {
-		case model.JobQueued, model.JobInterrupted, model.JobOversize:
-		default:
-			continue
-		}
-		if job.Size > maxBytes {
-			if job.State != model.JobOversize || job.Uploaded != 0 {
-				job.State = model.JobOversize
+	for {
+		c.mu.RLock()
+		jobs := cloneJobsForPersistence(c.jobs)
+		channel := c.channel
+		paused := c.paused
+		folder := c.folder
+		revision := c.queueRevision
+		c.mu.RUnlock()
+
+		changed := false
+		for i := range jobs {
+			job := &jobs[i]
+			switch job.State {
+			case model.JobQueued, model.JobInterrupted, model.JobOversize:
+			default:
+				continue
+			}
+			if job.Size > maxBytes {
+				if job.State != model.JobOversize || job.Uploaded != 0 {
+					job.State = model.JobOversize
+					resetPendingJobProgress(job)
+					changed = true
+				}
+			} else if job.State == model.JobOversize {
+				job.State = model.JobQueued
 				resetPendingJobProgress(job)
 				changed = true
 			}
-		} else if job.State == model.JobOversize {
-			job.State = model.JobQueued
-			resetPendingJobProgress(job)
-			changed = true
+		}
+		if !changed {
+			return nil
+		}
+		if err := c.persistCandidate(jobs, channel, paused, revision); err != nil {
+			if errors.Is(err, errQueueChanged) {
+				continue
+			}
+			c.setPersistenceError(err)
+			return err
+		}
+		if c.commitCandidate(jobs, folder, revision) {
+			return nil
 		}
 	}
-	if changed {
-		c.notifyLocked()
-	}
-	c.mu.Unlock()
-	if !changed {
-		return nil
-	}
-	if err := c.persist(); err != nil {
-		c.setPersistenceError(err)
-		return err
-	}
-	return nil
 }
 
 func resetPendingJobProgress(job *model.Job) {
@@ -812,40 +1058,57 @@ func (c *Controller) SetChannel(channel model.Channel) error {
 		return errors.New("上传、扫描或移动操作正在进行，请稍后重试")
 	}
 	defer c.opMu.Unlock()
-	c.mu.Lock()
-	if c.running {
+	for {
+		c.mu.RLock()
+		if c.running {
+			c.mu.RUnlock()
+			return errors.New("上传进行中，不能切换频道")
+		}
+		jobs := cloneJobsForPersistence(c.jobs)
+		paused := c.paused
+		revision := c.queueRevision
+		c.mu.RUnlock()
+		if err := c.persistCandidate(jobs, channel, paused, revision); err != nil {
+			if errors.Is(err, errQueueChanged) {
+				continue
+			}
+			c.setPersistenceError(err)
+			return err
+		}
+		c.mu.Lock()
+		if c.queueRevision != revision {
+			c.mu.Unlock()
+			continue
+		}
+		c.channel = channel
+		c.queueRevision++
+		c.lastError = ""
+		c.notifyLocked()
 		c.mu.Unlock()
-		return errors.New("上传进行中，不能切换频道")
+		return nil
 	}
-	c.channel = channel
-	c.notifyLocked()
-	c.mu.Unlock()
-	return c.persist()
 }
 
 func (c *Controller) Start(parent context.Context) error {
 	if !c.opMu.TryLock() {
-		return errors.New("上传、扫描或移动操作正在进行，请稍后重试")
+		return errors.New("另一个队列操作正在准备，请稍后重试")
 	}
+	defer c.opMu.Unlock()
 	c.mu.Lock()
 	if c.running {
 		c.mu.Unlock()
-		c.opMu.Unlock()
 		return errors.New("上传队列已经在运行")
 	}
 	if c.gateway == nil {
 		c.mu.Unlock()
-		c.opMu.Unlock()
 		return errors.New("请先连接 Telegram Bot")
 	}
 	if c.channel.ID == 0 {
 		c.mu.Unlock()
-		c.opMu.Unlock()
 		return errors.New("请先绑定目标频道")
 	}
 	if !hasRunnableJob(c.jobs) {
 		c.mu.Unlock()
-		c.opMu.Unlock()
 		return errors.New("队列中没有待上传视频")
 	}
 	wasPaused := c.paused || c.pauseRequested
@@ -853,6 +1116,7 @@ func (c *Controller) Start(parent context.Context) error {
 		c.paused = false
 		c.pauseRequested = false
 		c.pauseRevision++
+		c.queueRevision++
 	}
 	startPauseRevision := c.pauseRevision
 	if parent == nil {
@@ -876,6 +1140,7 @@ func (c *Controller) Start(parent context.Context) error {
 		if wasPaused && c.pauseRevision == startPauseRevision {
 			c.paused = true
 			c.pauseRevision++
+			c.queueRevision++
 		}
 		// A pause request is transient and only meaningful while Running is
 		// true. Preserve any newer paused intent, but normalize its view.
@@ -883,7 +1148,6 @@ func (c *Controller) Start(parent context.Context) error {
 		c.lastError = err.Error()
 		c.notifyLocked()
 		c.mu.Unlock()
-		c.opMu.Unlock()
 		return fmt.Errorf("保存上传队列失败：%w", err)
 	}
 	go c.runQueue(ctx)
@@ -948,11 +1212,10 @@ func (c *Controller) runQueue(ctx context.Context) {
 		if err := c.persist(); err != nil {
 			c.setPersistenceError(err)
 		}
-		c.opMu.Unlock()
 	}()
 
 	for {
-		index, job, channel, ok := c.nextJob()
+		job, channel, ok := c.nextJob()
 		if !ok {
 			return
 		}
@@ -961,12 +1224,11 @@ func (c *Controller) runQueue(ctx context.Context) {
 		}
 
 		jobCtx, jobCancel := context.WithCancel(ctx)
-		messageID, err := c.uploadJobWithRetry(jobCtx, index, job, channel, jobCancel)
+		messageID, err := c.uploadJobWithRetry(jobCtx, job, channel, jobCancel)
 		jobContextCancelled := jobCtx.Err() != nil
 
 		c.mu.Lock()
 		c.activeCancel = nil
-		c.activeID = ""
 		c.activeAttempt = 0
 		c.retryWaitActive = false
 		cancelCurrent := c.cancelJobID == job.ID
@@ -978,27 +1240,22 @@ func (c *Controller) runQueue(ctx context.Context) {
 		jobCancel()
 
 		if err != nil {
-			if errors.Is(err, errQueuePaused) {
-				c.mu.Lock()
-				if index >= 0 && index < len(c.jobs) && c.jobs[index].ID == job.ID &&
-					(c.jobs[index].State == model.JobUploading || c.jobs[index].State == model.JobSending) {
-					c.jobs[index].State = model.JobInterrupted
-					c.jobs[index].BytesPerSecond = 0
-					c.jobs[index].Error = "队列已暂停，可重新开始当前任务"
-					c.notifyLocked()
-				}
-				c.mu.Unlock()
-				if persistErr := c.persist(); persistErr != nil {
-					c.setPersistenceError(persistErr)
-				}
-				return
+			if errors.Is(err, errQueueJobCancelled) || errors.Is(err, errQueueJobNotRunnable) {
+				c.finishActiveJob(job.ID)
+				continue
 			}
 			if errors.Is(err, tgtransport.ErrSendOutcomeUnknown) {
 				c.mu.Lock()
-				c.jobs[index].State = model.JobConfirming
-				c.jobs[index].BytesPerSecond = 0
-				c.jobs[index].Error = "消息可能已经送达；请先检查频道，再选择“已发送”或“重试”"
-				c.lastError = c.jobs[index].Error
+				if current := findJobIndexLocked(c.jobs, job.ID); current >= 0 {
+					c.jobs[current].State = model.JobConfirming
+					c.jobs[current].BytesPerSecond = 0
+					c.jobs[current].Error = "消息可能已经送达；请先检查频道，再选择“已发送”或“重试”"
+					c.lastError = c.jobs[current].Error
+				}
+				// An unknown outcome must stay visible for manual confirmation;
+				// never delete it merely because the user clicked Remove.
+				delete(c.pendingRemoval, job.ID)
+				c.queueRevision++
 				c.notifyLocked()
 				c.mu.Unlock()
 				if persistErr := c.persist(); persistErr != nil {
@@ -1006,65 +1263,194 @@ func (c *Controller) runQueue(ctx context.Context) {
 				}
 				return
 			}
+			if errors.Is(err, errQueuePaused) {
+				jobContextCancelled = true
+			}
 			if errors.Is(err, errQueuePersistenceLost) {
-				c.failJob(index, job.ID, err)
+				c.clearPendingRemoval(job.ID)
+				_ = c.failJob(job.ID, err)
 				return
 			}
 			if jobContextCancelled || cancelCurrent || cancelAll || ctx.Err() != nil {
 				c.mu.Lock()
-				if index < 0 || index >= len(c.jobs) || c.jobs[index].ID != job.ID {
-					c.mu.Unlock()
-					return
-				}
-				if cancelCurrent || cancelAll {
-					c.jobs[index].State = model.JobCancelled
-					c.jobs[index].Error = ""
-				} else {
-					c.jobs[index].State = model.JobInterrupted
-					if c.paused || c.pauseRequested {
-						c.jobs[index].Error = "队列已暂停，可重新开始当前任务"
+				current := findJobIndexLocked(c.jobs, job.ID)
+				if current >= 0 {
+					if cancelCurrent || cancelAll {
+						c.jobs[current].State = model.JobCancelled
+						c.jobs[current].Error = ""
 					} else {
-						c.jobs[index].Error = "程序关闭或连接中断，可重新开始上传"
+						c.jobs[current].State = model.JobInterrupted
+						if c.paused || c.pauseRequested {
+							c.jobs[current].Error = "队列已暂停，可重新开始当前任务"
+						} else {
+							c.jobs[current].Error = "程序关闭或连接中断，可重新开始上传"
+						}
 					}
+					c.jobs[current].BytesPerSecond = 0
+					c.queueRevision++
+					c.notifyLocked()
 				}
-				c.jobs[index].BytesPerSecond = 0
-				c.notifyLocked()
 				c.mu.Unlock()
 				if persistErr := c.persist(); persistErr != nil {
+					c.clearPendingRemoval(job.ID)
 					c.setPersistenceError(persistErr)
+					c.finishActiveJob(job.ID)
+					return
+				} else if c.finishActiveJobUnlessPending(job.ID) {
+					if removeErr := c.removeAfterTerminalPersist(job.ID); removeErr != nil {
+						c.setPersistenceError(removeErr)
+					}
+					c.finishActiveJob(job.ID)
 				}
 				if ctx.Err() != nil {
 					return
 				}
 				continue
 			}
-			c.failJob(index, job.ID, err)
+			if persistErr := c.failJob(job.ID, err); persistErr != nil {
+				c.clearPendingRemoval(job.ID)
+				c.finishActiveJob(job.ID)
+				return
+			}
+			if c.finishActiveJobUnlessPending(job.ID) {
+				if removeErr := c.removeAfterTerminalPersist(job.ID); removeErr != nil {
+					c.setPersistenceError(removeErr)
+					c.finishActiveJob(job.ID)
+					return
+				}
+				c.finishActiveJob(job.ID)
+			}
 			continue
 		}
 
 		completed := time.Now()
 		c.mu.Lock()
-		c.jobs[index].State = model.JobSent
-		c.jobs[index].Uploaded = c.jobs[index].Size
-		c.jobs[index].MessageID = messageID
-		c.jobs[index].ChannelID = channel.ID
-		c.jobs[index].CompletedAt = &completed
-		c.jobs[index].Error = ""
+		current := findJobIndexLocked(c.jobs, job.ID)
+		if current < 0 {
+			c.mu.Unlock()
+			continue
+		}
+		c.jobs[current].State = model.JobSent
+		c.jobs[current].Uploaded = c.jobs[current].Size
+		c.jobs[current].MessageID = messageID
+		c.jobs[current].ChannelID = channel.ID
+		c.jobs[current].CompletedAt = &completed
+		c.jobs[current].Error = ""
+		c.queueRevision++
 		c.notifyLocked()
 		c.mu.Unlock()
 		if err := c.persist(); err != nil {
+			c.clearPendingRemoval(job.ID)
 			c.mu.Lock()
 			c.lastError = "消息已发送，但保存本地状态失败：" + err.Error()
 			c.notifyLocked()
 			c.mu.Unlock()
 			return
 		}
+		if c.finishActiveJobUnlessPending(job.ID) {
+			if removeErr := c.removeAfterTerminalPersist(job.ID); removeErr != nil {
+				c.setPersistenceError(removeErr)
+				c.finishActiveJob(job.ID)
+				return
+			}
+			c.finishActiveJob(job.ID)
+		}
+	}
+}
+
+// finishActiveJobUnlessPending atomically closes an active job only when a
+// concurrent removal request has not arrived. If it returns true, the caller
+// keeps the active identity until removeAfterTerminalPersist finishes.
+func (c *Controller) finishActiveJobUnlessPending(id string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.activeID != id {
+		return false
+	}
+	if _, pending := c.pendingRemoval[id]; pending {
+		return true
+	}
+	c.clearActiveJobLocked(id)
+	c.notifyLocked()
+	return false
+}
+
+func (c *Controller) finishActiveJob(id string) {
+	c.mu.Lock()
+	if c.activeID == id {
+		c.clearActiveJobLocked(id)
+		c.notifyLocked()
+	}
+	c.mu.Unlock()
+}
+
+func (c *Controller) clearActiveJobLocked(id string) {
+	c.activeID = ""
+	c.activeCancel = nil
+	c.activeAttempt = 0
+	c.retryWaitActive = false
+	if c.cancelJobID == id {
+		c.cancelJobID = ""
+	}
+}
+
+func (c *Controller) clearPendingRemoval(id string) {
+	c.mu.Lock()
+	if _, ok := c.pendingRemoval[id]; ok {
+		delete(c.pendingRemoval, id)
+		c.notifyLocked()
+	}
+	c.mu.Unlock()
+}
+
+// removeAfterTerminalPersist performs the destructive local queue edit only
+// after the terminal state (Sent, Cancelled, Interrupted, or Failed) has been durably saved. The
+// filtered candidate is persisted before it is published, so a failed write
+// leaves the terminal record visible and recoverable.
+func (c *Controller) removeAfterTerminalPersist(id string) error {
+	for {
+		c.mu.RLock()
+		current := cloneJobsForPersistence(c.jobs)
+		revision := c.queueRevision
+		channel := c.channel
+		paused := c.paused
+		folder := c.folder
+		index := findJobIndexLocked(current, id)
+		c.mu.RUnlock()
+		if index < 0 {
+			c.clearPendingRemoval(id)
+			return nil
+		}
+		remaining, _ := filteredJobs(current, func(job model.Job) bool { return job.ID == id })
+		if err := c.persistCandidate(remaining, channel, paused, revision); err != nil {
+			if errors.Is(err, errQueueChanged) {
+				continue
+			}
+			c.clearPendingRemoval(id)
+			return err
+		}
+		c.mu.Lock()
+		if c.queueRevision != revision {
+			c.mu.Unlock()
+			continue
+		}
+		c.jobs = cloneJobsForPersistence(remaining)
+		delete(c.pendingRemoval, id)
+		if len(c.jobs) == 0 {
+			c.folder = ""
+		} else {
+			c.folder = folder
+		}
+		c.queueRevision++
+		c.lastError = ""
+		c.notifyLocked()
+		c.mu.Unlock()
+		return nil
 	}
 }
 
 func (c *Controller) uploadJobWithRetry(
 	ctx context.Context,
-	index int,
 	job model.Job,
 	channel model.Channel,
 	cancel context.CancelFunc,
@@ -1075,6 +1461,9 @@ func (c *Controller) uploadJobWithRetry(
 		}
 		if c.queuePaused() {
 			return 0, errQueuePaused
+		}
+		if retryIndex == 0 && c.beforeUploadAttempt != nil {
+			c.beforeUploadAttempt(job)
 		}
 
 		// Reopen and revalidate the source for every attempt. Telegram uploads
@@ -1104,15 +1493,26 @@ func (c *Controller) uploadJobWithRetry(
 			_ = file.Close()
 			return 0, errQueuePaused
 		}
-		if index < 0 || index >= len(c.jobs) || c.jobs[index].ID != job.ID {
+		currentIndex := findJobIndexLocked(c.jobs, job.ID)
+		if currentIndex < 0 {
 			c.mu.Unlock()
 			_ = file.Close()
-			return 0, errors.New("上传队列在运行期间发生了变化")
+			return 0, errQueueJobNotRunnable
 		}
-		current := &c.jobs[index]
+		current := &c.jobs[currentIndex]
 		validState := retryIndex == 0 && (current.State == model.JobQueued || current.State == model.JobInterrupted) ||
 			retryIndex > 0 && (current.State == model.JobUploading || current.State == model.JobSending)
 		if !validState {
+			if current.State == model.JobCancelled {
+				c.mu.Unlock()
+				_ = file.Close()
+				return 0, errQueueJobCancelled
+			}
+			if retryIndex == 0 {
+				c.mu.Unlock()
+				_ = file.Close()
+				return 0, errQueueJobNotRunnable
+			}
 			c.mu.Unlock()
 			_ = file.Close()
 			return 0, fmt.Errorf("任务状态已变为 %s，停止上传", current.State)
@@ -1131,6 +1531,7 @@ func (c *Controller) uploadJobWithRetry(
 		attemptID := c.attemptRevision
 		c.activeAttempt = attemptID
 		c.retryWaitActive = false
+		c.queueRevision++
 		c.notifyLocked()
 		c.mu.Unlock()
 		if err := c.persist(); err != nil {
@@ -1172,10 +1573,10 @@ func (c *Controller) uploadJobWithRetry(
 				RandomID: job.RandomID,
 				Metadata: metadata,
 				BeforeSend: func() error {
-					return c.prepareSendForAttempt(index, job.ID, attemptID)
+					return c.prepareSendForAttempt(job.ID, attemptID)
 				},
 			}, func(progress model.Progress) {
-				c.applyProgressForAttempt(index, job.ID, attemptID, progress)
+				c.applyProgressForAttempt(job.ID, attemptID, progress)
 			})
 			err = uploadErr
 			if err == nil {
@@ -1203,7 +1604,7 @@ func (c *Controller) uploadJobWithRetry(
 		}
 
 		delay := c.uploadRetryDelays[retryIndex]
-		if err := c.waitBeforeUploadRetry(ctx, index, job.ID, err, delay, retryIndex+1); err != nil {
+		if err := c.waitBeforeUploadRetry(ctx, job.ID, err, delay, retryIndex+1); err != nil {
 			return 0, err
 		}
 	}
@@ -1211,7 +1612,6 @@ func (c *Controller) uploadJobWithRetry(
 
 func (c *Controller) waitBeforeUploadRetry(
 	ctx context.Context,
-	index int,
 	jobID string,
 	uploadErr error,
 	delay time.Duration,
@@ -1230,14 +1630,16 @@ func (c *Controller) waitBeforeUploadRetry(
 		c.mu.Unlock()
 		return errQueuePaused
 	}
-	if index < 0 || index >= len(c.jobs) || c.jobs[index].ID != jobID {
+	if findJobIndexLocked(c.jobs, jobID) < 0 {
 		c.mu.Unlock()
 		return errors.New("上传队列在重试期间发生了变化")
 	}
-	c.jobs[index].State = model.JobUploading
-	c.jobs[index].Uploaded = 0
-	c.jobs[index].BytesPerSecond = 0
-	c.jobs[index].Error = retryMessage
+	current := findJobIndexLocked(c.jobs, jobID)
+	c.jobs[current].State = model.JobUploading
+	c.jobs[current].Uploaded = 0
+	c.jobs[current].BytesPerSecond = 0
+	c.jobs[current].Error = retryMessage
+	c.queueRevision++
 	c.retryWaitActive = true
 	c.notifyLocked()
 	c.mu.Unlock()
@@ -1307,18 +1709,18 @@ func (c *Controller) queuePaused() bool {
 	return c.paused || c.pauseRequested
 }
 
-func (c *Controller) nextJob() (int, model.Job, model.Channel, bool) {
+func (c *Controller) nextJob() (model.Job, model.Channel, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	if c.paused || c.pauseRequested {
-		return 0, model.Job{}, model.Channel{}, false
+		return model.Job{}, model.Channel{}, false
 	}
-	for i, job := range c.jobs {
+	for _, job := range c.jobs {
 		if job.State == model.JobQueued || job.State == model.JobInterrupted {
-			return i, job, c.channel, true
+			return job, c.channel, true
 		}
 	}
-	return 0, model.Job{}, model.Channel{}, false
+	return model.Job{}, model.Channel{}, false
 }
 
 func captionFromFilename(name string) string {
@@ -1329,13 +1731,14 @@ func captionFromFilename(name string) string {
 	return name
 }
 
-func (c *Controller) applyProgress(index int, jobID string, progress model.Progress) {
-	c.applyProgressForAttempt(index, jobID, 0, progress)
+func (c *Controller) applyProgress(jobID string, progress model.Progress) {
+	c.applyProgressForAttempt(jobID, 0, progress)
 }
 
-func (c *Controller) applyProgressForAttempt(index int, jobID string, attemptID uint64, progress model.Progress) {
+func (c *Controller) applyProgressForAttempt(jobID string, attemptID uint64, progress model.Progress) {
 	c.mu.Lock()
-	if index < 0 || index >= len(c.jobs) || c.jobs[index].ID != jobID {
+	currentIndex := findJobIndexLocked(c.jobs, jobID)
+	if currentIndex < 0 {
 		c.mu.Unlock()
 		return
 	}
@@ -1343,7 +1746,7 @@ func (c *Controller) applyProgressForAttempt(index int, jobID string, attemptID 
 		c.mu.Unlock()
 		return
 	}
-	job := &c.jobs[index]
+	job := &c.jobs[currentIndex]
 	if job.State != model.JobUploading && job.State != model.JobSending {
 		c.mu.Unlock()
 		return
@@ -1361,9 +1764,10 @@ func (c *Controller) applyProgressForAttempt(index int, jobID string, attemptID 
 	c.mu.Unlock()
 }
 
-func (c *Controller) prepareSendForAttempt(index int, jobID string, attemptID uint64) error {
+func (c *Controller) prepareSendForAttempt(jobID string, attemptID uint64) error {
 	c.mu.Lock()
-	if index < 0 || index >= len(c.jobs) || c.jobs[index].ID != jobID {
+	currentIndex := findJobIndexLocked(c.jobs, jobID)
+	if currentIndex < 0 {
 		c.mu.Unlock()
 		return errors.New("消息提交前上传队列发生了变化")
 	}
@@ -1371,7 +1775,7 @@ func (c *Controller) prepareSendForAttempt(index int, jobID string, attemptID ui
 		c.mu.Unlock()
 		return errors.New("消息提交前上传任务已失效")
 	}
-	job := &c.jobs[index]
+	job := &c.jobs[currentIndex]
 	if job.State != model.JobUploading && job.State != model.JobSending {
 		state := job.State
 		c.mu.Unlock()
@@ -1384,6 +1788,7 @@ func (c *Controller) prepareSendForAttempt(index int, jobID string, attemptID ui
 	job.State = model.JobSending
 	job.Uploaded = job.Size
 	job.BytesPerSecond = 0
+	c.queueRevision++
 	c.notifyLocked()
 	c.mu.Unlock()
 
@@ -1398,19 +1803,22 @@ func (c *Controller) prepareSendForAttempt(index int, jobID string, attemptID ui
 	return nil
 }
 
-func (c *Controller) failJob(index int, jobID string, err error) {
+func (c *Controller) failJob(jobID string, err error) error {
 	c.mu.Lock()
-	if index >= 0 && index < len(c.jobs) && c.jobs[index].ID == jobID {
-		c.jobs[index].State = model.JobFailed
-		c.jobs[index].BytesPerSecond = 0
-		c.jobs[index].Error = err.Error()
+	if currentIndex := findJobIndexLocked(c.jobs, jobID); currentIndex >= 0 {
+		c.jobs[currentIndex].State = model.JobFailed
+		c.jobs[currentIndex].BytesPerSecond = 0
+		c.jobs[currentIndex].Error = err.Error()
+		c.queueRevision++
 	}
 	c.lastError = err.Error()
 	c.notifyLocked()
 	c.mu.Unlock()
 	if persistErr := c.persist(); persistErr != nil {
 		c.setPersistenceError(persistErr)
+		return persistErr
 	}
+	return nil
 }
 
 func (c *Controller) setPersistenceError(err error) {
@@ -1423,157 +1831,194 @@ func (c *Controller) setPersistenceError(err error) {
 	c.mu.Unlock()
 }
 
-func (c *Controller) CancelJob(id string) error {
-	// Active uploads must remain cancellable while Start owns opMu. Handle that
-	// path first, then take opMu for mutations of the durable idle queue.
-	c.mu.Lock()
-	for i := range c.jobs {
-		if c.jobs[i].ID == id && (c.jobs[i].State == model.JobUploading || c.jobs[i].State == model.JobSending) {
-			if c.activeID == id && c.activeCancel != nil {
-				c.cancelJobID = id
-				c.activeCancel()
-				c.mu.Unlock()
-				return nil
+func (c *Controller) persistJobMutation(id string, before model.Job, revision uint64) error {
+	if err := c.persist(); err != nil {
+		c.mu.Lock()
+		if c.queueRevision == revision {
+			if index := findJobIndexLocked(c.jobs, id); index >= 0 {
+				c.jobs[index] = before
+				c.queueRevision++
+				c.notifyLocked()
 			}
+		}
+		c.mu.Unlock()
+		c.setPersistenceError(err)
+		return err
+	}
+	return nil
+}
+
+func (c *Controller) CancelJob(id string) error {
+	if id == "" {
+		return errors.New("任务 ID 不能为空")
+	}
+	var cancel context.CancelFunc
+	c.mu.Lock()
+	index := findJobIndexLocked(c.jobs, id)
+	if index < 0 {
+		c.mu.Unlock()
+		return errors.New("没有找到上传任务")
+	}
+	if _, pending := c.pendingRemoval[id]; pending {
+		c.mu.Unlock()
+		return errors.New("该任务正在取消并删除")
+	}
+	if (c.jobs[index].State == model.JobUploading || c.jobs[index].State == model.JobSending) && c.activeID == id {
+		if c.activeCancel == nil {
 			c.mu.Unlock()
 			return errors.New("该任务当前无法取消")
 		}
+		c.cancelJobID = id
+		cancel = c.activeCancel
+		c.notifyLocked()
+		c.mu.Unlock()
+		cancel()
+		return nil
 	}
-	c.mu.Unlock()
-
-	if !c.opMu.TryLock() {
-		return errors.New("上传、扫描或移动操作正在进行，请稍后重试")
+	switch c.jobs[index].State {
+	case model.JobQueued, model.JobInterrupted, model.JobFailed, model.JobSkipped:
+		before := c.jobs[index]
+		c.jobs[index].State = model.JobCancelled
+		c.jobs[index].Error = ""
+		c.queueRevision++
+		revision := c.queueRevision
+		c.notifyLocked()
+		c.mu.Unlock()
+		return c.persistJobMutation(id, before, revision)
+	default:
+		c.mu.Unlock()
+		return errors.New("该任务已经结束或等待人工确认")
 	}
-	defer c.opMu.Unlock()
-	c.mu.Lock()
-	for i := range c.jobs {
-		if c.jobs[i].ID != id {
-			continue
-		}
-		switch c.jobs[i].State {
-		case model.JobQueued, model.JobInterrupted, model.JobFailed, model.JobSkipped:
-			c.jobs[i].State = model.JobCancelled
-			c.jobs[i].Error = ""
-			c.notifyLocked()
-			c.mu.Unlock()
-			return c.persist()
-		default:
-			c.mu.Unlock()
-			return errors.New("该任务已经结束")
-		}
-	}
-	c.mu.Unlock()
-	return errors.New("没有找到上传任务")
 }
 
 func (c *Controller) CancelAll() error {
-	c.mu.Lock()
-	if !c.running {
-		c.mu.Unlock()
-		if !c.opMu.TryLock() {
-			return errors.New("上传、扫描或移动操作正在进行，请稍后重试")
+	for {
+		c.mu.RLock()
+		jobs := cloneJobsForPersistence(c.jobs)
+		channel := c.channel
+		folder := c.folder
+		revision := c.queueRevision
+		c.mu.RUnlock()
+
+		for i := range jobs {
+			switch jobs[i].State {
+			case model.JobQueued, model.JobInterrupted, model.JobFailed, model.JobSkipped:
+				jobs[i].State = model.JobCancelled
+				jobs[i].Error = ""
+			}
 		}
-		defer c.opMu.Unlock()
+
+		// Save the non-active cancellation states before publishing them or
+		// interrupting the current transfer. If durable storage is unavailable,
+		// the caller gets an error and both memory and queue.json retain the
+		// pre-cancellation state instead of disagreeing after a restart.
+		if err := c.persistCandidate(jobs, channel, false, revision); err != nil {
+			if errors.Is(err, errQueueChanged) {
+				continue
+			}
+			c.setPersistenceError(err)
+			return err
+		}
+
+		var cancel context.CancelFunc
 		c.mu.Lock()
-	}
-	c.pauseRevision++
-	c.paused = false
-	c.pauseRequested = false
-	c.cancelAllRequested = true
-	if c.allCancel != nil {
-		c.allCancel()
-	}
-	for i := range c.jobs {
-		switch c.jobs[i].State {
-		case model.JobQueued, model.JobInterrupted, model.JobFailed, model.JobSkipped:
-			c.jobs[i].State = model.JobCancelled
-			c.jobs[i].Error = ""
+		if c.queueRevision != revision {
+			c.mu.Unlock()
+			continue
 		}
+		c.preserveActiveProgressLocked(jobs)
+		c.jobs = cloneJobsForPersistence(jobs)
+		if folder != "" || len(jobs) == 0 {
+			c.folder = folder
+		}
+		c.pauseRevision++
+		c.paused = false
+		c.pauseRequested = false
+		c.cancelAllRequested = true
+		cancel = c.allCancel
+		c.queueRevision++
+		c.lastError = ""
+		c.notifyLocked()
+		c.mu.Unlock()
+		if cancel != nil {
+			cancel()
+		}
+		return nil
 	}
-	c.notifyLocked()
-	c.mu.Unlock()
-	return c.persist()
 }
 
 func (c *Controller) Retry(id string) error {
-	if !c.opMu.TryLock() {
-		return errors.New("上传、扫描或移动操作正在进行，请稍后重试")
-	}
-	defer c.opMu.Unlock()
 	c.mu.Lock()
-	if c.running {
+	index := findJobIndexLocked(c.jobs, id)
+	if index < 0 {
 		c.mu.Unlock()
-		return errors.New("请先等待当前队列停止")
+		return errors.New("没有找到上传任务")
 	}
-	nextJobs := append([]model.Job(nil), c.jobs...)
-	channel := c.channel
-	paused := c.paused
-	c.mu.Unlock()
-	for i := range nextJobs {
-		if nextJobs[i].ID != id {
-			continue
-		}
-		switch nextJobs[i].State {
-		case model.JobFailed, model.JobInterrupted, model.JobCancelled, model.JobSkipped, model.JobConfirming:
-			nextJobs[i].State = model.JobQueued
-			resetPendingJobProgress(&nextJobs[i])
-			if err := c.saveSnapshot(nextJobs, channel, paused); err != nil {
-				c.setPersistenceError(err)
-				return err
-			}
-			c.mu.Lock()
-			c.jobs = nextJobs
-			c.lastError = ""
-			c.notifyLocked()
-			c.mu.Unlock()
-			return nil
-		default:
-			return errors.New("该任务当前不能重试")
-		}
+	if _, pending := c.pendingRemoval[id]; pending {
+		c.mu.Unlock()
+		return errors.New("该任务正在取消并删除")
 	}
-	return errors.New("没有找到上传任务")
+	if c.jobs[index].ID == c.activeID && (c.jobs[index].State == model.JobUploading || c.jobs[index].State == model.JobSending) {
+		c.mu.Unlock()
+		return errors.New("当前上传任务不能重试，请先取消")
+	}
+	switch c.jobs[index].State {
+	case model.JobFailed, model.JobInterrupted, model.JobCancelled, model.JobSkipped, model.JobConfirming:
+		before := c.jobs[index]
+		resetPendingJobProgress(&c.jobs[index])
+		c.jobs[index].State = model.JobQueued
+		c.queueRevision++
+		revision := c.queueRevision
+		c.lastError = ""
+		c.notifyLocked()
+		c.mu.Unlock()
+		return c.persistJobMutation(id, before, revision)
+	default:
+		c.mu.Unlock()
+		return errors.New("该任务当前不能重试")
+	}
 }
 
 func (c *Controller) Skip(id string) error {
-	if !c.opMu.TryLock() {
-		return errors.New("上传、扫描或移动操作正在进行，请稍后重试")
-	}
-	defer c.opMu.Unlock()
 	c.mu.Lock()
-	if c.running {
+	index := findJobIndexLocked(c.jobs, id)
+	if _, pending := c.pendingRemoval[id]; pending {
 		c.mu.Unlock()
-		return errors.New("请先等待当前队列停止")
+		return errors.New("该任务正在取消并删除")
 	}
-	for i := range c.jobs {
-		if c.jobs[i].ID == id && (c.jobs[i].State == model.JobFailed || c.jobs[i].State == model.JobConfirming) {
-			c.jobs[i].State = model.JobSkipped
-			c.jobs[i].Error = ""
-			c.notifyLocked()
-			c.mu.Unlock()
-			return c.persist()
-		}
+	if index >= 0 && c.jobs[index].ID != c.activeID && (c.jobs[index].State == model.JobFailed || c.jobs[index].State == model.JobConfirming) {
+		before := c.jobs[index]
+		c.jobs[index].State = model.JobSkipped
+		c.jobs[index].Error = ""
+		c.queueRevision++
+		revision := c.queueRevision
+		c.notifyLocked()
+		c.mu.Unlock()
+		return c.persistJobMutation(id, before, revision)
 	}
 	c.mu.Unlock()
 	return errors.New("该任务当前不能跳过")
 }
 
 func (c *Controller) MarkSent(id string) error {
-	if !c.opMu.TryLock() {
-		return errors.New("上传、扫描或移动操作正在进行，请稍后重试")
-	}
-	defer c.opMu.Unlock()
 	c.mu.Lock()
-	for i := range c.jobs {
-		if c.jobs[i].ID == id && c.jobs[i].State == model.JobConfirming {
-			now := time.Now()
-			c.jobs[i].State = model.JobSent
-			c.jobs[i].Uploaded = c.jobs[i].Size
-			c.jobs[i].CompletedAt = &now
-			c.jobs[i].Error = ""
-			c.notifyLocked()
-			c.mu.Unlock()
-			return c.persist()
-		}
+	index := findJobIndexLocked(c.jobs, id)
+	if _, pending := c.pendingRemoval[id]; pending {
+		c.mu.Unlock()
+		return errors.New("该任务正在取消并删除")
+	}
+	if index >= 0 && c.jobs[index].State == model.JobConfirming {
+		before := c.jobs[index]
+		now := time.Now()
+		c.jobs[index].State = model.JobSent
+		c.jobs[index].Uploaded = c.jobs[index].Size
+		c.jobs[index].CompletedAt = &now
+		c.jobs[index].Error = ""
+		c.queueRevision++
+		revision := c.queueRevision
+		c.notifyLocked()
+		c.mu.Unlock()
+		return c.persistJobMutation(id, before, revision)
 	}
 	c.mu.Unlock()
 	return errors.New("该任务不处于待确认状态")
@@ -1654,12 +2099,14 @@ func (c *Controller) MoveOversize(ctx context.Context, destinationDir string, on
 		c.jobs[current.index].State = model.JobMoving
 		c.jobs[current.index].MoveDestination = current.destination
 		c.jobs[current.index].Error = ""
+		c.queueRevision++
 		c.notifyLocked()
 		c.mu.Unlock()
 		if err := c.persist(); err != nil {
 			c.mu.Lock()
 			c.jobs[current.index].State = model.JobOversize
 			c.jobs[current.index].MoveDestination = ""
+			c.queueRevision++
 			c.notifyLocked()
 			c.mu.Unlock()
 			return fmt.Errorf("保存移动意图失败：%w", err)
@@ -1678,6 +2125,7 @@ func (c *Controller) MoveOversize(ctx context.Context, destinationDir string, on
 			c.jobs[current.index].State = model.JobOversize
 			c.jobs[current.index].MoveDestination = ""
 			c.jobs[current.index].Error = err.Error()
+			c.queueRevision++
 			c.notifyLocked()
 			c.mu.Unlock()
 			if persistErr := c.persist(); persistErr != nil {
@@ -1693,6 +2141,7 @@ func (c *Controller) MoveOversize(ctx context.Context, destinationDir string, on
 		c.jobs[current.index].MoveDestination = ""
 		c.jobs[current.index].CompletedAt = &now
 		c.jobs[current.index].Error = ""
+		c.queueRevision++
 		c.notifyLocked()
 		c.mu.Unlock()
 		if err := c.persist(); err != nil {
@@ -1722,23 +2171,31 @@ func (c *Controller) persist() error {
 	if c.store == nil {
 		return nil
 	}
-	c.persistMu.Lock()
-	defer c.persistMu.Unlock()
-	c.mu.RLock()
-	jobs := append([]model.Job(nil), c.jobs...)
-	channel := c.channel
-	paused := c.paused
-	c.mu.RUnlock()
-	return c.store.Save(jobs, channel, paused)
+	for {
+		c.mu.RLock()
+		jobs := cloneJobsForPersistence(c.jobs)
+		channel := c.channel
+		paused := c.paused
+		revision := c.queueRevision
+		c.mu.RUnlock()
+		err := c.persistCandidate(jobs, channel, paused, revision)
+		if errors.Is(err, errQueueChanged) {
+			continue
+		}
+		return err
+	}
 }
 
 func (c *Controller) saveSnapshot(jobs []model.Job, channel model.Channel, paused bool) error {
+	// Kept for file-move and compatibility paths that already own a complete
+	// snapshot. New queue edits use persistCandidate so they can publish only
+	// after a revision-checked write.
 	if c.store == nil {
 		return nil
 	}
 	c.persistMu.Lock()
 	defer c.persistMu.Unlock()
-	return c.store.Save(append([]model.Job(nil), jobs...), channel, paused)
+	return c.store.Save(cloneJobsForPersistence(jobs), channel, paused)
 }
 
 func (c *Controller) notifyLocked() {
@@ -1768,6 +2225,13 @@ func (c *Controller) snapshotLocked() Snapshot {
 		PauseRequested: c.pauseRequested,
 		ActiveID:       c.activeID,
 		LastError:      c.lastError,
+	}
+	if len(c.pendingRemoval) > 0 {
+		snapshot.PendingRemovalIDs = make([]string, 0, len(c.pendingRemoval))
+		for id := range c.pendingRemoval {
+			snapshot.PendingRemovalIDs = append(snapshot.PendingRemovalIDs, id)
+		}
+		sort.Strings(snapshot.PendingRemovalIDs)
 	}
 	for _, job := range jobs {
 		total, done := jobProgressBytes(job)
