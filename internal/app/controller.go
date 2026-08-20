@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jayden/telegram-video-uploader/internal/diagnostics"
 	"github.com/jayden/telegram-video-uploader/internal/media"
 	"github.com/jayden/telegram-video-uploader/internal/model"
 	"github.com/jayden/telegram-video-uploader/internal/mover"
@@ -40,6 +41,10 @@ type Snapshot struct {
 	// can explain why the active file is still moving.
 	PauseRequested bool
 	ActiveID       string
+	// ActiveAttempt identifies the current upload attempt for ActiveID. It is
+	// part of structural snapshots so consumers can discard progress callbacks
+	// that belong to a previous retry of the same job.
+	ActiveAttempt uint64
 	// PendingRemovalIDs contains active jobs for which the user requested a
 	// removal. The IDs are intentionally not persisted: they describe an
 	// in-flight cancellation and are rebuilt only for the lifetime of the
@@ -50,6 +55,17 @@ type Snapshot struct {
 	TotalBytes        int64
 	BytesPerSecond    float64
 	ETA               time.Duration
+}
+
+// ProgressUpdate is the lightweight, non-structural update emitted while a
+// file is being uploaded. Unlike Snapshot it never contains the complete
+// queue. The controller keeps only the newest update because intermediate
+// byte counters have no value once a newer counter is available.
+type ProgressUpdate struct {
+	JobID          string
+	AttemptID      uint64
+	Uploaded       int64
+	BytesPerSecond float64
 }
 
 // RemovalResult describes a queue removal request. Removed is the number of
@@ -106,11 +122,13 @@ type Controller struct {
 	activeAttempt      uint64
 	attemptRevision    uint64
 	allCancel          context.CancelFunc
+	runDone            chan struct{}
 	cancelJobID        string
 	cancelAllRequested bool
 	retryWaitActive    bool
 	pendingRemoval     map[string]struct{}
 	updates            chan Snapshot
+	progressUpdates    chan ProgressUpdate
 	uploadRetryDelays  []time.Duration
 	uploadRetryWait    func(context.Context, time.Duration) error
 	// beforeUploadAttempt is a deterministic test seam for the narrow interval
@@ -142,6 +160,7 @@ func NewController(store QueueStore, fileMover *mover.Mover) *Controller {
 		store:             store,
 		mover:             fileMover,
 		updates:           make(chan Snapshot, 1),
+		progressUpdates:   make(chan ProgressUpdate, 1),
 		pendingRemoval:    make(map[string]struct{}),
 		uploadRetryDelays: append([]time.Duration(nil), defaultUploadRetryDelays...),
 		uploadRetryWait:   waitForUploadRetry,
@@ -174,6 +193,47 @@ func (c *Controller) SetGateway(gateway tgtransport.Gateway) {
 }
 
 func (c *Controller) Updates() <-chan Snapshot { return c.updates }
+
+// ProgressUpdates returns a single-slot stream containing the newest byte
+// counter for the active upload. Structural queue changes continue to use
+// Updates and therefore retain their complete-snapshot semantics.
+func (c *Controller) ProgressUpdates() <-chan ProgressUpdate { return c.progressUpdates }
+
+// WaitStopped waits until the active queue goroutine has completed its final
+// state transition and persistence pass. It lets the desktop shutdown path
+// distinguish a fully drained queue from a process that is about to exit while
+// cleanup is still in flight.
+func (c *Controller) WaitStopped(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	c.mu.RLock()
+	done := c.runDone
+	c.mu.RUnlock()
+	if done == nil {
+		return nil
+	}
+	// Prefer an already completed queue over a simultaneously cancelled
+	// caller context. This makes a zero-budget shutdown check deterministic.
+	select {
+	case <-done:
+		return nil
+	default:
+	}
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		// Completion may race the deadline between the optimistic check above
+		// and this select. Prefer a fully drained queue in that boundary case.
+		select {
+		case <-done:
+			return nil
+		default:
+		}
+		return ctx.Err()
+	}
+}
 
 func (c *Controller) Snapshot() Snapshot {
 	c.mu.RLock()
@@ -858,6 +918,7 @@ func (c *Controller) persistCandidate(jobs []model.Job, channel model.Channel, p
 		return errQueueChanged
 	}
 	copyJobs := cloneJobsForPersistence(jobs)
+	c.preserveActiveProgressLocked(copyJobs)
 	c.mu.RUnlock()
 	if err := c.store.Save(copyJobs, channel, paused); err != nil {
 		return err
@@ -1095,9 +1156,9 @@ func (c *Controller) Start(parent context.Context) error {
 	}
 	defer c.opMu.Unlock()
 	c.mu.Lock()
-	if c.running {
+	if c.running || c.runDone != nil {
 		c.mu.Unlock()
-		return errors.New("上传队列已经在运行")
+		return errors.New("上传队列正在运行或完成清理")
 	}
 	if c.gateway == nil {
 		c.mu.Unlock()
@@ -1123,8 +1184,10 @@ func (c *Controller) Start(parent context.Context) error {
 		parent = context.Background()
 	}
 	ctx, cancel := context.WithCancel(parent)
+	runDone := make(chan struct{})
 	c.running = true
 	c.allCancel = cancel
+	c.runDone = runDone
 	c.cancelJobID = ""
 	c.cancelAllRequested = false
 	c.lastError = ""
@@ -1137,6 +1200,7 @@ func (c *Controller) Start(parent context.Context) error {
 		c.mu.Lock()
 		c.running = false
 		c.allCancel = nil
+		c.runDone = nil
 		if wasPaused && c.pauseRevision == startPauseRevision {
 			c.paused = true
 			c.pauseRevision++
@@ -1147,10 +1211,12 @@ func (c *Controller) Start(parent context.Context) error {
 		c.pauseRequested = false
 		c.lastError = err.Error()
 		c.notifyLocked()
+		close(runDone)
 		c.mu.Unlock()
 		return fmt.Errorf("保存上传队列失败：%w", err)
 	}
-	go c.runQueue(ctx)
+	_ = diagnostics.Logf("queue_start jobs=%d", len(c.Snapshot().Jobs))
+	go c.runQueue(ctx, cancel)
 	return nil
 }
 
@@ -1192,7 +1258,10 @@ func openVerifiedJob(job model.Job) (*os.File, model.VideoMetadata, error) {
 	return file, metadata, nil
 }
 
-func (c *Controller) runQueue(ctx context.Context) {
+func (c *Controller) runQueue(ctx context.Context, cancel context.CancelFunc) {
+	c.mu.RLock()
+	runDone := c.runDone
+	c.mu.RUnlock()
 	defer func() {
 		c.mu.Lock()
 		c.running = false
@@ -1212,6 +1281,16 @@ func (c *Controller) runQueue(ctx context.Context) {
 		if err := c.persist(); err != nil {
 			c.setPersistenceError(err)
 		}
+		cancel()
+		if runDone != nil {
+			c.mu.Lock()
+			close(runDone)
+			if c.runDone == runDone {
+				c.runDone = nil
+			}
+			c.mu.Unlock()
+		}
+		_ = diagnostics.Logf("queue_stop")
 	}()
 
 	for {
@@ -1224,6 +1303,7 @@ func (c *Controller) runQueue(ctx context.Context) {
 		}
 
 		jobCtx, jobCancel := context.WithCancel(ctx)
+		_ = diagnostics.Logf("job_start id=%s position=%d size=%d", job.ID, job.Position, job.Size)
 		messageID, err := c.uploadJobWithRetry(jobCtx, job, channel, jobCancel)
 		jobContextCancelled := jobCtx.Err() != nil
 
@@ -1240,6 +1320,13 @@ func (c *Controller) runQueue(ctx context.Context) {
 		jobCancel()
 
 		if err != nil {
+			_ = diagnostics.Logf(
+				"job_attempt_end id=%s success=false error_type=%T cancelled=%t outcome_unknown=%t",
+				job.ID,
+				err,
+				errors.Is(err, context.Canceled),
+				errors.Is(err, tgtransport.ErrSendOutcomeUnknown),
+			)
 			if errors.Is(err, errQueueJobCancelled) || errors.Is(err, errQueueJobNotRunnable) {
 				c.finishActiveJob(job.ID)
 				continue
@@ -1324,6 +1411,7 @@ func (c *Controller) runQueue(ctx context.Context) {
 		}
 
 		completed := time.Now()
+		_ = diagnostics.Logf("job_sent id=%s message_id=%d", job.ID, messageID)
 		c.mu.Lock()
 		current := findJobIndexLocked(c.jobs, job.ID)
 		if current < 0 {
@@ -1503,7 +1591,8 @@ func (c *Controller) uploadJobWithRetry(
 		validState := retryIndex == 0 && (current.State == model.JobQueued || current.State == model.JobInterrupted) ||
 			retryIndex > 0 && (current.State == model.JobUploading || current.State == model.JobSending)
 		if !validState {
-			if current.State == model.JobCancelled {
+			currentState := current.State
+			if currentState == model.JobCancelled {
 				c.mu.Unlock()
 				_ = file.Close()
 				return 0, errQueueJobCancelled
@@ -1515,7 +1604,7 @@ func (c *Controller) uploadJobWithRetry(
 			}
 			c.mu.Unlock()
 			_ = file.Close()
-			return 0, fmt.Errorf("任务状态已变为 %s，停止上传", current.State)
+			return 0, fmt.Errorf("任务状态已变为 %s，停止上传", currentState)
 		}
 		current.Metadata = metadata
 		current.State = model.JobUploading
@@ -1534,6 +1623,7 @@ func (c *Controller) uploadJobWithRetry(
 		c.queueRevision++
 		c.notifyLocked()
 		c.mu.Unlock()
+		_ = diagnostics.Logf("upload_attempt_start id=%s attempt=%d retry=%d", job.ID, attemptID, retryIndex)
 		if err := c.persist(); err != nil {
 			_ = file.Close()
 			return 0, fmt.Errorf("%w：保存上传状态失败：%v", errQueuePersistenceLost, err)
@@ -1604,6 +1694,14 @@ func (c *Controller) uploadJobWithRetry(
 		}
 
 		delay := c.uploadRetryDelays[retryIndex]
+		_ = diagnostics.Logf(
+			"upload_retry_wait id=%s retry=%d max_retries=%d delay_ms=%d error_type=%T",
+			job.ID,
+			retryIndex+1,
+			len(c.uploadRetryDelays),
+			delay.Milliseconds(),
+			err,
+		)
 		if err := c.waitBeforeUploadRetry(ctx, job.ID, err, delay, retryIndex+1); err != nil {
 			return 0, err
 		}
@@ -1760,7 +1858,12 @@ func (c *Controller) applyProgressForAttempt(jobID string, attemptID uint64, pro
 	}
 	job.Uploaded = progress.BytesDone
 	job.BytesPerSecond = progress.BytesPerSecond
-	c.notifyLocked()
+	c.notifyProgressLocked(ProgressUpdate{
+		JobID:          jobID,
+		AttemptID:      attemptID,
+		Uploaded:       job.Uploaded,
+		BytesPerSecond: job.BytesPerSecond,
+	})
 	c.mu.Unlock()
 }
 
@@ -1806,12 +1909,25 @@ func (c *Controller) prepareSendForAttempt(jobID string, attemptID uint64) error
 func (c *Controller) failJob(jobID string, err error) error {
 	c.mu.Lock()
 	if currentIndex := findJobIndexLocked(c.jobs, jobID); currentIndex >= 0 {
-		c.jobs[currentIndex].State = model.JobFailed
+		cancelled := c.jobs[currentIndex].State == model.JobCancelled ||
+			c.cancelAllRequested || c.cancelJobID == jobID
+		if cancelled {
+			// A cancellation can be durably committed after runQueue captured its
+			// earlier flags but before this stale failure path acquires c.mu. Never
+			// let that older error overwrite the user's newer cancellation.
+			c.jobs[currentIndex].State = model.JobCancelled
+			c.jobs[currentIndex].Error = ""
+			c.lastError = ""
+		} else {
+			c.jobs[currentIndex].State = model.JobFailed
+			c.jobs[currentIndex].Error = err.Error()
+			c.lastError = err.Error()
+		}
 		c.jobs[currentIndex].BytesPerSecond = 0
-		c.jobs[currentIndex].Error = err.Error()
 		c.queueRevision++
+	} else {
+		c.lastError = err.Error()
 	}
-	c.lastError = err.Error()
 	c.notifyLocked()
 	c.mu.Unlock()
 	if persistErr := c.persist(); persistErr != nil {
@@ -1892,6 +2008,20 @@ func (c *Controller) CancelJob(id string) error {
 }
 
 func (c *Controller) CancelAll() error {
+	// If Start is still durably saving the queue (or the runner is between
+	// jobs), there is no active Telegram request to protect. Cancel the queue
+	// context immediately so the runner cannot begin a new file in the window
+	// before the revision-safe cancellation save below completes.
+	c.mu.RLock()
+	var cancelBeforeActive context.CancelFunc
+	if c.running && c.activeID == "" {
+		cancelBeforeActive = c.allCancel
+	}
+	c.mu.RUnlock()
+	if cancelBeforeActive != nil {
+		cancelBeforeActive()
+	}
+
 	for {
 		c.mu.RLock()
 		jobs := cloneJobsForPersistence(c.jobs)
@@ -2214,6 +2344,31 @@ func (c *Controller) notifyLocked() {
 	}
 }
 
+// notifyProgressLocked publishes only the newest upload progress. This runs
+// while c.mu is held and intentionally never blocks an upload callback. A
+// full progress history is unnecessary: the UI and other observers can safely
+// render the latest monotonic byte counter.
+func (c *Controller) notifyProgressLocked(update ProgressUpdate) {
+	if c.progressUpdates == nil {
+		// Controllers constructed as zero values are used by a few focused tests;
+		// retain their old in-memory behavior without panicking.
+		return
+	}
+	select {
+	case c.progressUpdates <- update:
+		return
+	default:
+	}
+	select {
+	case <-c.progressUpdates:
+	default:
+	}
+	select {
+	case c.progressUpdates <- update:
+	default:
+	}
+}
+
 func (c *Controller) snapshotLocked() Snapshot {
 	jobs := append([]model.Job(nil), c.jobs...)
 	snapshot := Snapshot{
@@ -2224,6 +2379,7 @@ func (c *Controller) snapshotLocked() Snapshot {
 		Paused:         c.paused,
 		PauseRequested: c.pauseRequested,
 		ActiveID:       c.activeID,
+		ActiveAttempt:  c.activeAttempt,
 		LastError:      c.lastError,
 	}
 	if len(c.pendingRemoval) > 0 {

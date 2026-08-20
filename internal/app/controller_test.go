@@ -1591,6 +1591,143 @@ func TestControllerCancelAllCancelsActiveAndPendingJobs(t *testing.T) {
 	}
 }
 
+func TestControllerFailureCannotOverwriteConcurrentCancellation(t *testing.T) {
+	tests := []struct {
+		name          string
+		state         model.JobState
+		cancelAll     bool
+		cancelJobID   string
+		wantLastError string
+	}{
+		{name: "already cancelled", state: model.JobCancelled},
+		{name: "cancel all committed", state: model.JobUploading, cancelAll: true},
+		{name: "single job cancellation", state: model.JobUploading, cancelJobID: "job-1"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			jobs, _ := fixtureJobs(t, []fixtureJob{{Name: "cancel-race.mp4", RandomID: 7431, State: test.state}})
+			store := &memoryQueueStore{jobs: jobs, channel: testChannel()}
+			controller := newLoadedController(t, store, &fakeGateway{})
+			controller.cancelAllRequested = test.cancelAll
+			controller.cancelJobID = test.cancelJobID
+
+			if err := controller.failJob(jobs[0].ID, errors.New("stale upload failure")); err != nil {
+				t.Fatalf("failJob() error = %v", err)
+			}
+			snapshot := controller.Snapshot()
+			if got := snapshot.Jobs[0]; got.State != model.JobCancelled || got.Error != "" {
+				t.Fatalf("job after stale failure = %+v, want cancelled without error", got)
+			}
+			if snapshot.LastError != test.wantLastError {
+				t.Fatalf("LastError = %q, want %q", snapshot.LastError, test.wantLastError)
+			}
+			if got := store.SnapshotJobs()[0]; got.State != model.JobCancelled || got.Error != "" {
+				t.Fatalf("persisted job after stale failure = %+v, want cancelled without error", got)
+			}
+		})
+	}
+}
+
+func TestPersistCandidateIncludesLatestActiveProgress(t *testing.T) {
+	jobs, _ := fixtureJobs(t, []fixtureJob{{Name: "active-progress.mp4", RandomID: 7432, State: model.JobUploading}})
+	store := &memoryQueueStore{jobs: jobs, channel: testChannel()}
+	controller := newLoadedController(t, store, &fakeGateway{})
+	controller.mu.Lock()
+	controller.activeID = jobs[0].ID
+	controller.jobs[0].Uploaded = 80
+	controller.jobs[0].BytesPerSecond = 12
+	revision := controller.queueRevision
+	stale := cloneJobs(controller.jobs)
+	stale[0].Uploaded = 10
+	stale[0].BytesPerSecond = 2
+	channel := controller.channel
+	paused := controller.paused
+	controller.mu.Unlock()
+
+	if err := controller.persistCandidate(stale, channel, paused, revision); err != nil {
+		t.Fatalf("persistCandidate() error = %v", err)
+	}
+	persisted := store.SnapshotJobs()
+	if got := persisted[0]; got.Uploaded != 80 || got.BytesPerSecond != 12 {
+		t.Fatalf("persisted active progress = %d at %v B/s, want 80 at 12 B/s", got.Uploaded, got.BytesPerSecond)
+	}
+}
+
+func TestControllerWaitStoppedIncludesFinalPersistence(t *testing.T) {
+	jobs, _ := fixtureJobs(t, []fixtureJob{{Name: "wait-stopped.mp4", RandomID: 7441}})
+	activateSaveBlock := make(chan struct{})
+	releaseSave := make(chan struct{})
+	saveEntered := make(chan struct{}, 1)
+	store := &memoryQueueStore{jobs: jobs, channel: testChannel()}
+	store.saveHook = func([]model.Job) {
+		select {
+		case <-activateSaveBlock:
+			select {
+			case saveEntered <- struct{}{}:
+			default:
+			}
+			<-releaseSave
+		default:
+		}
+	}
+
+	gateway := &fakeGateway{}
+	started := make(chan struct{})
+	allowUploadReturn := make(chan struct{})
+	var startedOnce sync.Once
+	gateway.upload = func(ctx context.Context, _ tgtransport.UploadRequest, _ func(model.Progress)) (int, error) {
+		startedOnce.Do(func() { close(started) })
+		<-ctx.Done()
+		<-allowUploadReturn
+		return 0, ctx.Err()
+	}
+
+	controller := newLoadedController(t, store, gateway)
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := controller.WaitStopped(cancelled); err != nil {
+		t.Fatalf("WaitStopped() while idle = %v, want nil", err)
+	}
+	if err := controller.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	select {
+	case <-started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for active upload")
+	}
+	if err := controller.WaitStopped(cancelled); !errors.Is(err, context.Canceled) {
+		t.Fatalf("WaitStopped() while running = %v, want context.Canceled", err)
+	}
+	if err := controller.CancelAll(); err != nil {
+		t.Fatalf("CancelAll() error = %v", err)
+	}
+	close(activateSaveBlock)
+	close(allowUploadReturn)
+	select {
+	case <-saveEntered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for final persistence")
+	}
+	if err := controller.WaitStopped(cancelled); !errors.Is(err, context.Canceled) {
+		t.Fatalf("WaitStopped() during final persistence = %v, want context.Canceled", err)
+	}
+	close(releaseSave)
+	waitCtx, waitCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer waitCancel()
+	if err := controller.WaitStopped(waitCtx); err != nil {
+		t.Fatalf("WaitStopped() after persistence = %v", err)
+	}
+	snapshot := controller.Snapshot()
+	if snapshot.Running || len(snapshot.Jobs) != 1 || snapshot.Jobs[0].State != model.JobCancelled {
+		t.Fatalf("final snapshot = %+v, want stopped cancelled job", snapshot)
+	}
+	persisted := store.SnapshotJobs()
+	if len(persisted) != 1 || persisted[0].State != model.JobCancelled {
+		t.Fatalf("persisted jobs = %+v, want cancelled job", persisted)
+	}
+}
+
 func TestControllerParentCancellationMarksActiveJobInterrupted(t *testing.T) {
 	jobs, _ := fixtureJobs(t, []fixtureJob{{Name: "parent-cancel.mp4", RandomID: 7451}})
 	store := &memoryQueueStore{jobs: jobs, channel: testChannel()}
@@ -1621,6 +1758,46 @@ func TestControllerParentCancellationMarksActiveJobInterrupted(t *testing.T) {
 	})
 	if final.Jobs[0].Error == "" {
 		t.Fatal("interrupted job error is empty, want recovery guidance")
+	}
+}
+
+func TestControllerRunQueueCancelsContextAfterNaturalCompletion(t *testing.T) {
+	jobs, _ := fixtureJobs(t, []fixtureJob{{Name: "natural-context-cleanup.mp4", RandomID: 7452}})
+	controller := newLoadedController(t, &memoryQueueStore{jobs: jobs, channel: testChannel()}, &fakeGateway{})
+
+	cancelled := make(chan struct{})
+	go controller.runQueue(context.Background(), func() {
+		close(cancelled)
+	})
+
+	select {
+	case <-cancelled:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for natural queue completion cancellation")
+	}
+	if snapshot := controller.Snapshot(); snapshot.Running || snapshot.Jobs[0].State != model.JobSent {
+		t.Fatalf("snapshot after natural queue completion = %+v, want stopped sent queue", snapshot)
+	}
+}
+
+func TestControllerRunQueueCancelsContextAfterEarlyReturn(t *testing.T) {
+	jobs, _ := fixtureJobs(t, []fixtureJob{{Name: "early-context-cleanup.mp4", RandomID: 7453}})
+	controller := newLoadedController(t, &memoryQueueStore{jobs: jobs, channel: testChannel()}, &fakeGateway{})
+
+	ctx, cancelParent := context.WithCancel(context.Background())
+	cancelParent()
+	cancelled := make(chan struct{})
+	go controller.runQueue(ctx, func() {
+		close(cancelled)
+	})
+
+	select {
+	case <-cancelled:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for early queue return cancellation")
+	}
+	if snapshot := controller.Snapshot(); snapshot.Running {
+		t.Fatalf("snapshot after early queue return = %+v, want stopped queue", snapshot)
 	}
 }
 
@@ -1707,6 +1884,41 @@ func TestControllerIgnoresProgressFromPreviousRetryAttempt(t *testing.T) {
 	})
 	if got := controller.Snapshot().Jobs[0]; got.Uploaded != 25 || got.BytesPerSecond != 50 {
 		t.Fatalf("current attempt progress = %+v, want 25 bytes at 50 B/s", got)
+	}
+}
+
+func TestControllerProgressUsesLatestSingleSlotWithoutSnapshot(t *testing.T) {
+	controller := NewController(nil, nil)
+	controller.jobs = []model.Job{{ID: "job", Size: 100, State: model.JobUploading}}
+	controller.activeID = "job"
+	controller.activeAttempt = 7
+
+	for _, uploaded := range []int64{10, 40, 80} {
+		controller.applyProgressForAttempt("job", 7, model.Progress{
+			BytesDone:      uploaded,
+			BytesTotal:     100,
+			BytesPerSecond: float64(uploaded),
+			At:             time.Now(),
+		})
+	}
+
+	select {
+	case <-controller.Updates():
+		t.Fatal("pure progress unexpectedly emitted a complete snapshot")
+	default:
+	}
+	select {
+	case got := <-controller.ProgressUpdates():
+		if got.JobID != "job" || got.AttemptID != 7 || got.Uploaded != 80 || got.BytesPerSecond != 80 {
+			t.Fatalf("latest progress = %+v, want job attempt 7 at 80 bytes and 80 B/s", got)
+		}
+	default:
+		t.Fatal("pure progress did not emit a lightweight update")
+	}
+	select {
+	case <-controller.ProgressUpdates():
+		t.Fatal("progress channel retained an older update")
+	default:
 	}
 }
 
