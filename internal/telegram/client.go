@@ -21,6 +21,7 @@ import (
 	"github.com/gotd/td/tg"
 	"golang.org/x/net/proxy"
 
+	"github.com/jayden/telegram-video-uploader/internal/buildinfo"
 	"github.com/jayden/telegram-video-uploader/internal/model"
 )
 
@@ -47,10 +48,24 @@ type Client struct {
 	readyOnce sync.Once
 	doneOnce  sync.Once
 
+	// requestMu protects the admission gate for API requests. A request is
+	// counted while holding requestMu before Run is allowed to wait on
+	// requestWG; this makes the stop path immune to an Add/Wait race.
+	requestMu         sync.Mutex
+	requestCtx        context.Context
+	requestCancel     context.CancelFunc
+	requestWG         sync.WaitGroup
+	requestStopDone   chan struct{}
+	acceptingRequests bool
+
 	bindingMu         sync.RWMutex
 	bindingCode       string
 	bindingGeneration uint64
-	binding           chan BindingEvent
+	// bindingValidationGeneration is the binding generation whose validation
+	// task is currently in flight. It prevents repeated Telegram updates for
+	// the same code from multiplying validation goroutines.
+	bindingValidationGeneration uint64
+	binding                     chan BindingEvent
 
 	uploadSem chan struct{}
 	// uploadConcurrency is read once for each video. The connection pool is
@@ -126,7 +141,7 @@ func NewClient(cfg Config, events Events) (*Client, error) {
 		Device: gotdtelegram.DeviceConfig{
 			DeviceModel:    "Desktop",
 			SystemVersion:  "Windows/macOS",
-			AppVersion:     "1.2.0",
+			AppVersion:     buildinfo.Version,
 			SystemLangCode: "zh-Hans",
 			LangCode:       "zh-Hans",
 		},
@@ -234,7 +249,14 @@ func (c *Client) Run(ctx context.Context) (retErr error) {
 		if err != nil {
 			return fmt.Errorf("创建上传连接池失败：%w", err)
 		}
-		defer func() { _ = uploadPool.Close() }()
+		// The pool owns the connections used by both ValidateChannel and
+		// UploadVideo. Stop admitting requests, cancel their contexts, and wait
+		// for them to return before closing the pool. This is important when the
+		// gotd run loop exits while a large upload is still in flight.
+		defer func() {
+			c.stopRequestLifecycle()
+			_ = uploadPool.Close()
+		}()
 
 		username, _ := status.User.GetUsername()
 		c.mu.Lock()
@@ -243,6 +265,7 @@ func (c *Client) Run(ctx context.Context) (retErr error) {
 		c.runCtx = runCtx
 		c.identity = Identity{BotID: status.User.ID, Username: username, MaxUploadBytes: maxBytes, MaxUploadExact: maxUploadExact}
 		c.mu.Unlock()
+		c.startRequestLifecycle(runCtx)
 
 		return c.gaps.Run(runCtx, c.raw.API(), status.User.ID, updates.AuthOptions{
 			IsBot:  true,
@@ -252,6 +275,86 @@ func (c *Client) Run(ctx context.Context) (retErr error) {
 			},
 		})
 	})
+}
+
+// startRequestLifecycle opens the request admission gate for one gotd Run
+// callback. The callback owns the underlying upload connection pool, so its
+// context is the parent of every admitted API request.
+func (c *Client) startRequestLifecycle(runCtx context.Context) {
+	if runCtx == nil {
+		runCtx = context.Background()
+	}
+	lifetimeCtx, cancel := context.WithCancel(runCtx)
+	c.requestMu.Lock()
+	// Client.Run is one-shot, but keep this assignment self-contained so the
+	// lifecycle can also be exercised by deterministic unit tests.
+	c.requestCtx = lifetimeCtx
+	c.requestCancel = cancel
+	c.requestStopDone = make(chan struct{})
+	c.acceptingRequests = true
+	c.requestMu.Unlock()
+}
+
+// stopRequestLifecycle closes the admission gate before cancelling and
+// waiting for active requests. The gate remains closed after this method
+// returns, and the method is safe to call more than once.
+func (c *Client) stopRequestLifecycle() {
+	c.requestMu.Lock()
+	if !c.acceptingRequests && c.requestCancel == nil {
+		stopDone := c.requestStopDone
+		c.requestMu.Unlock()
+		if stopDone != nil {
+			<-stopDone
+		}
+		return
+	}
+	c.acceptingRequests = false
+	c.requestCtx = nil
+	cancel := c.requestCancel
+	c.requestCancel = nil
+	stopDone := c.requestStopDone
+	c.requestMu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+	c.requestWG.Wait()
+	if stopDone != nil {
+		close(stopDone)
+	}
+}
+
+// beginRequest admits one operation against the current Run callback. The
+// returned context is cancelled by either the caller or the Run lifecycle;
+// release must be called exactly once (normally via defer).
+func (c *Client) beginRequest(ctx context.Context) (context.Context, func(), error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	c.requestMu.Lock()
+	if !c.acceptingRequests || c.requestCtx == nil {
+		c.requestMu.Unlock()
+		return nil, nil, ErrNotConnected
+	}
+	lifetimeCtx := c.requestCtx
+	// Add is deliberately performed while requestMu is held. stopRequest-
+	// Lifecycle takes the same lock before it calls Wait, so no request can be
+	// added after the wait begins.
+	c.requestWG.Add(1)
+	c.requestMu.Unlock()
+
+	requestCtx, cancel := context.WithCancel(ctx)
+	stopCancel := context.AfterFunc(lifetimeCtx, cancel)
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() {
+			stopCancel()
+			cancel()
+			c.requestWG.Done()
+		})
+	}
+	return requestCtx, release, nil
 }
 
 func normalizeUploadConcurrency(value int) int {
@@ -339,20 +442,56 @@ func (c *Client) BeginChannelBinding() (string, error) {
 
 func (c *Client) BindingEvents() <-chan BindingEvent { return c.binding }
 
+func (c *Client) claimBindingValidation(message string) (string, uint64, bool) {
+	c.bindingMu.Lock()
+	defer c.bindingMu.Unlock()
+
+	code := c.bindingCode
+	generation := c.bindingGeneration
+	if code == "" || strings.TrimSpace(message) != code || c.bindingValidationGeneration == generation {
+		return "", 0, false
+	}
+	c.bindingValidationGeneration = generation
+	return code, generation, true
+}
+
+func (c *Client) releaseBindingValidation(generation uint64) {
+	c.bindingMu.Lock()
+	if c.bindingValidationGeneration == generation {
+		c.bindingValidationGeneration = 0
+	}
+	c.bindingMu.Unlock()
+}
+
+func (c *Client) bindingValidationContext() (context.Context, context.CancelFunc, bool) {
+	c.mu.RLock()
+	runCtx := c.runCtx
+	c.mu.RUnlock()
+	if runCtx == nil {
+		return nil, nil, false
+	}
+	validationCtx, cancel := context.WithTimeout(runCtx, 20*time.Second)
+	return validationCtx, cancel, true
+}
+
+func (c *Client) sendBindingEvent(event BindingEvent) {
+	select {
+	case c.binding <- event:
+	case <-c.runDone:
+	}
+}
+
 func (c *Client) onNewChannelMessage(ctx context.Context, entities tg.Entities, update *tg.UpdateNewChannelMessage) error {
 	message, ok := update.Message.(*tg.Message)
 	if !ok {
 		return nil
 	}
-	c.bindingMu.RLock()
-	code := c.bindingCode
-	generation := c.bindingGeneration
-	c.bindingMu.RUnlock()
-	if code == "" || strings.TrimSpace(message.Message) != code {
-		return nil
-	}
 	peer, ok := message.PeerID.(*tg.PeerChannel)
 	if !ok {
+		return nil
+	}
+	code, generation, claimed := c.claimBindingValidation(message.Message)
+	if !claimed {
 		return nil
 	}
 
@@ -373,13 +512,18 @@ func (c *Client) onNewChannelMessage(ctx context.Context, entities tg.Entities, 
 	}
 
 	go func(expected string, expectedGeneration uint64, ch model.Channel) {
+		defer c.releaseBindingValidation(expectedGeneration)
+
 		c.bindingMu.RLock()
 		current := c.bindingCode == expected && c.bindingGeneration == expectedGeneration
 		c.bindingMu.RUnlock()
 		if !current {
 			return
 		}
-		validateCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		validateCtx, cancel, ok := c.bindingValidationContext()
+		if !ok {
+			return
+		}
 		defer cancel()
 		resolved, err := c.ValidateChannel(validateCtx, ch)
 		c.bindingMu.Lock()
@@ -391,23 +535,25 @@ func (c *Client) onNewChannelMessage(ctx context.Context, entities tg.Entities, 
 		if !current {
 			return
 		}
-
-		c.mu.RLock()
-		runCtx := c.runCtx
-		c.mu.RUnlock()
-		var done <-chan struct{}
-		if runCtx != nil {
-			done = runCtx.Done()
-		}
-		select {
-		case c.binding <- BindingEvent{Channel: resolved, Err: err}:
-		case <-done:
-		}
+		c.sendBindingEvent(BindingEvent{Channel: resolved, Err: err})
 	}(code, generation, candidate)
 	return nil
 }
 
 func (c *Client) ValidateChannel(ctx context.Context, channel model.Channel) (model.Channel, error) {
+	requestCtx, release, err := c.beginRequest(ctx)
+	if err != nil {
+		return model.Channel{}, err
+	}
+	defer release()
+	return c.validateChannel(requestCtx, channel)
+}
+
+// validateChannel performs the actual API calls using an already-admitted
+// request context. UploadVideo uses this helper so channel validation and
+// message upload share one request-lifecycle reference and cannot race pool
+// shutdown between two separate admissions.
+func (c *Client) validateChannel(ctx context.Context, channel model.Channel) (model.Channel, error) {
 	api, err := c.connectedAPI()
 	if err != nil {
 		return model.Channel{}, err

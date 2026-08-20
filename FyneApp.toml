@@ -2,5 +2,8 @@
 [Details]
 Name = "Telegram Video Uploader"
 ID = "com.jayden.telegramvideouploader"
-Version = "1.2.0"
-Build = 3
+Version = "1.2.1"
+Build = 4
+
+[Migrations]
+fyneDo = true

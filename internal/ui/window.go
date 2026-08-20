@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -25,7 +26,9 @@ import (
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/widget"
 	coreapp "github.com/jayden/telegram-video-uploader/internal/app"
+	"github.com/jayden/telegram-video-uploader/internal/buildinfo"
 	"github.com/jayden/telegram-video-uploader/internal/credentials"
+	"github.com/jayden/telegram-video-uploader/internal/diagnostics"
 	"github.com/jayden/telegram-video-uploader/internal/model"
 	"github.com/jayden/telegram-video-uploader/internal/platform"
 	"github.com/jayden/telegram-video-uploader/internal/scanner"
@@ -35,6 +38,7 @@ import (
 const (
 	connectionRetryInitial = 5 * time.Second
 	connectionRetryMaximum = time.Minute
+	connectionStopTimeout  = 5 * time.Second
 )
 
 const (
@@ -99,9 +103,9 @@ func normalizeUploadConcurrency(value int) int {
 // the window is closed. A complete saved configuration is connected
 // automatically; first-run and configuration failures remain available from
 // the settings page without blocking queue management.
-func Run(controller *coreapp.Controller, paths coreapp.Paths, secrets *credentials.Store) {
+func Run(controller *coreapp.Controller, paths coreapp.Paths, secrets *credentials.Store) bool {
 	if controller == nil {
-		return
+		return false
 	}
 	if secrets == nil {
 		secrets = credentials.NewStore()
@@ -113,10 +117,31 @@ func Run(controller *coreapp.Controller, paths coreapp.Paths, secrets *credentia
 	u := newWindow(application, window, controller, paths, secrets, settings)
 	u.settingsLoadErr = settingsErr
 	u.build()
+	if diagnostics.PreviousRunUnclean() {
+		u.operationLabel.SetText("检测到上一次运行未正常结束；诊断日志已保留，可在“设置 → 关于”中打开")
+	}
 	u.startObservers()
 	u.window.Show()
 	u.autoConnectIfConfigured()
 	u.application.Run()
+	clean := u.isClosed()
+	if !clean {
+		// A native window/driver can end Fyne's event loop without invoking the
+		// close intercept. Always release the connection, scheduler and sleep
+		// guard, but preserve the durable queue as interrupted rather than
+		// rewriting every job as explicitly cancelled.
+		u.shutdown(false, false)
+	}
+	stopDeadline := time.Now().Add(connectionStopTimeout)
+	if !u.waitForController(time.Until(stopDeadline)) {
+		_ = diagnostics.Logf("queue_stop_timeout timeout_ms=%d", connectionStopTimeout.Milliseconds())
+		clean = false
+	}
+	if !u.waitForConnectionWorkers(time.Until(stopDeadline)) {
+		_ = diagnostics.Logf("telegram_workers_stop_timeout timeout_ms=%d", connectionStopTimeout.Milliseconds())
+		clean = false
+	}
+	return clean
 }
 
 type window struct {
@@ -150,6 +175,10 @@ type window struct {
 	// Telegram or replacing the transport implementation.
 	connectionStarter func(connectionRequest, bool, uint64)
 
+	connectionWorkerMu       sync.Mutex
+	connectionWorkers        sync.WaitGroup
+	connectionWorkersStopped bool
+
 	closedMu sync.RWMutex
 	closed   bool
 
@@ -164,6 +193,9 @@ type window struct {
 	snapshotDispatchMu     sync.Mutex
 	pendingSnapshot        coreapp.Snapshot
 	snapshotDispatchQueued bool
+	progressDispatchMu     sync.Mutex
+	pendingProgress        coreapp.ProgressUpdate
+	progressDispatchQueued bool
 
 	// Settings controls.
 	apiID                    *widget.Entry
@@ -279,6 +311,16 @@ func (u *window) build() {
 	uploadPerformanceHint := widget.NewLabel("高速档可能改善高延迟网络，也会使用更多连接；若速度没有提升，请使用均衡档。切换后从下一个视频生效。")
 	uploadPerformanceHint.Wrapping = fyne.TextWrapWord
 
+	repositoryURL, _ := url.Parse(buildinfo.RepositoryURL)
+	logDirectory := filepath.Join(u.paths.Root, "logs")
+	logDirectoryLabel := widget.NewLabel("诊断日志：" + logDirectory)
+	logDirectoryLabel.Wrapping = fyne.TextWrapWord
+	logPrivacyHint := widget.NewLabel("日志只保存在本机，不会自动上传；向他人发送 crash 日志前请先检查其中是否含有敏感内容。")
+	logPrivacyHint.Wrapping = fyne.TextWrapWord
+	lastRunStatus := "上一次运行：已正常结束或没有历史记录"
+	if diagnostics.PreviousRunUnclean() {
+		lastRunStatus = "上一次运行：未检测到正常关闭，相关日志已保留"
+	}
 	settingsPanel := container.NewVBox(
 		widget.NewLabelWithStyle("Telegram 连接", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
 		widget.NewSeparator(),
@@ -306,6 +348,15 @@ func (u *window) build() {
 		u.bindButton,
 		u.limit,
 		widget.NewLabel("提示：Bot 只需要目标频道的发帖权限，不会登录个人账号。"),
+		widget.NewSeparator(),
+		widget.NewLabelWithStyle("关于", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		widget.NewLabel(fmt.Sprintf("%s · v%s（build %d）", buildinfo.Name, buildinfo.Version, buildinfo.Build)),
+		widget.NewLabel("源码仓库"),
+		widget.NewHyperlink(buildinfo.RepositoryURL, repositoryURL),
+		widget.NewLabel(lastRunStatus),
+		logDirectoryLabel,
+		widget.NewButton("打开诊断日志文件夹", u.openLogDirectory),
+		logPrivacyHint,
 	)
 	settingsScroll := container.NewVScroll(settingsPanel)
 	settingsHeader := container.NewBorder(
@@ -879,6 +930,11 @@ func (u *window) observeController() {
 				return
 			}
 			u.dispatchControllerSnapshot(snapshot)
+		case progress, ok := <-u.controller.ProgressUpdates():
+			if !ok {
+				return
+			}
+			u.dispatchControllerProgress(progress)
 		case <-u.rootCtx.Done():
 			return
 		}
@@ -916,6 +972,129 @@ func (u *window) takeControllerSnapshot() (coreapp.Snapshot, bool) {
 	u.pendingSnapshot = coreapp.Snapshot{}
 	u.snapshotDispatchQueued = false
 	return snapshot, true
+}
+
+func (u *window) dispatchControllerProgress(progress coreapp.ProgressUpdate) {
+	if !u.enqueueControllerProgress(progress) {
+		return
+	}
+	u.doUI(func() {
+		if current, ok := u.takeControllerProgress(); ok {
+			u.applyProgressUpdate(current)
+		}
+	})
+}
+
+func (u *window) enqueueControllerProgress(progress coreapp.ProgressUpdate) bool {
+	u.progressDispatchMu.Lock()
+	defer u.progressDispatchMu.Unlock()
+	u.pendingProgress = progress
+	if u.progressDispatchQueued {
+		return false
+	}
+	u.progressDispatchQueued = true
+	return true
+}
+
+func (u *window) takeControllerProgress() (coreapp.ProgressUpdate, bool) {
+	u.progressDispatchMu.Lock()
+	defer u.progressDispatchMu.Unlock()
+	if !u.progressDispatchQueued {
+		return coreapp.ProgressUpdate{}, false
+	}
+	progress := u.pendingProgress
+	u.pendingProgress = coreapp.ProgressUpdate{}
+	u.progressDispatchQueued = false
+	return progress, true
+}
+
+// applyProgressUpdate updates the active row and aggregate counters without
+// cloning or walking the complete queue. Full snapshots remain authoritative
+// for structural/state changes and reset the local index when a retry or job
+// transition occurs.
+func (u *window) applyProgressUpdate(update coreapp.ProgressUpdate) {
+	if u.isClosed() || update.JobID == "" {
+		return
+	}
+	if u.snapshot.ActiveID != update.JobID {
+		return
+	}
+	// A zero ActiveAttempt is the retry-wait/no-active-upload boundary. Do not
+	// treat it as a wildcard: an old attempt arriving after that snapshot must
+	// be discarded just like an old attempt after a newer retry.
+	if update.AttemptID != u.snapshot.ActiveAttempt {
+		return
+	}
+	index, ok := u.queueIndex[update.JobID]
+	if !ok || index < 0 || index >= len(u.queueJobs) || index >= len(u.snapshot.Jobs) {
+		return
+	}
+	job := &u.queueJobs[index]
+	snapshotJob := &u.snapshot.Jobs[index]
+	if job.ID != update.JobID || snapshotJob.ID != update.JobID {
+		return
+	}
+	if (job.State != model.JobUploading && job.State != model.JobSending) ||
+		(snapshotJob.State != model.JobUploading && snapshotJob.State != model.JobSending) {
+		return
+	}
+	if update.Uploaded < job.Uploaded || update.Uploaded < snapshotJob.Uploaded {
+		return
+	}
+
+	oldUploaded := job.Uploaded
+	oldBytesPerSecond := job.BytesPerSecond
+	if oldUploaded < 0 {
+		oldUploaded = 0
+	}
+	if oldUploaded > job.Size && job.Size > 0 {
+		oldUploaded = job.Size
+	}
+	newUploaded := update.Uploaded
+	if newUploaded < 0 {
+		newUploaded = 0
+	}
+	if job.Size > 0 && newUploaded > job.Size {
+		newUploaded = job.Size
+	}
+	job.Uploaded = newUploaded
+	job.BytesPerSecond = update.BytesPerSecond
+	snapshotJob.Uploaded = newUploaded
+	snapshotJob.BytesPerSecond = update.BytesPerSecond
+
+	delta := newUploaded - oldUploaded
+	u.snapshot.DoneBytes += delta
+	if u.snapshot.DoneBytes < 0 {
+		u.snapshot.DoneBytes = 0
+	}
+	if u.snapshot.TotalBytes >= 0 && u.snapshot.DoneBytes > u.snapshot.TotalBytes {
+		u.snapshot.DoneBytes = u.snapshot.TotalBytes
+	}
+	u.snapshot.BytesPerSecond += update.BytesPerSecond - oldBytesPerSecond
+	if u.snapshot.BytesPerSecond < 0 {
+		u.snapshot.BytesPerSecond = 0
+	}
+	if u.snapshot.BytesPerSecond > 0 && u.snapshot.TotalBytes > u.snapshot.DoneBytes {
+		u.snapshot.ETA = time.Duration(float64(u.snapshot.TotalBytes-u.snapshot.DoneBytes)/u.snapshot.BytesPerSecond) * time.Second
+	} else {
+		u.snapshot.ETA = 0
+	}
+
+	state := u.queueRenderState[update.JobID]
+	state.Progress = jobFraction(*job)
+	state.Status = u.compactJobStatusForSnapshot(*job)
+	u.queueRenderState[update.JobID] = state
+	for _, row := range u.queueRowPool {
+		if row.boundID == update.JobID {
+			u.updateJobRow(row, *job)
+		}
+	}
+	if u.snapshot.TotalBytes > 0 {
+		u.progress.SetValue(float64(u.snapshot.DoneBytes) / float64(u.snapshot.TotalBytes))
+	} else {
+		u.progress.SetValue(0)
+	}
+	u.progressSummary.SetText(formatSummaryWithCompleted(u.snapshot, u.queueStats.Completed))
 }
 
 func (u *window) applySnapshot(snapshot coreapp.Snapshot) {
@@ -1264,6 +1443,13 @@ func (u *window) connectWithRequest(request connectionRequest, automatic bool) {
 	}
 	u.clientMu.Unlock()
 	u.stopConnectionRetryTimer()
+	_ = diagnostics.Logf(
+		"telegram_connect_requested generation=%d automatic=%t proxy=%t upload_concurrency=%d",
+		generation,
+		automatic,
+		request.proxyEnabled,
+		normalizeUploadConcurrency(request.uploadConcurrency),
+	)
 	u.connectButton.Disable()
 	if automatic {
 		u.connection.SetText("正在自动连接……")
@@ -1271,7 +1457,9 @@ func (u *window) connectWithRequest(request connectionRequest, automatic bool) {
 		u.connection.SetText("正在保存凭据并连接……")
 	}
 	u.updateActionAvailability()
-	go u.startConnectionAttempt(request, automatic, generation)
+	u.startConnectionWorker(func() {
+		u.startConnectionAttempt(request, automatic, generation)
+	})
 }
 
 func (u *window) startConnectionAttempt(request connectionRequest, automatic bool, generation uint64) {
@@ -1383,9 +1571,71 @@ func (u *window) connectAsync(request connectionRequest, automatic bool, generat
 	u.clientMu.Unlock()
 
 	u.doUI(func() { u.connection.SetText("正在启动 Telegram 客户端……") })
-	go u.runClient(client, ctx, automatic, generation)
-	go u.waitClientReady(client, ctx, automatic, generation)
-	go u.observeBinding(client, ctx, generation)
+	u.startConnectionWorker(func() { u.runClient(client, ctx, automatic, generation) })
+	u.startConnectionWorker(func() { u.waitClientReady(client, ctx, automatic, generation) })
+	u.startConnectionWorker(func() { u.observeBinding(client, ctx, generation) })
+}
+
+func (u *window) startConnectionWorker(worker func()) bool {
+	if worker == nil {
+		return false
+	}
+	u.connectionWorkerMu.Lock()
+	if u.connectionWorkersStopped {
+		u.connectionWorkerMu.Unlock()
+		return false
+	}
+	u.connectionWorkers.Add(1)
+	u.connectionWorkerMu.Unlock()
+	go func() {
+		defer u.connectionWorkers.Done()
+		worker()
+	}()
+	return true
+}
+
+func (u *window) stopConnectionWorkers() {
+	u.connectionWorkerMu.Lock()
+	u.connectionWorkersStopped = true
+	u.connectionWorkerMu.Unlock()
+}
+
+func (u *window) waitForConnectionWorkers(timeout time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		u.connectionWorkers.Wait()
+		close(done)
+	}()
+	if timeout <= 0 {
+		select {
+		case <-done:
+			return true
+		default:
+			return false
+		}
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return true
+	case <-timer.C:
+		return false
+	}
+}
+
+func (u *window) waitForController(timeout time.Duration) bool {
+	if u.controller == nil {
+		return true
+	}
+	if timeout <= 0 {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		return u.controller.WaitStopped(ctx) == nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return u.controller.WaitStopped(ctx) == nil
 }
 
 func (u *window) selectedUploadConcurrency() int {
@@ -1398,6 +1648,13 @@ func (u *window) selectedUploadConcurrency() int {
 }
 
 func (u *window) handleConnectionFailure(err error, automatic, retryable bool, generation uint64) {
+	_ = diagnostics.Logf(
+		"telegram_connect_failed generation=%d automatic=%t retryable=%t error_type=%T",
+		generation,
+		automatic,
+		retryable,
+		err,
+	)
 	u.clientMu.Lock()
 	if generation != u.clientGeneration {
 		u.clientMu.Unlock()
@@ -1443,6 +1700,7 @@ func (u *window) handleConnectionFailure(err error, automatic, retryable bool, g
 }
 
 func (u *window) handleConnectionState(client *tgtransport.Client, generation uint64, state tgtransport.ConnectionState) {
+	_ = diagnostics.Logf("telegram_connection_state generation=%d state=%s", generation, state)
 	u.doUI(func() {
 		if client == nil || !u.isUsableCurrentClient(client, generation) || u.isClosed() {
 			return
@@ -1510,6 +1768,14 @@ func (u *window) runClient(client *tgtransport.Client, ctx context.Context, auto
 		u.controller.SetGateway(nil)
 	}
 	retryable := shouldRetryConnection(err, ctx.Err(), u.isClosed())
+	_ = diagnostics.Logf(
+		"telegram_client_stopped generation=%d automatic=%t retryable=%t context_cancelled=%t error_type=%T",
+		generation,
+		automatic,
+		retryable,
+		ctx.Err() != nil,
+		err,
+	)
 	if err != nil && !errors.Is(err, context.Canceled) && !u.isClosed() && !automatic && !retryable {
 		u.showError(err)
 	}
@@ -1569,6 +1835,7 @@ func (u *window) waitClientReady(client *tgtransport.Client, ctx context.Context
 	if !u.isUsableCurrentClient(client, generation) || u.isClosed() {
 		return
 	}
+	_ = diagnostics.Logf("telegram_client_ready generation=%d max_upload_bytes=%d", generation, identity.MaxUploadBytes)
 	u.doUI(func() {
 		u.clientMu.Lock()
 		if client == nil || u.client != client || u.clientGeneration != generation || u.reconnectRequested || u.isClosed() {
@@ -2733,6 +3000,14 @@ func (u *window) closeIntercept() {
 }
 
 func (u *window) forceClose() {
+	u.shutdown(true, true)
+}
+
+// shutdown is the single idempotent owner of process-lifetime resources.
+// cancelQueue is reserved for an explicit user close; an unexpected event-loop
+// return should interrupt the active operation through rootCancel without
+// changing every queued record to an intentional cancellation.
+func (u *window) shutdown(cancelQueue, closeWindow bool) {
 	u.closedMu.Lock()
 	if u.closed {
 		u.closedMu.Unlock()
@@ -2740,9 +3015,11 @@ func (u *window) forceClose() {
 	}
 	u.closed = true
 	u.closedMu.Unlock()
+	_ = diagnostics.Logf("ui_shutdown explicit=%t close_window=%t queue_running=%t", cancelQueue, closeWindow, u.queueRunning())
+	u.stopConnectionWorkers()
 	u.stopConnectionRetryTimer()
 
-	if u.queueRunning() && u.controller != nil {
+	if cancelQueue && u.controller != nil && u.queueRunning() {
 		_ = u.controller.CancelAll()
 	}
 	u.moveMu.Lock()
@@ -2761,13 +3038,19 @@ func (u *window) forceClose() {
 	u.clientCancel = nil
 	u.client = nil
 	u.clientMu.Unlock()
-	u.controller.SetGateway(nil)
-	u.rootCancel()
+	if u.controller != nil {
+		u.controller.SetGateway(nil)
+	}
+	if u.rootCancel != nil {
+		u.rootCancel()
+	}
 	if u.scheduler != nil {
 		u.scheduler.Stop()
 	}
 	u.stopSleepGuard()
-	u.window.Close()
+	if closeWindow && u.window != nil {
+		u.window.Close()
+	}
 }
 
 func (u *window) stopSleepGuard() {
@@ -2776,12 +3059,34 @@ func (u *window) stopSleepGuard() {
 	u.sleepGuard = nil
 	u.sleepMu.Unlock()
 	if guard != nil {
-		go func() {
-			if err := guard.Stop(); err != nil && !u.isClosed() {
-				u.showError(fmt.Errorf("恢复系统休眠设置失败：%w", err))
-			}
-		}()
+		if err := guard.Stop(); err != nil && !u.isClosed() {
+			u.showError(fmt.Errorf("恢复系统休眠设置失败：%w", err))
+		}
 	}
+}
+
+func (u *window) openLogDirectory() {
+	logDirectory := filepath.Join(u.paths.Root, "logs")
+	if err := os.MkdirAll(logDirectory, 0o700); err != nil {
+		u.showError(fmt.Errorf("创建诊断日志目录失败：%w", err))
+		return
+	}
+	if u.application == nil {
+		return
+	}
+	if err := u.application.OpenURL(localFileURL(logDirectory)); err != nil {
+		u.showError(fmt.Errorf("打开诊断日志目录失败：%w", err))
+	}
+}
+
+func localFileURL(path string) *url.URL {
+	slashPath := strings.ReplaceAll(filepath.ToSlash(filepath.Clean(path)), "\\", "/")
+	// url.URL requires a leading slash for a Windows drive path to serialize
+	// as file:///C:/..., while Unix absolute paths already have one.
+	if len(slashPath) >= 2 && slashPath[1] == ':' && !strings.HasPrefix(slashPath, "/") {
+		slashPath = "/" + slashPath
+	}
+	return &url.URL{Scheme: "file", Path: slashPath}
 }
 
 func (u *window) settingsSnapshot() coreapp.Settings {

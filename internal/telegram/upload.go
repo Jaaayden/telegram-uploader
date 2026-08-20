@@ -164,6 +164,11 @@ func (c *Client) UploadVideo(ctx context.Context, request UploadRequest, onProgr
 	if request.RandomID == 0 {
 		return 0, errors.New("random_id 不能为空")
 	}
+	requestCtx, release, err := c.beginRequest(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer release()
 	// Snapshot the profile at the request boundary. A setting change while this
 	// video is validating or uploading must apply to the next video, matching
 	// the UI contract.
@@ -176,7 +181,7 @@ func (c *Client) UploadVideo(ctx context.Context, request UploadRequest, onProgr
 	if err != nil {
 		return 0, err
 	}
-	validatedChannel, err := c.ValidateChannel(ctx, request.Channel)
+	validatedChannel, err := c.validateChannel(requestCtx, request.Channel)
 	if err != nil {
 		return 0, err
 	}
@@ -204,23 +209,23 @@ func (c *Client) UploadVideo(ctx context.Context, request UploadRequest, onProgr
 	select {
 	case c.uploadSem <- struct{}{}:
 		defer func() { <-c.uploadSem }()
-	case <-ctx.Done():
-		return 0, ctx.Err()
+	case <-requestCtx.Done():
+		return 0, requestCtx.Err()
 	}
 
 	progress := newUploadProgressReporter(onProgress)
 	uploadEngine := newUploadEngine(uploadAPI, progress, uploadConcurrency)
 	var inputFile tg.InputFileClass
 	if request.File != nil {
-		inputFile, err = uploadEngine.FromFile(ctx, request.File)
+		inputFile, err = uploadEngine.FromFile(requestCtx, request.File)
 	} else {
-		inputFile, err = uploadEngine.FromPath(ctx, request.Path)
+		inputFile, err = uploadEngine.FromPath(requestCtx, request.Path)
 	}
 	progress.Close()
 	if err != nil {
 		return 0, fmt.Errorf("%w：上传视频数据失败：%w", ErrUploadData, err)
 	}
-	if err := ctx.Err(); err != nil {
+	if err := requestCtx.Err(); err != nil {
 		return 0, err
 	}
 	if request.BeforeSend != nil {
@@ -231,7 +236,7 @@ func (c *Client) UploadVideo(ctx context.Context, request UploadRequest, onProgr
 	// Cancellation can race with a durable BeforeSend callback. Re-check at the
 	// exact submission boundary so a completed local fsync never causes a
 	// deliberately cancelled job to enter messages.sendMedia.
-	if err := ctx.Err(); err != nil {
+	if err := requestCtx.Err(); err != nil {
 		return 0, err
 	}
 
@@ -245,14 +250,14 @@ func (c *Client) UploadVideo(ctx context.Context, request UploadRequest, onProgr
 		video.SupportsStreaming()
 	}
 
-	if err := c.reserveSendSlot(ctx); err != nil {
+	if err := c.reserveSendSlot(requestCtx); err != nil {
 		return 0, err
 	}
 	updatesResult, err := message.NewSender(api).
 		WithUploader(uploadEngine).
 		To(&tg.InputPeerChannel{ChannelID: request.Channel.ID, AccessHash: request.Channel.AccessHash}).
 		RandomID(request.RandomID).
-		Media(ctx, video)
+		Media(requestCtx, video)
 	if err != nil {
 		return 0, fmt.Errorf("%w：提交频道消息失败：%w", ErrSendOutcomeUnknown, err)
 	}

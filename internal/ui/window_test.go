@@ -14,6 +14,7 @@ import (
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/test"
+	"fyne.io/fyne/v2/widget"
 	coreapp "github.com/jayden/telegram-video-uploader/internal/app"
 	"github.com/jayden/telegram-video-uploader/internal/model"
 	tgtransport "github.com/jayden/telegram-video-uploader/internal/telegram"
@@ -162,6 +163,21 @@ func TestMainStatusHeaderStaysOnOneLine(t *testing.T) {
 	}
 }
 
+func TestLocalFileURLSupportsUnixAndWindowsPaths(t *testing.T) {
+	tests := []struct {
+		path string
+		want string
+	}{
+		{path: "/tmp/Telegram Video Uploader/logs", want: "file:///tmp/Telegram%20Video%20Uploader/logs"},
+		{path: `C:\Users\Jayden\AppData\Roaming\TelegramVideoUploader\logs`, want: "file:///C:/Users/Jayden/AppData/Roaming/TelegramVideoUploader/logs"},
+	}
+	for _, test := range tests {
+		if got := localFileURL(test.path).String(); got != test.want {
+			t.Errorf("localFileURL(%q) = %q, want %q", test.path, got, test.want)
+		}
+	}
+}
+
 func TestVirtualQueueProgressUpdatesReuseVisibleRows(t *testing.T) {
 	application := test.NewApp()
 	defer application.Quit()
@@ -196,6 +212,77 @@ func TestVirtualQueueProgressUpdatesReuseVisibleRows(t *testing.T) {
 	}
 	if u.queueRowCreateCount != created {
 		t.Fatalf("progress updates created %d additional rows, want the visible row pool reused", u.queueRowCreateCount-created)
+	}
+}
+
+func TestApplyProgressUpdateMergesLatestActiveAttemptWithoutFullRefresh(t *testing.T) {
+	application := test.NewApp()
+	defer application.Quit()
+
+	u := &window{}
+	u.buildQueue()
+	u.progress = widget.NewProgressBar()
+	u.progressSummary = widget.NewLabel("")
+	job := model.Job{
+		ID:             "active",
+		Position:       0,
+		Name:           "active.mp4",
+		Size:           1000,
+		Uploaded:       100,
+		BytesPerSecond: 5,
+		State:          model.JobUploading,
+	}
+	u.snapshot = coreapp.Snapshot{
+		Jobs:           []model.Job{job},
+		ActiveID:       job.ID,
+		ActiveAttempt:  2,
+		Running:        true,
+		TotalBytes:     1000,
+		DoneBytes:      100,
+		BytesPerSecond: 5,
+	}
+	u.refreshQueueRows(u.snapshot.Jobs)
+
+	u.applyProgressUpdate(coreapp.ProgressUpdate{
+		JobID:          job.ID,
+		AttemptID:      2,
+		Uploaded:       400,
+		BytesPerSecond: 20,
+	})
+	if got := u.queueJobs[0].Uploaded; got != 400 {
+		t.Fatalf("local job uploaded = %d, want 400", got)
+	}
+	if got := u.snapshot.DoneBytes; got != 400 {
+		t.Fatalf("aggregate done bytes = %d, want 400", got)
+	}
+	if got := u.snapshot.BytesPerSecond; got != 20 {
+		t.Fatalf("aggregate speed = %v, want 20", got)
+	}
+	if got := u.progress.Value; got != 0.4 {
+		t.Fatalf("overall progress = %v, want 0.4", got)
+	}
+
+	// A retry callback and a terminal-state callback must not overwrite the
+	// current local state, even when they arrive after the latest update.
+	u.applyProgressUpdate(coreapp.ProgressUpdate{
+		JobID:          job.ID,
+		AttemptID:      1,
+		Uploaded:       900,
+		BytesPerSecond: 90,
+	})
+	if got := u.queueJobs[0].Uploaded; got != 400 {
+		t.Fatalf("stale retry changed local progress to %d, want 400", got)
+	}
+	u.snapshot.Jobs[0].State = model.JobSent
+	u.queueJobs[0].State = model.JobSent
+	u.applyProgressUpdate(coreapp.ProgressUpdate{
+		JobID:          job.ID,
+		AttemptID:      2,
+		Uploaded:       1000,
+		BytesPerSecond: 100,
+	})
+	if got := u.queueJobs[0].Uploaded; got != 400 {
+		t.Fatalf("terminal callback changed local progress to %d, want 400", got)
 	}
 }
 
@@ -550,6 +637,18 @@ func TestForceCloseUsesLiveControllerRunningState(t *testing.T) {
 		u.forceClose()
 		close(closeDone)
 	}()
+	// Ensure the shutdown goroutine has actually entered shutdown before the
+	// Start save is released. Without this synchronization the queue can fully
+	// fail before forceClose is ever scheduled, which does not exercise the
+	// intended close-during-start boundary.
+	deadline := time.Now().Add(time.Second)
+	for !u.isClosed() && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if !u.isClosed() {
+		t.Fatal("forceClose did not enter shutdown")
+	}
+	time.Sleep(10 * time.Millisecond)
 	close(store.releaseSave)
 	if err := <-startDone; err != nil {
 		t.Fatalf("Start() error = %v", err)
@@ -559,7 +658,7 @@ func TestForceCloseUsesLiveControllerRunningState(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("forceClose did not finish")
 	}
-	deadline := time.Now().Add(time.Second)
+	deadline = time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {
 		snapshot := controller.Snapshot()
 		if !snapshot.Running && len(snapshot.Jobs) == 1 && snapshot.Jobs[0].State == model.JobCancelled {
@@ -568,6 +667,51 @@ func TestForceCloseUsesLiveControllerRunningState(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 	t.Fatalf("queue after forceClose = %+v, want cancelled live queue", controller.Snapshot())
+}
+
+func TestShutdownIsIdempotentAndCancelsLifetimeResources(t *testing.T) {
+	rootCtx, rootCancel := context.WithCancel(context.Background())
+	clientCancels := 0
+	moveCancels := 0
+	u := &window{
+		rootCtx:      rootCtx,
+		rootCancel:   rootCancel,
+		clientCancel: func() { clientCancels++ },
+		moveCancel:   func() { moveCancels++ },
+	}
+
+	u.shutdown(false, false)
+	u.shutdown(false, false)
+	select {
+	case <-rootCtx.Done():
+	default:
+		t.Fatal("shutdown did not cancel the root context")
+	}
+	if clientCancels != 1 || moveCancels != 1 {
+		t.Fatalf("shutdown cancellation counts = client:%d move:%d, want one each", clientCancels, moveCancels)
+	}
+	if !u.isClosed() {
+		t.Fatal("shutdown did not mark the window closed")
+	}
+}
+
+func TestConnectionWorkerGateStopsNewWorkersAndWaitsForExistingWorkers(t *testing.T) {
+	u := &window{}
+	release := make(chan struct{})
+	if !u.startConnectionWorker(func() { <-release }) {
+		t.Fatal("first connection worker was rejected")
+	}
+	u.stopConnectionWorkers()
+	if u.startConnectionWorker(func() {}) {
+		t.Fatal("connection worker started after the gate was stopped")
+	}
+	if u.waitForConnectionWorkers(10 * time.Millisecond) {
+		t.Fatal("worker wait completed before the active worker exited")
+	}
+	close(release)
+	if !u.waitForConnectionWorkers(time.Second) {
+		t.Fatal("worker wait did not complete after the active worker exited")
+	}
 }
 
 func TestSettingsNavigationUsesDedicatedSameWindowPage(t *testing.T) {
@@ -611,6 +755,30 @@ func TestControllerSnapshotDispatchCoalescesToLatestState(t *testing.T) {
 	}
 	if !u.enqueueControllerSnapshot(first) {
 		t.Fatal("dispatcher did not accept a new snapshot after draining")
+	}
+}
+
+func TestControllerProgressDispatchCoalescesToLatestUpdate(t *testing.T) {
+	u := &window{}
+	first := coreapp.ProgressUpdate{JobID: "job", AttemptID: 1, Uploaded: 10}
+	latest := coreapp.ProgressUpdate{JobID: "job", AttemptID: 1, Uploaded: 90}
+	if !u.enqueueControllerProgress(first) {
+		t.Fatal("first progress did not request a UI dispatch")
+	}
+	for i := 0; i < 1000; i++ {
+		if u.enqueueControllerProgress(coreapp.ProgressUpdate{JobID: "job", AttemptID: 1, Uploaded: int64(i)}) {
+			t.Fatal("intermediate progress queued a duplicate UI dispatch")
+		}
+	}
+	if u.enqueueControllerProgress(latest) {
+		t.Fatal("latest progress queued a duplicate UI dispatch")
+	}
+	got, ok := u.takeControllerProgress()
+	if !ok || got != latest {
+		t.Fatalf("dispatched progress = (%+v, %v), want latest %+v", got, ok, latest)
+	}
+	if _, ok := u.takeControllerProgress(); ok {
+		t.Fatal("empty progress dispatcher returned an update")
 	}
 }
 
