@@ -10,7 +10,7 @@ import (
 	"syscall"
 	"testing"
 
-	"github.com/jayden/telegram-video-uploader/internal/model"
+	"github.com/Jaaayden/telegram-uploader/internal/model"
 )
 
 func TestRenameNoReplacePreservesExistingDestination(t *testing.T) {

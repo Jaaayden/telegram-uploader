@@ -5,13 +5,13 @@ import (
 	"log/slog"
 	"os"
 
-	coreapp "github.com/jayden/telegram-video-uploader/internal/app"
-	"github.com/jayden/telegram-video-uploader/internal/applog"
-	"github.com/jayden/telegram-video-uploader/internal/buildinfo"
-	"github.com/jayden/telegram-video-uploader/internal/credentials"
-	"github.com/jayden/telegram-video-uploader/internal/mover"
-	"github.com/jayden/telegram-video-uploader/internal/queue"
-	"github.com/jayden/telegram-video-uploader/internal/ui"
+	coreapp "github.com/Jaaayden/telegram-uploader/internal/app"
+	"github.com/Jaaayden/telegram-uploader/internal/applog"
+	"github.com/Jaaayden/telegram-uploader/internal/buildinfo"
+	"github.com/Jaaayden/telegram-uploader/internal/credentials"
+	"github.com/Jaaayden/telegram-uploader/internal/mover"
+	"github.com/Jaaayden/telegram-uploader/internal/queue"
+	"github.com/Jaaayden/telegram-uploader/internal/ui"
 )
 
 func main() {

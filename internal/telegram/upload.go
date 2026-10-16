@@ -15,7 +15,7 @@ import (
 	"github.com/gotd/td/telegram/uploader"
 	"github.com/gotd/td/tg"
 
-	"github.com/jayden/telegram-video-uploader/internal/model"
+	"github.com/Jaaayden/telegram-uploader/internal/model"
 )
 
 const (

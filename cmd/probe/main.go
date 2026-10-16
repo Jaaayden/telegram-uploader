@@ -15,11 +15,11 @@ import (
 	"syscall"
 	"time"
 
-	appcore "github.com/jayden/telegram-video-uploader/internal/app"
-	"github.com/jayden/telegram-video-uploader/internal/credentials"
-	"github.com/jayden/telegram-video-uploader/internal/media"
-	"github.com/jayden/telegram-video-uploader/internal/model"
-	tgtransport "github.com/jayden/telegram-video-uploader/internal/telegram"
+	appcore "github.com/Jaaayden/telegram-uploader/internal/app"
+	"github.com/Jaaayden/telegram-uploader/internal/credentials"
+	"github.com/Jaaayden/telegram-uploader/internal/media"
+	"github.com/Jaaayden/telegram-uploader/internal/model"
+	tgtransport "github.com/Jaaayden/telegram-uploader/internal/telegram"
 )
 
 func main() {

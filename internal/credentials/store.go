@@ -16,7 +16,7 @@ import (
 
 	"github.com/zalando/go-keyring"
 
-	"github.com/jayden/telegram-video-uploader/internal/fsutil"
+	"github.com/Jaaayden/telegram-uploader/internal/fsutil"
 )
 
 const (

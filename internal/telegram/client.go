@@ -21,8 +21,8 @@ import (
 	"github.com/gotd/td/tg"
 	"golang.org/x/net/proxy"
 
-	"github.com/jayden/telegram-video-uploader/internal/buildinfo"
-	"github.com/jayden/telegram-video-uploader/internal/model"
+	"github.com/Jaaayden/telegram-uploader/internal/buildinfo"
+	"github.com/Jaaayden/telegram-uploader/internal/model"
 )
 
 type Client struct {

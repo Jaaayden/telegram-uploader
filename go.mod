@@ -1,4 +1,4 @@
-module github.com/jayden/telegram-video-uploader
+module github.com/Jaaayden/telegram-uploader
 
 go 1.25.0
 
