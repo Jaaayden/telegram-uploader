@@ -37,7 +37,9 @@
 
 ## 下载版本
 
-请从 [GitHub Releases](https://github.com/Jaaayden/telegram-uploader/releases) 下载构建好的 Windows 或 macOS 应用。`v*` 版本是正式版本；`main-*` 是每次合并到主分支后自动生成的开发预览版。每个 Release 都附带 `SHA256SUMS`，可用于核对下载文件完整性。
+请从 [GitHub Releases](https://github.com/Jaaayden/telegram-uploader/releases) 下载构建好的 Windows 或 macOS 应用。`v*` 版本是正式版本；`nightly` 是始终指向主分支最新提交的滚动开发预览版（每次合并后被替换，不会累积旧版本）。每个 Release 都附带 `SHA256SUMS`，可用于核对下载文件完整性。
+
+**macOS 首次打开**：应用目前只有 ad-hoc 签名、没有 Apple 公证，Gatekeeper 会提示“无法验证开发者”。请在 Finder 中右键应用选择“打开”，或在终端执行 `xattr -dr com.apple.quarantine /path/to/TelegramVideoUploader.app` 后再启动。Windows 版同样没有代码签名，SmartScreen 可能提示“未知发布者”。
 
 ## 安全与恢复语义
 
@@ -48,6 +50,7 @@
 - 如果取消/断线恰好发生在消息提交阶段，应用不会盲目重试，而是标为“待确认”。请先检查频道，再选择“已发送”或明确确认重新上传。
 - 如果 MP4 的 `moov` 元数据完整、但末尾 `mdat` 声明长度超过实际文件，应用会显示“源 MP4 尾部结构不完整”警告并原样上传，而不是阻止任务。应用不会修复或补全源文件；重要视频仍建议从原始来源重新复制一份完整文件。
 - 超过 Bot 当前上限的文件不会上传。可一键移动到指定文件夹；移动操作从不覆盖同名目标，跨卷时会复制、校验 SHA-256、同步落盘后才删除源文件。
+- 如果加密 session 文件损坏，或系统凭据库里的加密密钥丢失（例如换了电脑或清理了钥匙串），应用会把旧文件改名为 `telegram-session.enc.invalid` 并用 Bot Token 自动重新登录；凭据库只是暂时不可用时不会丢弃 session。
 - macOS 上传期间调用系统自带的 `caffeinate`；Windows 使用 `SetThreadExecutionState`，避免电脑自动休眠中断上传。
 
 应用数据位置：
@@ -55,11 +58,13 @@
 - macOS：`~/Library/Application Support/TelegramVideoUploader/`
 - Windows：`%AppData%\TelegramVideoUploader\`
 
+诊断日志写在同一目录的 `app.log`（超过 2 MiB 时轮转为 `app.log.1`），只记录错误文本，不包含 Token、API Hash 或代理密码；反馈问题时可附上该文件。
+
 敏感凭据不在上述目录的 JSON 文件中。
 
 ## 本地构建
 
-要求 Go 1.25 或更新版本。最终用户使用已构建产物时不需要安装 Go、Python、FFmpeg、TDLib 或本地 Bot API Server。
+要求 Go 1.26 或更新版本（以 `go.mod` 为准）。最终用户使用已构建产物时不需要安装 Go、Python、FFmpeg、TDLib 或本地 Bot API Server。
 
 macOS：
 
@@ -75,6 +80,8 @@ Windows PowerShell：
 ./build/TelegramVideoUploader.exe
 ```
 
+版本号只在 `FyneApp.toml` 维护，构建脚本通过 `-ldflags -X` 注入 `buildinfo.Version`；`scripts/check-version.sh [tag]` 会校验 `Info.plist` 与（可选的）发布 tag 是否一致，CI 在每次构建时都会运行它。
+
 Fyne 桌面驱动在构建时需要平台 C 编译器；发布后的应用是自包含产物。仓库中的 GitHub Actions 工作流会分别在原生 macOS 和 Windows runner 上构建。
 
 ## 验证
@@ -83,6 +90,11 @@ Fyne 桌面驱动在构建时需要平台 C 编译器；发布后的应用是自
 go test ./...
 go test -race ./internal/app ./internal/credentials ./internal/media ./internal/mover ./internal/queue ./internal/scanner ./internal/telegram
 go vet ./...
+go run honnef.co/go/tools/cmd/staticcheck@v0.8.2 ./...
+go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
+./scripts/check-version.sh
 ```
+
+CI 在 Linux 上对非 UI 包运行 `go vet`、`go test -race` 和 staticcheck，在原生 macOS/Windows runner 上运行完整 `go vet` 与 `go test`；`govulncheck` 单独运行（每周一次及每次推送），新发布的漏洞公告不会阻塞发版。
 
 离线测试覆盖自然排序、MP4 元数据、队列恢复、逐项/全部取消、待确认消息、跨卷安全移动、加密 session 和关键并发路径。真实 Telegram 端到端测试必须由使用者在本机输入自己的凭据完成；不要把凭据提交到仓库或发送到聊天中。
