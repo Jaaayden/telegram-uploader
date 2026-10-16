@@ -6,13 +6,83 @@ on:
     tags: ['v*']
   pull_request:
   workflow_dispatch:
+  schedule:
+    # Weekly vulnerability scan: advisories appear without any code change.
+    - cron: '17 3 * * 1'
 
 permissions:
   contents: read
 
 jobs:
+  verify:
+    name: Lint and test (Linux)
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Check version consistency
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            ./scripts/check-version.sh "$GITHUB_REF_NAME"
+          else
+            ./scripts/check-version.sh
+          fi
+
+      - name: Check formatting and modules
+        shell: bash
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [[ -n "$unformatted" ]]; then
+            echo "gofmt needed:" >&2
+            echo "$unformatted" >&2
+            exit 1
+          fi
+          go mod verify
+          go mod tidy -diff
+
+      # The Fyne UI needs a C toolchain and GL headers, so the headless
+      # packages are checked here and the UI is vetted and tested on the
+      # native macOS/Windows builds below.
+      - name: Vet, race-test and staticcheck headless packages
+        shell: bash
+        run: |
+          pkgs="$(go list ./... | grep -v -e '/internal/ui$' -e '/cmd/tg-video-uploader$')"
+          go vet $pkgs
+          go test -race $pkgs
+          go run honnef.co/go/tools/cmd/staticcheck@v0.8.2 $pkgs
+
+  vulncheck:
+    name: Vulnerability scan
+    # Not required for publishing: new advisories must not block a release,
+    # but they should be visible on every run and weekly.
+    runs-on: macos-15
+    env:
+      CGO_ENABLED: 1
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
+
   test-and-build:
     name: ${{ matrix.name }}
+    if: github.event_name != 'schedule'
     runs-on: ${{ matrix.os }}
     env:
       CGO_ENABLED: 1
@@ -54,12 +124,12 @@ jobs:
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Set up Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
-          go-version: '1.25.x'
+          go-version-file: go.mod
           cache: true
 
       - name: Download dependencies
@@ -69,14 +139,28 @@ jobs:
         shell: bash
         run: gcc --version
 
-      - name: Run tests
-        run: go test ./...
+      - name: Run vet and tests
+        run: |
+          go vet ./...
+          go test ./...
+
+      - name: Compute build version
+        id: version
+        shell: bash
+        run: |
+          base="$(./scripts/version.sh)"
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            version="$base"
+          else
+            version="${base}-dev.${GITHUB_SHA::7}"
+          fi
+          echo "value=$version" >> "$GITHUB_OUTPUT"
 
       - name: Build standalone application
         shell: bash
         env:
           OUTPUT: build/${{ matrix.artifact }}${{ matrix.extension }}
-          LDFLAGS: ${{ matrix.ldflags }}
+          LDFLAGS: ${{ matrix.ldflags }} -X github.com/Jaaayden/telegram-uploader/internal/buildinfo.Version=${{ steps.version.outputs.value }}
         run: |
           mkdir -p build
           go build -trimpath -ldflags="$LDFLAGS" -o "$OUTPUT" ./cmd/tg-video-uploader
@@ -98,7 +182,7 @@ jobs:
           ditto -c -k --sequesterRsrc --keepParent "$APP_BUNDLE" "$ARCHIVE"
 
       - name: Upload application artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.upload }}
@@ -106,7 +190,7 @@ jobs:
 
   publish-release:
     name: Publish GitHub Release
-    needs: test-and-build
+    needs: [verify, test-and-build]
     if: >-
       success() &&
       github.event_name == 'push' &&
@@ -123,7 +207,7 @@ jobs:
 
     steps:
       - name: Download build artifacts
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         with:
           path: release-assets
           merge-multiple: true
@@ -146,21 +230,10 @@ jobs:
           set -euo pipefail
 
           if [[ "$GITHUB_REF" == "refs/heads/main" ]]; then
-            tag="main-${GITHUB_SHA:0:12}"
-            title="Main build ${GITHUB_SHA:0:12}"
-            release_kind="prerelease"
-          else
-            tag="$GITHUB_REF_NAME"
-            title="Telegram Video Uploader ${GITHUB_REF_NAME}"
-            release_kind="stable"
-          fi
-
-          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "Release $tag already exists; nothing to publish."
-            exit 0
-          fi
-
-          if [[ "$release_kind" == "prerelease" ]]; then
+            # One rolling prerelease instead of a new permanent release per push.
+            tag="nightly"
+            title="Nightly build (${GITHUB_SHA:0:12})"
+            gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes 2>/dev/null || true
             gh release create "$tag" \
               release-assets/* \
               --repo "$GITHUB_REPOSITORY" \
@@ -170,6 +243,12 @@ jobs:
               --prerelease \
               --latest=false
           else
+            tag="$GITHUB_REF_NAME"
+            title="Telegram Video Uploader ${GITHUB_REF_NAME}"
+            if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              echo "Release $tag already exists; nothing to publish."
+              exit 0
+            fi
             gh release create "$tag" \
               release-assets/* \
               --repo "$GITHUB_REPOSITORY" \
