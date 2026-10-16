@@ -11,12 +11,12 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 
 	"github.com/zalando/go-keyring"
+
+	"github.com/jayden/telegram-video-uploader/internal/fsutil"
 )
 
 const (
@@ -255,7 +255,7 @@ func (s *Store) EncryptSessionFile(srcPath string, dstPath ...string) error {
 	if err != nil {
 		return fmt.Errorf("encrypt session file: %w", err)
 	}
-	if err := atomicWrite0600(destination, ciphertext); err != nil {
+	if err := fsutil.AtomicWriteFile(destination, ciphertext, 0o600); err != nil {
 		return fmt.Errorf("write encrypted session file: %w", err)
 	}
 	return nil
@@ -283,7 +283,7 @@ func (s *Store) DecryptSessionFile(srcPath string, dstPath ...string) error {
 	if err != nil {
 		return fmt.Errorf("decrypt session file: %w", err)
 	}
-	if err := atomicWrite0600(destination, plaintext); err != nil {
+	if err := fsutil.AtomicWriteFile(destination, plaintext, 0o600); err != nil {
 		return fmt.Errorf("write decrypted session file: %w", err)
 	}
 	return nil
@@ -332,64 +332,6 @@ func decryptBytes(key, ciphertext []byte) ([]byte, error) {
 	}
 	nonce, sealed := ciphertext[:nonceSize], ciphertext[nonceSize:]
 	return aead.Open(nil, nonce, sealed, nil)
-}
-
-func atomicWrite0600(path string, contents []byte) error {
-	dir := filepath.Dir(path)
-	base := filepath.Base(path)
-	tmp, err := os.CreateTemp(dir, "."+base+".tmp-")
-	if err != nil {
-		return err
-	}
-	tmpName := tmp.Name()
-	removeTemp := true
-	defer func() {
-		if removeTemp {
-			_ = os.Remove(tmpName)
-		}
-	}()
-
-	if err := tmp.Chmod(0o600); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if _, err := tmp.Write(contents); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(tmpName, path); err != nil {
-		return err
-	}
-	removeTemp = false
-	return syncParentDirectory(dir)
-}
-
-func syncParentDirectory(dir string) error {
-	if runtime.GOOS == "windows" {
-		return nil
-	}
-	file, err := os.Open(dir)
-	if err != nil {
-		return err
-	}
-	syncErr := file.Sync()
-	closeErr := file.Close()
-	if syncErr != nil {
-		message := strings.ToLower(syncErr.Error())
-		if !strings.Contains(message, "invalid argument") &&
-			!strings.Contains(message, "not supported") &&
-			!strings.Contains(message, "function not implemented") {
-			return syncErr
-		}
-	}
-	return closeErr
 }
 
 func wrapSessionFileReadError(operation, path string, err error) error {
