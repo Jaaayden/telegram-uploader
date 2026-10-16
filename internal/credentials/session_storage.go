@@ -8,6 +8,8 @@ import (
 	"sync"
 
 	"github.com/gotd/td/session"
+
+	"github.com/jayden/telegram-video-uploader/internal/fsutil"
 )
 
 // SessionStorage implements gotd session.Storage without ever writing the
@@ -66,7 +68,7 @@ func (s *SessionStorage) StoreSession(ctx context.Context, data []byte) error {
 	if err != nil {
 		return fmt.Errorf("加密 Telegram 会话失败：%w", err)
 	}
-	if err := atomicWrite0600(s.Path, ciphertext); err != nil {
+	if err := fsutil.AtomicWriteFile(s.Path, ciphertext, 0o600); err != nil {
 		return fmt.Errorf("保存加密 Telegram 会话失败：%w", err)
 	}
 	return nil
