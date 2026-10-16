@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
@@ -98,8 +99,10 @@ func normalizeUploadConcurrency(value int) int {
 // Run creates and runs the single-window desktop application. It returns when
 // the window is closed. A complete saved configuration is connected
 // automatically; first-run and configuration failures remain available from
-// the settings page without blocking queue management.
-func Run(controller *coreapp.Controller, paths coreapp.Paths, secrets *credentials.Store) {
+// the settings page without blocking queue management. Each non-nil notice
+// (for example a queue file that could not be read at startup) is shown to the
+// user once the window is visible.
+func Run(controller *coreapp.Controller, paths coreapp.Paths, secrets *credentials.Store, notices ...error) {
 	if controller == nil {
 		return
 	}
@@ -115,8 +118,25 @@ func Run(controller *coreapp.Controller, paths coreapp.Paths, secrets *credentia
 	u.build()
 	u.startObservers()
 	u.window.Show()
+	for _, notice := range notices {
+		u.showError(notice)
+	}
 	u.autoConnectIfConfigured()
 	u.application.Run()
+}
+
+// ShowFatal displays an unrecoverable startup error in a small window and
+// returns when the user closes it. It exists because a GUI build has no
+// visible stderr.
+func ShowFatal(message string) {
+	application := fyneapp.NewWithID("com.jayden.telegramvideouploader")
+	win := application.NewWindow("Telegram 视频顺序上传器")
+	label := widget.NewLabel(message)
+	label.Wrapping = fyne.TextWrapWord
+	win.SetContent(container.NewVBox(label, widget.NewButton("关闭", win.Close)))
+	win.Resize(fyne.NewSize(480, 160))
+	win.SetFixedSize(true)
+	win.ShowAndRun()
 }
 
 type window struct {
@@ -1398,6 +1418,7 @@ func (u *window) selectedUploadConcurrency() int {
 }
 
 func (u *window) handleConnectionFailure(err error, automatic, retryable bool, generation uint64) {
+	slog.Warn("telegram connection failed", "error", err, "automatic", automatic, "retryable", retryable)
 	u.clientMu.Lock()
 	if generation != u.clientGeneration {
 		u.clientMu.Unlock()
@@ -1472,6 +1493,9 @@ func (u *window) handleConnectionState(client *tgtransport.Client, generation ui
 
 func (u *window) runClient(client *tgtransport.Client, ctx context.Context, automatic bool, generation uint64) {
 	err := client.Run(ctx)
+	if err != nil && ctx.Err() == nil {
+		slog.Warn("telegram client stopped", "error", err)
+	}
 	if errors.Is(err, tgtransport.ErrWrongBotSession) {
 		if removeErr := os.Remove(u.paths.Session); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
 			err = errors.Join(err, fmt.Errorf("清理旧 Bot 会话失败：%w", removeErr))

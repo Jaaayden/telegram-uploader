@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
@@ -1804,6 +1805,7 @@ func (c *Controller) prepareSendForAttempt(jobID string, attemptID uint64) error
 }
 
 func (c *Controller) failJob(jobID string, err error) error {
+	slog.Warn("upload job failed", "job", jobID, "error", err)
 	c.mu.Lock()
 	if currentIndex := findJobIndexLocked(c.jobs, jobID); currentIndex >= 0 {
 		c.jobs[currentIndex].State = model.JobFailed
