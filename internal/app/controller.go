@@ -272,18 +272,6 @@ func (c *Controller) persist() error {
 	}
 }
 
-func (c *Controller) saveSnapshot(jobs []model.Job, channel model.Channel, paused bool) error {
-	// Kept for file-move and compatibility paths that already own a complete
-	// snapshot. New queue edits use persistCandidate so they can publish only
-	// after a revision-checked write.
-	if c.store == nil {
-		return nil
-	}
-	c.persistMu.Lock()
-	defer c.persistMu.Unlock()
-	return c.store.Save(cloneJobsForPersistence(jobs), channel, paused)
-}
-
 func (c *Controller) notifyLocked() {
 	snapshot := c.snapshotLocked()
 	select {

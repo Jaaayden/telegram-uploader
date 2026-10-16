@@ -352,8 +352,7 @@ func (u *window) showJobDetails(id string) {
 	if !ok {
 		return
 	}
-	var detailsDialog *dialog.CustomDialog
-	detailsDialog = dialog.NewCustom("队列条目详情", "关闭", u.jobDetailsContent(job), u.window)
+	detailsDialog := dialog.NewCustom("队列条目详情", "关闭", u.jobDetailsContent(job), u.window)
 	detailsDialog.SetButtons([]fyne.CanvasObject{
 		widget.NewButton("复制路径", func() { u.application.Clipboard().SetContent(job.Path) }),
 		widget.NewButton("关闭", func() { detailsDialog.Dismiss() }),
