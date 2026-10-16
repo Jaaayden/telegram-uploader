@@ -7,8 +7,8 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/jayden/telegram-video-uploader/internal/fsutil"
-	tgtransport "github.com/jayden/telegram-video-uploader/internal/telegram"
+	"github.com/Jaaayden/telegram-uploader/internal/fsutil"
+	tgtransport "github.com/Jaaayden/telegram-uploader/internal/telegram"
 )
 
 const settingsSchemaVersion = 1

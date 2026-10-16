@@ -14,9 +14,9 @@ import (
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/test"
-	coreapp "github.com/jayden/telegram-video-uploader/internal/app"
-	"github.com/jayden/telegram-video-uploader/internal/model"
-	tgtransport "github.com/jayden/telegram-video-uploader/internal/telegram"
+	coreapp "github.com/Jaaayden/telegram-uploader/internal/app"
+	"github.com/Jaaayden/telegram-uploader/internal/model"
+	tgtransport "github.com/Jaaayden/telegram-uploader/internal/telegram"
 )
 
 func TestUploadConcurrencyOptionMapping(t *testing.T) {

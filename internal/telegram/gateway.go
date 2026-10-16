@@ -8,7 +8,7 @@ import (
 
 	"github.com/gotd/td/session"
 
-	"github.com/jayden/telegram-video-uploader/internal/model"
+	"github.com/Jaaayden/telegram-uploader/internal/model"
 )
 
 var (

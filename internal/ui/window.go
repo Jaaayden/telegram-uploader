@@ -25,12 +25,12 @@ import (
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/widget"
-	coreapp "github.com/jayden/telegram-video-uploader/internal/app"
-	"github.com/jayden/telegram-video-uploader/internal/credentials"
-	"github.com/jayden/telegram-video-uploader/internal/model"
-	"github.com/jayden/telegram-video-uploader/internal/platform"
-	"github.com/jayden/telegram-video-uploader/internal/scanner"
-	tgtransport "github.com/jayden/telegram-video-uploader/internal/telegram"
+	coreapp "github.com/Jaaayden/telegram-uploader/internal/app"
+	"github.com/Jaaayden/telegram-uploader/internal/credentials"
+	"github.com/Jaaayden/telegram-uploader/internal/model"
+	"github.com/Jaaayden/telegram-uploader/internal/platform"
+	"github.com/Jaaayden/telegram-uploader/internal/scanner"
+	tgtransport "github.com/Jaaayden/telegram-uploader/internal/telegram"
 )
 
 const (

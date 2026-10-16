@@ -14,7 +14,7 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/jayden/telegram-video-uploader/internal/model"
+	"github.com/Jaaayden/telegram-uploader/internal/model"
 )
 
 // lstat is replaced in tests to simulate files that vanish during a scan.

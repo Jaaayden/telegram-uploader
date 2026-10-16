@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	tgtransport "github.com/jayden/telegram-video-uploader/internal/telegram"
+	tgtransport "github.com/Jaaayden/telegram-uploader/internal/telegram"
 )
 
 func TestSettingsRoundTrip(t *testing.T) {

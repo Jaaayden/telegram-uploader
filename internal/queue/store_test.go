@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jayden/telegram-video-uploader/internal/model"
+	"github.com/Jaaayden/telegram-uploader/internal/model"
 )
 
 func TestStoreRoundTrip(t *testing.T) {

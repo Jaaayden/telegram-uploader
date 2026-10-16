@@ -15,11 +15,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/jayden/telegram-video-uploader/internal/media"
-	"github.com/jayden/telegram-video-uploader/internal/model"
-	"github.com/jayden/telegram-video-uploader/internal/mover"
-	"github.com/jayden/telegram-video-uploader/internal/scanner"
-	tgtransport "github.com/jayden/telegram-video-uploader/internal/telegram"
+	"github.com/Jaaayden/telegram-uploader/internal/media"
+	"github.com/Jaaayden/telegram-uploader/internal/model"
+	"github.com/Jaaayden/telegram-uploader/internal/mover"
+	"github.com/Jaaayden/telegram-uploader/internal/scanner"
+	tgtransport "github.com/Jaaayden/telegram-uploader/internal/telegram"
 )
 
 type QueueStore interface {

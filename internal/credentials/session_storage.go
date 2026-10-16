@@ -9,7 +9,7 @@ import (
 
 	"github.com/gotd/td/session"
 
-	"github.com/jayden/telegram-video-uploader/internal/fsutil"
+	"github.com/Jaaayden/telegram-uploader/internal/fsutil"
 )
 
 // SessionStorage implements gotd session.Storage without ever writing the

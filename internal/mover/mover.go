@@ -15,8 +15,8 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/jayden/telegram-video-uploader/internal/fsutil"
-	"github.com/jayden/telegram-video-uploader/internal/model"
+	"github.com/Jaaayden/telegram-uploader/internal/fsutil"
+	"github.com/Jaaayden/telegram-uploader/internal/model"
 )
 
 // ProgressFunc receives progress for one move operation.  BytesDone is

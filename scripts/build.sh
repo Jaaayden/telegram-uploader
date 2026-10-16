@@ -17,9 +17,12 @@ if [[ "$HOST_OS" == "Darwin" ]]; then
   export CGO_LDFLAGS="${CGO_LDFLAGS:+${CGO_LDFLAGS} }$MIN_VERSION_FLAG"
 fi
 
+VERSION="${VERSION:-$("$ROOT_DIR/scripts/version.sh")}"
+"$ROOT_DIR/scripts/check-version.sh"
+
 mkdir -p "$BUILD_DIR"
 "$GO_BIN" test ./...
-"$GO_BIN" build -trimpath -ldflags="-s -w" -o "$BUILD_DIR/$APP_NAME" ./cmd/tg-video-uploader
+"$GO_BIN" build -trimpath -ldflags="-s -w -X github.com/Jaaayden/telegram-uploader/internal/buildinfo.Version=$VERSION" -o "$BUILD_DIR/$APP_NAME" ./cmd/tg-video-uploader
 
 printf 'Built %s\n' "$BUILD_DIR/$APP_NAME"
 
