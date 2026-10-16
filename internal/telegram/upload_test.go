@@ -8,9 +8,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Jaaayden/telegram-uploader/internal/model"
 	"github.com/gotd/td/telegram/uploader"
 	"github.com/gotd/td/tg"
-	"github.com/Jaaayden/telegram-uploader/internal/model"
 )
 
 type zeroReader struct{}
@@ -331,5 +331,51 @@ func TestUploadProgressReporterDoesNotBlockWorkersDuringCallback(t *testing.T) {
 	reporter.Close()
 	if err := <-firstDone; err != nil {
 		t.Fatalf("first Chunk() error = %v", err)
+	}
+}
+
+func TestUploadProgressReporterSpeedTracksRecentRate(t *testing.T) {
+	base := time.Unix(1000, 0)
+	clock := base
+	reporter := newUploadProgressReporter(nil)
+	defer reporter.Close()
+	reporter.interval = 0
+	reporter.started = base
+	reporter.now = func() time.Time { return clock }
+
+	record := func(offset time.Duration, uploaded int64) float64 {
+		clock = base.Add(offset)
+		reporter.mu.Lock()
+		defer reporter.mu.Unlock()
+		return reporter.recordSample(clock, uploaded)
+	}
+
+	// 10 s at 1 MB/s, then 10 s at 10 MB/s.
+	for s := 1; s <= 10; s++ {
+		record(time.Duration(s)*time.Second, int64(s)*1_000_000)
+	}
+	var speed float64
+	for s := 11; s <= 20; s++ {
+		speed = record(time.Duration(s)*time.Second, 10_000_000+int64(s-10)*10_000_000)
+	}
+	lifetimeAverage := float64(110_000_000) / 20
+	if speed < 9_000_000 || speed > 11_000_000 {
+		t.Fatalf("recent speed = %.0f B/s, want about 10 MB/s", speed)
+	}
+	if speed <= lifetimeAverage {
+		t.Fatalf("recent speed %.0f should exceed the lifetime average %.0f", speed, lifetimeAverage)
+	}
+}
+
+func TestUploadProgressReporterFirstSampleUsesAverageSinceStart(t *testing.T) {
+	base := time.Unix(1000, 0)
+	reporter := newUploadProgressReporter(nil)
+	defer reporter.Close()
+	reporter.started = base
+	reporter.mu.Lock()
+	speed := reporter.recordSample(base.Add(2*time.Second), 4_000_000)
+	reporter.mu.Unlock()
+	if speed != 2_000_000 {
+		t.Fatalf("speed = %v, want 2000000", speed)
 	}
 }
