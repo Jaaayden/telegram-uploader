@@ -168,3 +168,47 @@ func indexOf(values []string, value string) int {
 	}
 	return -1
 }
+
+func TestScanSkipsFilesThatVanishDuringScan(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{"a.mp4", "gone.mp4", "b.mp4"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(name), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	original := lstat
+	t.Cleanup(func() { lstat = original })
+	lstat = func(path string) (os.FileInfo, error) {
+		if filepath.Base(path) == "gone.mp4" {
+			return nil, &os.PathError{Op: "lstat", Path: path, Err: os.ErrNotExist}
+		}
+		return original(path)
+	}
+
+	jobs, err := Scan(dir, 0)
+	if err != nil {
+		t.Fatalf("Scan() error = %v", err)
+	}
+	var names []string
+	for _, job := range jobs {
+		names = append(names, job.Name)
+	}
+	if !reflect.DeepEqual(names, []string{"a.mp4", "b.mp4"}) {
+		t.Fatalf("names = %v", names)
+	}
+}
+
+func TestScanStillFailsOnOtherInspectErrors(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "a.mp4"), []byte("a"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	original := lstat
+	t.Cleanup(func() { lstat = original })
+	lstat = func(path string) (os.FileInfo, error) {
+		return nil, &os.PathError{Op: "lstat", Path: path, Err: os.ErrPermission}
+	}
+	if _, err := Scan(dir, 0); err == nil {
+		t.Fatal("expected a permission error to be reported")
+	}
+}
