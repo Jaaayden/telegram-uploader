@@ -7,7 +7,7 @@ import (
 	"testing"
 
 	"github.com/Eyevinn/mp4ff/mp4"
-	"github.com/jayden/telegram-video-uploader/internal/model"
+	"github.com/Jaaayden/telegram-uploader/internal/model"
 )
 
 func TestParseMP4MetadataFastStart(t *testing.T) {

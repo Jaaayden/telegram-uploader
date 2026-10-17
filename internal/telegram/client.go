@@ -21,7 +21,8 @@ import (
 	"github.com/gotd/td/tg"
 	"golang.org/x/net/proxy"
 
-	"github.com/jayden/telegram-video-uploader/internal/model"
+	"github.com/Jaaayden/telegram-uploader/internal/buildinfo"
+	"github.com/Jaaayden/telegram-uploader/internal/model"
 )
 
 type Client struct {
@@ -126,7 +127,7 @@ func NewClient(cfg Config, events Events) (*Client, error) {
 		Device: gotdtelegram.DeviceConfig{
 			DeviceModel:    "Desktop",
 			SystemVersion:  "Windows/macOS",
-			AppVersion:     "1.2.0",
+			AppVersion:     buildinfo.Version,
 			SystemLangCode: "zh-Hans",
 			LangCode:       "zh-Hans",
 		},
