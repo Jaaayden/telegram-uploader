@@ -4,7 +4,7 @@ go 1.26.0
 
 require (
 	fyne.io/fyne/v2 v2.8.2
-	github.com/Eyevinn/mp4ff v0.55.0
+	github.com/Eyevinn/mp4ff v0.60.0
 	github.com/gotd/td v0.162.0
 	github.com/zalando/go-keyring v0.2.8
 	golang.org/x/net v0.61.0
