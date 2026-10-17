@@ -54,6 +54,7 @@ func Run(controller *coreapp.Controller, paths coreapp.Paths, secrets *credentia
 
 	settings, settingsErr := coreapp.LoadSettings(paths.Settings)
 	application := fyneapp.NewWithID("com.jayden.telegramvideouploader")
+	application.Settings().SetTheme(newAppTheme())
 	window := application.NewWindow("Telegram 视频顺序上传器")
 	u := newWindow(application, window, controller, paths, secrets, settings)
 	u.settingsLoadErr = settingsErr
@@ -72,6 +73,7 @@ func Run(controller *coreapp.Controller, paths coreapp.Paths, secrets *credentia
 // visible stderr.
 func ShowFatal(message string) {
 	application := fyneapp.NewWithID("com.jayden.telegramvideouploader")
+	application.Settings().SetTheme(newAppTheme())
 	win := application.NewWindow("Telegram 视频顺序上传器")
 	label := widget.NewLabel(message)
 	label.Wrapping = fyne.TextWrapWord
