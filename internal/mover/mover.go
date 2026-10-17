@@ -13,11 +13,10 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"runtime"
-	"strings"
 	"time"
 
-	"github.com/jayden/telegram-video-uploader/internal/model"
+	"github.com/Jaaayden/telegram-uploader/internal/fsutil"
+	"github.com/Jaaayden/telegram-uploader/internal/model"
 )
 
 // ProgressFunc receives progress for one move operation.  BytesDone is
@@ -66,7 +65,7 @@ func defaultMoveOps() moveOps {
 			return os.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode.Perm())
 		},
 		remove:  os.Remove,
-		syncDir: syncDirectory,
+		syncDir: fsutil.SyncDir,
 	}
 }
 
@@ -445,29 +444,6 @@ func emitProgress(cb ProgressFunc, done, total int64, at time.Time) {
 		BytesTotal: total,
 		At:         at,
 	})
-}
-
-func syncDirectory(directory string) error {
-	if runtime.GOOS == "windows" {
-		return nil
-	}
-	file, err := os.Open(directory)
-	if err != nil {
-		return err
-	}
-	syncErr := file.Sync()
-	closeErr := file.Close()
-	if syncErr != nil && !directorySyncUnsupported(syncErr) {
-		return syncErr
-	}
-	return closeErr
-}
-
-func directorySyncUnsupported(err error) bool {
-	message := strings.ToLower(err.Error())
-	return strings.Contains(message, "invalid argument") ||
-		strings.Contains(message, "not supported") ||
-		strings.Contains(message, "function not implemented")
 }
 
 // MoveBatch moves each source into destinationDir using the source basename.

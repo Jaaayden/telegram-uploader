@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -13,8 +14,11 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/jayden/telegram-video-uploader/internal/model"
+	"github.com/Jaaayden/telegram-uploader/internal/model"
 )
+
+// lstat is replaced in tests to simulate files that vanish during a scan.
+var lstat = os.Lstat
 
 // Scan returns one job for every regular, top-level MP4 file in dir.
 //
@@ -35,7 +39,12 @@ func Scan(dir string, maxBytes int64) ([]model.Job, error) {
 
 		// Lstat is intentional: Stat would follow a symlink and could make a
 		// symlink to a regular file look like an eligible file.
-		info, err := os.Lstat(path)
+		info, err := lstat(path)
+		if errors.Is(err, os.ErrNotExist) {
+			// The file was moved or deleted between ReadDir and Lstat; one
+			// vanished entry must not discard the whole scan.
+			continue
+		}
 		if err != nil {
 			return nil, fmt.Errorf("inspect %q: %w", path, err)
 		}

@@ -1,14 +1,14 @@
-module github.com/jayden/telegram-video-uploader
+module github.com/Jaaayden/telegram-uploader
 
-go 1.25.0
+go 1.26.0
 
 require (
 	fyne.io/fyne/v2 v2.8.0
 	github.com/Eyevinn/mp4ff v0.55.0
 	github.com/gotd/td v0.161.0
 	github.com/zalando/go-keyring v0.2.8
-	golang.org/x/net v0.57.0
-	golang.org/x/sys v0.47.0
+	golang.org/x/net v0.60.0
+	golang.org/x/sys v0.48.0
 )
 
 require (
@@ -71,13 +71,13 @@ require (
 	go.uber.org/atomic v1.11.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
 	go.uber.org/zap v1.28.0 // indirect
-	golang.org/x/crypto v0.54.0 // indirect
+	golang.org/x/crypto v0.57.0 // indirect
 	golang.org/x/exp v0.0.0-20230725093048-515e97ebf090 // indirect
-	golang.org/x/image v0.24.0 // indirect
-	golang.org/x/mod v0.38.0 // indirect
-	golang.org/x/sync v0.22.0 // indirect
-	golang.org/x/text v0.40.0 // indirect
-	golang.org/x/tools v0.48.0 // indirect
+	golang.org/x/image v0.45.0 // indirect
+	golang.org/x/mod v0.41.0 // indirect
+	golang.org/x/sync v0.23.0 // indirect
+	golang.org/x/text v0.42.0 // indirect
+	golang.org/x/tools v0.49.0 // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 	rsc.io/qr v0.2.0 // indirect

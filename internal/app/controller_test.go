@@ -13,8 +13,8 @@ import (
 	"time"
 
 	"github.com/Eyevinn/mp4ff/mp4"
-	"github.com/jayden/telegram-video-uploader/internal/model"
-	tgtransport "github.com/jayden/telegram-video-uploader/internal/telegram"
+	"github.com/Jaaayden/telegram-uploader/internal/model"
+	tgtransport "github.com/Jaaayden/telegram-uploader/internal/telegram"
 )
 
 func TestControllerUploadsSeriallyWithExactRequestAndProgress(t *testing.T) {

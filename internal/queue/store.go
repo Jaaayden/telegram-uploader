@@ -6,11 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
-	"runtime"
-	"strings"
 
-	"github.com/jayden/telegram-video-uploader/internal/model"
+	"github.com/Jaaayden/telegram-uploader/internal/fsutil"
+	"github.com/Jaaayden/telegram-uploader/internal/model"
 )
 
 const currentSchemaVersion = 1
@@ -69,45 +67,8 @@ func (s Store) Save(jobs []model.Job, channel model.Channel, paused bool) (err e
 		return fmt.Errorf("queue: encode store: %w", err)
 	}
 
-	dir := filepath.Dir(path)
-	base := filepath.Base(path)
-	tmp, err := os.CreateTemp(dir, "."+base+".tmp-*")
-	if err != nil {
-		return fmt.Errorf("queue: create temporary store: %w", err)
-	}
-	tmpPath := tmp.Name()
-	committed := false
-	closed := false
-	defer func() {
-		if !closed {
-			_ = tmp.Close()
-		}
-		if !committed {
-			_ = os.Remove(tmpPath)
-		}
-	}()
-
-	if err := tmp.Chmod(0o600); err != nil {
-		return fmt.Errorf("queue: set temporary store permissions: %w", err)
-	}
-	if _, err := tmp.Write(payload); err != nil {
-		return fmt.Errorf("queue: write temporary store: %w", err)
-	}
-	if err := tmp.Sync(); err != nil {
-		return fmt.Errorf("queue: sync temporary store: %w", err)
-	}
-	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("queue: close temporary store: %w", err)
-	}
-	closed = true
-
-	if err := os.Rename(tmpPath, path); err != nil {
-		return fmt.Errorf("queue: replace store: %w", err)
-	}
-	committed = true
-
-	if err := syncDirectory(dir); err != nil {
-		return fmt.Errorf("queue: sync store directory: %w", err)
+	if err := fsutil.AtomicWriteFile(path, payload, 0o600); err != nil {
+		return fmt.Errorf("queue: write store: %w", err)
 	}
 	return nil
 }
@@ -168,33 +129,4 @@ func schemaVersion(schemaVersion, version *int) (int, bool) {
 		return *version, true
 	}
 	return 0, false
-}
-
-// syncDirectory makes the rename durable on platforms/filesystems that
-// support directory fsync. Windows does not support opening a directory as a
-// syncable file, and some filesystems report the same limitation as EINVAL or
-// "operation not supported"; those cases are safe to ignore after the file
-// itself has already been synced and renamed.
-func syncDirectory(dir string) error {
-	if runtime.GOOS == "windows" {
-		return nil
-	}
-
-	f, err := os.Open(dir)
-	if err != nil {
-		return err
-	}
-	syncErr := f.Sync()
-	closeErr := f.Close()
-	if syncErr != nil && !directorySyncUnsupported(syncErr) {
-		return syncErr
-	}
-	return closeErr
-}
-
-func directorySyncUnsupported(err error) bool {
-	message := strings.ToLower(err.Error())
-	return strings.Contains(message, "invalid argument") ||
-		strings.Contains(message, "not supported") ||
-		strings.Contains(message, "function not implemented")
 }

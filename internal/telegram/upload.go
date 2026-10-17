@@ -15,7 +15,7 @@ import (
 	"github.com/gotd/td/telegram/uploader"
 	"github.com/gotd/td/tg"
 
-	"github.com/jayden/telegram-video-uploader/internal/model"
+	"github.com/Jaaayden/telegram-uploader/internal/model"
 )
 
 const (
@@ -25,7 +25,15 @@ const (
 	uploadPartSize                    = uploader.MaximumPartSize
 	uploadConnectionPoolMaximum int64 = UploadConcurrencyFast
 	progressUpdateInterval            = 100 * time.Millisecond
+	// speedWindow is how far back the displayed transfer rate looks. A longer
+	// window is smoother; a lifetime average would hide slowdowns and speedups.
+	speedWindow = 5 * time.Second
 )
+
+type speedSample struct {
+	at    time.Time
+	bytes int64
+}
 
 type uploadProgressReporter struct {
 	mu         sync.Mutex
@@ -41,10 +49,13 @@ type uploadProgressReporter struct {
 	stop       chan struct{}
 	done       chan struct{}
 	closeOnce  sync.Once
+	now        func() time.Time
+	samples    []speedSample
 }
 
 func newUploadProgressReporter(callback func(model.Progress)) *uploadProgressReporter {
 	p := &uploadProgressReporter{
+		now:      time.Now,
 		started:  time.Now(),
 		interval: progressUpdateInterval,
 		callback: callback,
@@ -71,7 +82,7 @@ func (p *uploadProgressReporter) Chunk(ctx context.Context, state uploader.Progr
 		return nil
 	}
 	p.lastBytes = state.Uploaded
-	now := time.Now()
+	now := p.now()
 	complete := state.Total > 0 && state.Uploaded >= state.Total
 	if !complete && !p.lastUpdate.IsZero() && now.Sub(p.lastUpdate) < p.interval {
 		p.mu.Unlock()
@@ -82,11 +93,7 @@ func (p *uploadProgressReporter) Chunk(ctx context.Context, state uploader.Progr
 		p.mu.Unlock()
 		return nil
 	}
-	elapsed := now.Sub(p.started).Seconds()
-	var speed float64
-	if elapsed > 0 {
-		speed = float64(state.Uploaded) / elapsed
-	}
+	speed := p.recordSample(now, state.Uploaded)
 	p.pending = model.Progress{
 		BytesDone:      state.Uploaded,
 		BytesTotal:     state.Total,
@@ -104,6 +111,26 @@ func (p *uploadProgressReporter) Chunk(ctx context.Context, state uploader.Progr
 	default:
 	}
 	return nil
+}
+
+// recordSample adds a point and returns the rate over the last speedWindow.
+// With a single sample it falls back to the average since the upload started.
+// The caller must hold p.mu.
+func (p *uploadProgressReporter) recordSample(at time.Time, uploaded int64) float64 {
+	p.samples = append(p.samples, speedSample{at: at, bytes: uploaded})
+	cutoff := at.Add(-speedWindow)
+	for len(p.samples) > 2 && p.samples[1].at.Before(cutoff) {
+		p.samples = p.samples[1:]
+	}
+	base := speedSample{at: p.started}
+	if len(p.samples) > 1 {
+		base = p.samples[0]
+	}
+	elapsed := at.Sub(base.at).Seconds()
+	if elapsed <= 0 {
+		return 0
+	}
+	return float64(uploaded-base.bytes) / elapsed
 }
 
 func (p *uploadProgressReporter) dispatch() {
