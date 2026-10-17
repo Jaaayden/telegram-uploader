@@ -69,6 +69,20 @@ func (c *Controller) CancelJob(id string) error {
 }
 
 func (c *Controller) CancelAll() error {
+	// If Start is still durably saving the queue (or the runner is between
+	// jobs), there is no active Telegram request to protect. Cancel the queue
+	// context immediately so the runner cannot begin a new file in the window
+	// before the revision-safe cancellation save below completes.
+	c.mu.RLock()
+	var cancelBeforeActive context.CancelFunc
+	if c.running && c.activeID == "" {
+		cancelBeforeActive = c.allCancel
+	}
+	c.mu.RUnlock()
+	if cancelBeforeActive != nil {
+		cancelBeforeActive()
+	}
+
 	for {
 		c.mu.RLock()
 		jobs := cloneJobsForPersistence(c.jobs)

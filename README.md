@@ -58,9 +58,23 @@
 - macOS：`~/Library/Application Support/TelegramVideoUploader/`
 - Windows：`%AppData%\TelegramVideoUploader\`
 
-诊断日志写在同一目录的 `app.log`（超过 2 MiB 时轮转为 `app.log.1`），只记录错误文本，不包含 Token、API Hash 或代理密码；反馈问题时可附上该文件。
+运行日志和异常诊断文件位于同一目录的 `logs/` 子目录，详见下文“关于与异常诊断”。
 
 敏感凭据不在上述目录的 JSON 文件中。
+
+## 关于与异常诊断
+
+应用“设置”页底部会显示当前版本、构建号和项目来源，并可直接打开源码仓库：
+
+- [github.com/Jaaayden/telegram-uploader](https://github.com/Jaaayden/telegram-uploader)
+
+每次启动都会在应用数据目录的 `logs/` 子目录写入低频运行日志。Windows 对应 `%AppData%\TelegramVideoUploader\logs\`，macOS 对应 `~/Library/Application Support/TelegramVideoUploader/logs/`。设置页可直接打开该文件夹。
+
+- `app.log` 记录启动、正常退出及少量关键生命周期信息；单文件上限 5 MiB，最多保留 3 份轮转备份。
+- `crash-*.log` 接收 Go runtime 能捕获的未处理 panic 或致命错误；正常运行且内容为空时会自动删除。
+- `run-state.json` 只记录运行 ID、系统/架构、进程号和起止时间，用于判断上一次是否完成了正常关闭。
+
+应用日志不会主动记录 Bot Token、API Hash、代理密码或 Telegram session，常见凭据格式还会在写入前脱敏。应用也不会自动上传任何日志。`crash-*.log` 是 Go runtime 原样写入的故障现场，无法经过应用的脱敏流程；向他人发送前请先自行检查内容。如果 Windows 上再次出现窗口无提示消失，请保留该时间段的 `app.log`、对应的 `crash-*.log`，并同时查看“可靠性监视器”或“事件查看器 → Windows 日志 → 应用程序”。原生图形驱动崩溃、系统重启、注销或外部程序终止进程不一定能写入 Go crash 文件，Windows 事件记录可用于补充判断。
 
 ## 本地构建
 

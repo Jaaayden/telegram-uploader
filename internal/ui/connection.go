@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"net"
 	"os"
 	"strconv"
@@ -19,6 +18,7 @@ import (
 
 	coreapp "github.com/Jaaayden/telegram-uploader/internal/app"
 	"github.com/Jaaayden/telegram-uploader/internal/credentials"
+	"github.com/Jaaayden/telegram-uploader/internal/diagnostics"
 	tgtransport "github.com/Jaaayden/telegram-uploader/internal/telegram"
 )
 
@@ -244,6 +244,13 @@ func (u *window) connectWithRequest(request connectionRequest, automatic bool) {
 	}
 	u.clientMu.Unlock()
 	u.stopConnectionRetryTimer()
+	_ = diagnostics.Logf(
+		"telegram_connect_requested generation=%d automatic=%t proxy=%t upload_concurrency=%d",
+		generation,
+		automatic,
+		request.proxyEnabled,
+		normalizeUploadConcurrency(request.uploadConcurrency),
+	)
 	u.connectButton.Disable()
 	if automatic {
 		u.connection.SetText("正在自动连接……")
@@ -251,7 +258,9 @@ func (u *window) connectWithRequest(request connectionRequest, automatic bool) {
 		u.connection.SetText("正在保存凭据并连接……")
 	}
 	u.updateActionAvailability()
-	go u.startConnectionAttempt(request, automatic, generation)
+	u.startConnectionWorker(func() {
+		u.startConnectionAttempt(request, automatic, generation)
+	})
 }
 
 func (u *window) startConnectionAttempt(request connectionRequest, automatic bool, generation uint64) {
@@ -363,9 +372,9 @@ func (u *window) connectAsync(request connectionRequest, automatic bool, generat
 	u.clientMu.Unlock()
 
 	u.doUI(func() { u.connection.SetText("正在启动 Telegram 客户端……") })
-	go u.runClient(client, ctx, automatic, generation)
-	go u.waitClientReady(client, ctx, automatic, generation)
-	go u.observeBinding(client, ctx, generation)
+	u.startConnectionWorker(func() { u.runClient(client, ctx, automatic, generation) })
+	u.startConnectionWorker(func() { u.waitClientReady(client, ctx, automatic, generation) })
+	u.startConnectionWorker(func() { u.observeBinding(client, ctx, generation) })
 }
 
 func (u *window) selectedUploadConcurrency() int {
@@ -378,7 +387,13 @@ func (u *window) selectedUploadConcurrency() int {
 }
 
 func (u *window) handleConnectionFailure(err error, automatic, retryable bool, generation uint64) {
-	slog.Warn("telegram connection failed", "error", err, "automatic", automatic, "retryable", retryable)
+	_ = diagnostics.Logf(
+		"telegram_connect_failed generation=%d automatic=%t retryable=%t error_type=%T",
+		generation,
+		automatic,
+		retryable,
+		err,
+	)
 	u.clientMu.Lock()
 	if generation != u.clientGeneration {
 		u.clientMu.Unlock()
@@ -424,6 +439,7 @@ func (u *window) handleConnectionFailure(err error, automatic, retryable bool, g
 }
 
 func (u *window) handleConnectionState(client *tgtransport.Client, generation uint64, state tgtransport.ConnectionState) {
+	_ = diagnostics.Logf("telegram_connection_state generation=%d state=%s", generation, state)
 	u.doUI(func() {
 		if client == nil || !u.isUsableCurrentClient(client, generation) || u.isClosed() {
 			return
@@ -453,9 +469,6 @@ func (u *window) handleConnectionState(client *tgtransport.Client, generation ui
 
 func (u *window) runClient(client *tgtransport.Client, ctx context.Context, automatic bool, generation uint64) {
 	err := client.Run(ctx)
-	if err != nil && ctx.Err() == nil {
-		slog.Warn("telegram client stopped", "error", err)
-	}
 	if errors.Is(err, tgtransport.ErrWrongBotSession) {
 		if removeErr := os.Remove(u.paths.Session); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
 			err = errors.Join(err, fmt.Errorf("清理旧 Bot 会话失败：%w", removeErr))
@@ -494,6 +507,14 @@ func (u *window) runClient(client *tgtransport.Client, ctx context.Context, auto
 		u.controller.SetGateway(nil)
 	}
 	retryable := shouldRetryConnection(err, ctx.Err(), u.isClosed())
+	_ = diagnostics.Logf(
+		"telegram_client_stopped generation=%d automatic=%t retryable=%t context_cancelled=%t error_type=%T",
+		generation,
+		automatic,
+		retryable,
+		ctx.Err() != nil,
+		err,
+	)
 	if err != nil && !errors.Is(err, context.Canceled) && !u.isClosed() && !automatic && !retryable {
 		u.showError(err)
 	}
@@ -553,6 +574,7 @@ func (u *window) waitClientReady(client *tgtransport.Client, ctx context.Context
 	if !u.isUsableCurrentClient(client, generation) || u.isClosed() {
 		return
 	}
+	_ = diagnostics.Logf("telegram_client_ready generation=%d max_upload_bytes=%d", generation, identity.MaxUploadBytes)
 	u.doUI(func() {
 		u.clientMu.Lock()
 		if client == nil || u.client != client || u.clientGeneration != generation || u.reconnectRequested || u.isClosed() {

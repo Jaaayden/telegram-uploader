@@ -494,6 +494,7 @@ func (c *Controller) persistCandidate(jobs []model.Job, channel model.Channel, p
 		return errQueueChanged
 	}
 	copyJobs := cloneJobsForPersistence(jobs)
+	c.preserveActiveProgressLocked(copyJobs)
 	c.mu.RUnlock()
 	if err := c.store.Save(copyJobs, channel, paused); err != nil {
 		return err

@@ -33,6 +33,10 @@ type Snapshot struct {
 	// can explain why the active file is still moving.
 	PauseRequested bool
 	ActiveID       string
+	// ActiveAttempt identifies the current upload attempt for ActiveID. It is
+	// part of structural snapshots so consumers can discard progress callbacks
+	// that belong to a previous retry of the same job.
+	ActiveAttempt uint64
 	// PendingRemovalIDs contains active jobs for which the user requested a
 	// removal. The IDs are intentionally not persisted: they describe an
 	// in-flight cancellation and are rebuilt only for the lifetime of the
@@ -43,6 +47,17 @@ type Snapshot struct {
 	TotalBytes        int64
 	BytesPerSecond    float64
 	ETA               time.Duration
+}
+
+// ProgressUpdate is the lightweight, non-structural update emitted while a
+// file is being uploaded. Unlike Snapshot it never contains the complete
+// queue. The controller keeps only the newest update because intermediate
+// byte counters have no value once a newer counter is available.
+type ProgressUpdate struct {
+	JobID          string
+	AttemptID      uint64
+	Uploaded       int64
+	BytesPerSecond float64
 }
 
 // RemovalResult describes a queue removal request. Removed is the number of
@@ -99,11 +114,13 @@ type Controller struct {
 	activeAttempt      uint64
 	attemptRevision    uint64
 	allCancel          context.CancelFunc
+	runDone            chan struct{}
 	cancelJobID        string
 	cancelAllRequested bool
 	retryWaitActive    bool
 	pendingRemoval     map[string]struct{}
 	updates            chan Snapshot
+	progressUpdates    chan ProgressUpdate
 	uploadRetryDelays  []time.Duration
 	uploadRetryWait    func(context.Context, time.Duration) error
 	// beforeUploadAttempt is a deterministic test seam for the narrow interval
@@ -135,6 +152,7 @@ func NewController(store QueueStore, fileMover *mover.Mover) *Controller {
 		store:             store,
 		mover:             fileMover,
 		updates:           make(chan Snapshot, 1),
+		progressUpdates:   make(chan ProgressUpdate, 1),
 		pendingRemoval:    make(map[string]struct{}),
 		uploadRetryDelays: append([]time.Duration(nil), defaultUploadRetryDelays...),
 		uploadRetryWait:   waitForUploadRetry,
@@ -148,6 +166,47 @@ func (c *Controller) SetGateway(gateway tgtransport.Gateway) {
 }
 
 func (c *Controller) Updates() <-chan Snapshot { return c.updates }
+
+// ProgressUpdates returns a single-slot stream containing the newest byte
+// counter for the active upload. Structural queue changes continue to use
+// Updates and therefore retain their complete-snapshot semantics.
+func (c *Controller) ProgressUpdates() <-chan ProgressUpdate { return c.progressUpdates }
+
+// WaitStopped waits until the active queue goroutine has completed its final
+// state transition and persistence pass. It lets the desktop shutdown path
+// distinguish a fully drained queue from a process that is about to exit while
+// cleanup is still in flight.
+func (c *Controller) WaitStopped(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	c.mu.RLock()
+	done := c.runDone
+	c.mu.RUnlock()
+	if done == nil {
+		return nil
+	}
+	// Prefer an already completed queue over a simultaneously cancelled
+	// caller context. This makes a zero-budget shutdown check deterministic.
+	select {
+	case <-done:
+		return nil
+	default:
+	}
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		// Completion may race the deadline between the optimistic check above
+		// and this select. Prefer a fully drained queue in that boundary case.
+		select {
+		case <-done:
+			return nil
+		default:
+		}
+		return ctx.Err()
+	}
+}
 
 func (c *Controller) Snapshot() Snapshot {
 	c.mu.RLock()
@@ -288,6 +347,31 @@ func (c *Controller) notifyLocked() {
 	}
 }
 
+// notifyProgressLocked publishes only the newest upload progress. This runs
+// while c.mu is held and intentionally never blocks an upload callback. A
+// full progress history is unnecessary: the UI and other observers can safely
+// render the latest monotonic byte counter.
+func (c *Controller) notifyProgressLocked(update ProgressUpdate) {
+	if c.progressUpdates == nil {
+		// Controllers constructed as zero values are used by a few focused tests;
+		// retain their old in-memory behavior without panicking.
+		return
+	}
+	select {
+	case c.progressUpdates <- update:
+		return
+	default:
+	}
+	select {
+	case <-c.progressUpdates:
+	default:
+	}
+	select {
+	case c.progressUpdates <- update:
+	default:
+	}
+}
+
 func (c *Controller) snapshotLocked() Snapshot {
 	jobs := append([]model.Job(nil), c.jobs...)
 	snapshot := Snapshot{
@@ -298,6 +382,7 @@ func (c *Controller) snapshotLocked() Snapshot {
 		Paused:         c.paused,
 		PauseRequested: c.pauseRequested,
 		ActiveID:       c.activeID,
+		ActiveAttempt:  c.activeAttempt,
 		LastError:      c.lastError,
 	}
 	if len(c.pendingRemoval) > 0 {
