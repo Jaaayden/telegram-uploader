@@ -4,12 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/Jaaayden/telegram-uploader/internal/diagnostics"
 	"github.com/Jaaayden/telegram-uploader/internal/media"
 	"github.com/Jaaayden/telegram-uploader/internal/model"
 	tgtransport "github.com/Jaaayden/telegram-uploader/internal/telegram"
@@ -21,9 +21,9 @@ func (c *Controller) Start(parent context.Context) error {
 	}
 	defer c.opMu.Unlock()
 	c.mu.Lock()
-	if c.running {
+	if c.running || c.runDone != nil {
 		c.mu.Unlock()
-		return errors.New("上传队列已经在运行")
+		return errors.New("上传队列正在运行或完成清理")
 	}
 	if c.gateway == nil {
 		c.mu.Unlock()
@@ -49,8 +49,10 @@ func (c *Controller) Start(parent context.Context) error {
 		parent = context.Background()
 	}
 	ctx, cancel := context.WithCancel(parent)
+	runDone := make(chan struct{})
 	c.running = true
 	c.allCancel = cancel
+	c.runDone = runDone
 	c.cancelJobID = ""
 	c.cancelAllRequested = false
 	c.lastError = ""
@@ -63,6 +65,7 @@ func (c *Controller) Start(parent context.Context) error {
 		c.mu.Lock()
 		c.running = false
 		c.allCancel = nil
+		c.runDone = nil
 		if wasPaused && c.pauseRevision == startPauseRevision {
 			c.paused = true
 			c.pauseRevision++
@@ -73,10 +76,12 @@ func (c *Controller) Start(parent context.Context) error {
 		c.pauseRequested = false
 		c.lastError = err.Error()
 		c.notifyLocked()
+		close(runDone)
 		c.mu.Unlock()
 		return fmt.Errorf("保存上传队列失败：%w", err)
 	}
-	go c.runQueue(ctx)
+	_ = diagnostics.Logf("queue_start jobs=%d", len(c.Snapshot().Jobs))
+	go c.runQueue(ctx, cancel)
 	return nil
 }
 
@@ -118,7 +123,10 @@ func openVerifiedJob(job model.Job) (*os.File, model.VideoMetadata, error) {
 	return file, metadata, nil
 }
 
-func (c *Controller) runQueue(ctx context.Context) {
+func (c *Controller) runQueue(ctx context.Context, cancel context.CancelFunc) {
+	c.mu.RLock()
+	runDone := c.runDone
+	c.mu.RUnlock()
 	defer func() {
 		c.mu.Lock()
 		c.running = false
@@ -138,6 +146,16 @@ func (c *Controller) runQueue(ctx context.Context) {
 		if err := c.persist(); err != nil {
 			c.setPersistenceError(err)
 		}
+		cancel()
+		if runDone != nil {
+			c.mu.Lock()
+			close(runDone)
+			if c.runDone == runDone {
+				c.runDone = nil
+			}
+			c.mu.Unlock()
+		}
+		_ = diagnostics.Logf("queue_stop")
 	}()
 
 	for {
@@ -150,6 +168,7 @@ func (c *Controller) runQueue(ctx context.Context) {
 		}
 
 		jobCtx, jobCancel := context.WithCancel(ctx)
+		_ = diagnostics.Logf("job_start id=%s position=%d size=%d", job.ID, job.Position, job.Size)
 		messageID, err := c.uploadJobWithRetry(jobCtx, job, channel, jobCancel)
 		jobContextCancelled := jobCtx.Err() != nil
 
@@ -166,6 +185,13 @@ func (c *Controller) runQueue(ctx context.Context) {
 		jobCancel()
 
 		if err != nil {
+			_ = diagnostics.Logf(
+				"job_attempt_end id=%s success=false error_type=%T cancelled=%t outcome_unknown=%t",
+				job.ID,
+				err,
+				errors.Is(err, context.Canceled),
+				errors.Is(err, tgtransport.ErrSendOutcomeUnknown),
+			)
 			if errors.Is(err, errQueueJobCancelled) || errors.Is(err, errQueueJobNotRunnable) {
 				c.finishActiveJob(job.ID)
 				continue
@@ -250,6 +276,7 @@ func (c *Controller) runQueue(ctx context.Context) {
 		}
 
 		completed := time.Now()
+		_ = diagnostics.Logf("job_sent id=%s message_id=%d", job.ID, messageID)
 		c.mu.Lock()
 		current := findJobIndexLocked(c.jobs, job.ID)
 		if current < 0 {
@@ -432,7 +459,12 @@ func (c *Controller) applyProgressForAttempt(jobID string, attemptID uint64, pro
 	}
 	job.Uploaded = progress.BytesDone
 	job.BytesPerSecond = progress.BytesPerSecond
-	c.notifyLocked()
+	c.notifyProgressLocked(ProgressUpdate{
+		JobID:          jobID,
+		AttemptID:      attemptID,
+		Uploaded:       job.Uploaded,
+		BytesPerSecond: job.BytesPerSecond,
+	})
 	c.mu.Unlock()
 }
 
@@ -476,15 +508,27 @@ func (c *Controller) prepareSendForAttempt(jobID string, attemptID uint64) error
 }
 
 func (c *Controller) failJob(jobID string, err error) error {
-	slog.Warn("upload job failed", "job", jobID, "error", err)
 	c.mu.Lock()
 	if currentIndex := findJobIndexLocked(c.jobs, jobID); currentIndex >= 0 {
-		c.jobs[currentIndex].State = model.JobFailed
+		cancelled := c.jobs[currentIndex].State == model.JobCancelled ||
+			c.cancelAllRequested || c.cancelJobID == jobID
+		if cancelled {
+			// A cancellation can be durably committed after runQueue captured its
+			// earlier flags but before this stale failure path acquires c.mu. Never
+			// let that older error overwrite the user's newer cancellation.
+			c.jobs[currentIndex].State = model.JobCancelled
+			c.jobs[currentIndex].Error = ""
+			c.lastError = ""
+		} else {
+			c.jobs[currentIndex].State = model.JobFailed
+			c.jobs[currentIndex].Error = err.Error()
+			c.lastError = err.Error()
+		}
 		c.jobs[currentIndex].BytesPerSecond = 0
-		c.jobs[currentIndex].Error = err.Error()
 		c.queueRevision++
+	} else {
+		c.lastError = err.Error()
 	}
-	c.lastError = err.Error()
 	c.notifyLocked()
 	c.mu.Unlock()
 	if persistErr := c.persist(); persistErr != nil {

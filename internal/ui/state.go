@@ -106,6 +106,11 @@ func (u *window) observeController() {
 				return
 			}
 			u.dispatchControllerSnapshot(snapshot)
+		case progress, ok := <-u.controller.ProgressUpdates():
+			if !ok {
+				return
+			}
+			u.dispatchControllerProgress(progress)
 		case <-u.rootCtx.Done():
 			return
 		}

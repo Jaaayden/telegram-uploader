@@ -8,6 +8,7 @@ import (
 	"net"
 	"time"
 
+	"github.com/Jaaayden/telegram-uploader/internal/diagnostics"
 	"github.com/Jaaayden/telegram-uploader/internal/model"
 	tgtransport "github.com/Jaaayden/telegram-uploader/internal/telegram"
 )
@@ -85,7 +86,8 @@ func (c *Controller) uploadJobWithRetry(
 		validState := retryIndex == 0 && (current.State == model.JobQueued || current.State == model.JobInterrupted) ||
 			retryIndex > 0 && (current.State == model.JobUploading || current.State == model.JobSending)
 		if !validState {
-			if current.State == model.JobCancelled {
+			currentState := current.State
+			if currentState == model.JobCancelled {
 				c.mu.Unlock()
 				_ = file.Close()
 				return 0, errQueueJobCancelled
@@ -97,7 +99,7 @@ func (c *Controller) uploadJobWithRetry(
 			}
 			c.mu.Unlock()
 			_ = file.Close()
-			return 0, fmt.Errorf("任务状态已变为 %s，停止上传", current.State)
+			return 0, fmt.Errorf("任务状态已变为 %s，停止上传", currentState)
 		}
 		current.Metadata = metadata
 		current.State = model.JobUploading
@@ -116,6 +118,7 @@ func (c *Controller) uploadJobWithRetry(
 		c.queueRevision++
 		c.notifyLocked()
 		c.mu.Unlock()
+		_ = diagnostics.Logf("upload_attempt_start id=%s attempt=%d retry=%d", job.ID, attemptID, retryIndex)
 		if err := c.persist(); err != nil {
 			_ = file.Close()
 			return 0, fmt.Errorf("%w：保存上传状态失败：%v", errQueuePersistenceLost, err)
@@ -186,6 +189,14 @@ func (c *Controller) uploadJobWithRetry(
 		}
 
 		delay := c.uploadRetryDelays[retryIndex]
+		_ = diagnostics.Logf(
+			"upload_retry_wait id=%s retry=%d max_retries=%d delay_ms=%d error_type=%T",
+			job.ID,
+			retryIndex+1,
+			len(c.uploadRetryDelays),
+			delay.Milliseconds(),
+			err,
+		)
 		if err := c.waitBeforeUploadRetry(ctx, job.ID, err, delay, retryIndex+1); err != nil {
 			return 0, err
 		}
