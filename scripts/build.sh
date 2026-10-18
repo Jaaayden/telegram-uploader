@@ -31,6 +31,7 @@ if [[ "$HOST_OS" == "Darwin" ]]; then
   mkdir -p "$APP_BUNDLE/Contents/MacOS" "$APP_BUNDLE/Contents/Resources"
   cp "$BUILD_DIR/$APP_NAME" "$APP_BUNDLE/Contents/MacOS/TelegramVideoUploader"
   cp "$ROOT_DIR/packaging/macos/Info.plist" "$APP_BUNDLE/Contents/Info.plist"
+  cp "$ROOT_DIR/packaging/macos/AppIcon.icns" "$APP_BUNDLE/Contents/Resources/AppIcon.icns"
   codesign --force --deep --sign - "$APP_BUNDLE"
   printf 'Built %s\n' "$APP_BUNDLE"
 fi

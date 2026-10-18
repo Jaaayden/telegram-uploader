@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#4FB3FF"/>
+      <stop offset="1" stop-color="#2B54D8"/>
+    </linearGradient>
+  </defs>
+  <!-- App tile -->
+  <rect x="64" y="64" width="896" height="896" rx="200" ry="200" fill="url(#bg)"/>
+  <!-- Play triangle: the video -->
+  <path d="M372.0 316.0 L372.0 550.0 Q372 620 433.0 585.6 L643.0 467.4 Q704 433 643.0 398.6 L433.0 280.4 Q372 246 372.0 316.0 Z" fill="#FFFFFF"/>
+  <!-- Progress bar: the sequential upload -->
+  <rect x="236" y="724" width="552" height="72" rx="36" ry="36" fill="#FFFFFF" fill-opacity="0.35"/>
+  <rect x="236" y="724" width="352" height="72" rx="36" ry="36" fill="#FFFFFF"/>
+</svg>

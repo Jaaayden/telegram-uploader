@@ -185,6 +185,7 @@ jobs:
           mkdir -p "$APP_BUNDLE/Contents/MacOS" "$APP_BUNDLE/Contents/Resources"
           cp "$BINARY" "$APP_BUNDLE/Contents/MacOS/TelegramVideoUploader"
           cp packaging/macos/Info.plist "$APP_BUNDLE/Contents/Info.plist"
+          cp packaging/macos/AppIcon.icns "$APP_BUNDLE/Contents/Resources/AppIcon.icns"
           plutil -lint "$APP_BUNDLE/Contents/Info.plist"
           codesign --force --deep --sign - "$APP_BUNDLE"
           codesign --verify --deep --strict "$APP_BUNDLE"
