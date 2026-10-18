@@ -15,11 +15,11 @@ func TestConstants(t *testing.T) {
 	if Name != "Telegram Video Uploader" {
 		t.Fatalf("Name = %q, want %q", Name, "Telegram Video Uploader")
 	}
-	if Version != "1.2.1" {
-		t.Fatalf("Version = %q, want %q", Version, "1.2.1")
+	if Version != "1.2.2" {
+		t.Fatalf("Version = %q, want %q", Version, "1.2.2")
 	}
-	if Build != 4 {
-		t.Fatalf("Build = %d, want %d", Build, 4)
+	if Build != 5 {
+		t.Fatalf("Build = %d, want %d", Build, 5)
 	}
 	if RepositoryURL != "https://github.com/Jaaayden/telegram-uploader" {
 		t.Fatalf("RepositoryURL = %q, want %q", RepositoryURL, "https://github.com/Jaaayden/telegram-uploader")

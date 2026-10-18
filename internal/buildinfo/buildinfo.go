@@ -7,7 +7,7 @@ const (
 	Name = "Telegram Video Uploader"
 
 	// Build is the monotonically increasing package/build number.
-	Build = 4
+	Build = 5
 
 	// RepositoryURL points to the source repository for this application.
 	RepositoryURL = "https://github.com/Jaaayden/telegram-uploader"
@@ -18,4 +18,4 @@ const (
 // release and CI builds override it with
 //
 //	-ldflags "-X github.com/Jaaayden/telegram-uploader/internal/buildinfo.Version=<version>"
-var Version = "1.2.1"
+var Version = "1.2.2"
