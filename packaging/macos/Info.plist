@@ -8,6 +8,8 @@
 	<string>Telegram 视频顺序上传器</string>
 	<key>CFBundleExecutable</key>
 	<string>TelegramVideoUploader</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
 	<key>CFBundleIdentifier</key>
 	<string>com.jayden.telegramvideouploader</string>
 	<key>CFBundleInfoDictionaryVersion</key>
