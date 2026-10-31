@@ -8,7 +8,7 @@ require (
 	github.com/go-text/typesetting v0.3.5
 	github.com/gotd/td v0.162.0
 	github.com/zalando/go-keyring v0.2.8
-	golang.org/x/net v0.61.0
+	golang.org/x/net v0.62.0
 	golang.org/x/sys v0.49.0
 )
 
