@@ -6,7 +6,7 @@ require (
 	fyne.io/fyne/v2 v2.8.2
 	github.com/Eyevinn/mp4ff v0.60.0
 	github.com/go-text/typesetting v0.3.5
-	github.com/gotd/td v0.162.0
+	github.com/gotd/td v0.163.0
 	github.com/zalando/go-keyring v0.2.8
 	golang.org/x/net v0.61.0
 	golang.org/x/sys v0.49.0
