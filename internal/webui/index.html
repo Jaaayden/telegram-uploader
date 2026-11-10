@@ -6,6 +6,16 @@
 <meta name="color-scheme" content="light dark">
 <title>Telegram 视频顺序上传器</title>
 <link rel="stylesheet" href="app.css">
+<script>
+// Reports script errors to the application log. It is a separate, tiny script
+// so it still works when the main one fails to parse.
+window.addEventListener('error', function (event) {
+  try {
+    window.__tvuPost(JSON.stringify({ id: 0, method: '__error', params: {
+      message: String(event.message), line: event.lineno || 0, column: event.colno || 0 } }));
+  } catch (ignored) {}
+});
+</script>
 </head>
 <body>
 <div id="app" class="app" hidden>
@@ -56,10 +66,17 @@
           <button id="moreBtn" class="btn ghost" type="button" title="更多队列操作">更多</button>
           <div id="moreMenu" class="popover menu right" hidden></div>
         </div>
-        <button id="addBtn" class="btn primary" type="button">
-          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M9 4h2v5h5v2h-5v5H9v-5H4V9h5V4Z"/></svg>
-          添加文件夹
-        </button>
+        <div class="popover-anchor">
+          <button id="addBtn" class="btn primary" type="button" title="也可以把视频或文件夹直接拖进窗口">
+            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M9 4h2v5h5v2h-5v5H9v-5H4V9h5V4Z"/></svg>
+            <span id="addBtnText">添加视频</span>
+          </button>
+          <div id="addMenu" class="popover menu right" hidden>
+            <button class="menu-item" type="button" data-act="add-files">选择视频文件…</button>
+            <button class="menu-item" type="button" data-act="add-folder">选择文件夹…</button>
+            <p class="hint">也可以把视频或文件夹直接拖进窗口。</p>
+          </div>
+        </div>
       </div>
     </div>
 
@@ -182,6 +199,7 @@
 </aside>
 <div id="scrim" class="scrim" hidden></div>
 
+<div id="dropHint" class="drop-hint" hidden><div><b>松开以添加到队列</b><span>支持 MP4 文件和文件夹（文件夹只取顶层的 MP4）</span></div></div>
 <div id="modalRoot"></div>
 <div id="toasts" class="toasts" aria-live="polite"></div>
 <script src="app.js"></script>

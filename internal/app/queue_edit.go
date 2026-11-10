@@ -10,6 +10,7 @@ import (
 
 	"github.com/Jaaayden/telegram-uploader/internal/model"
 	"github.com/Jaaayden/telegram-uploader/internal/scanner"
+	tgtransport "github.com/Jaaayden/telegram-uploader/internal/telegram"
 )
 
 func (c *Controller) Scan(folder string, maxBytes int64) error {
@@ -688,6 +689,24 @@ func resetPendingJobProgress(job *model.Job) {
 	job.StartedAt = nil
 	job.CompletedAt = nil
 	job.MoveDestination = ""
+	clearResume(job)
+}
+
+// clearResume forgets a partial upload, so the next attempt starts over.
+func clearResume(job *model.Job) {
+	job.UploadFileID = 0
+	job.UploadParts = 0
+	job.UploadPartSize = 0
+	job.UploadPartsAt = nil
+}
+
+// resumeToken returns the job's partial-upload state.
+func resumeToken(job *model.Job) tgtransport.ResumeToken {
+	token := tgtransport.ResumeToken{FileID: job.UploadFileID, Parts: job.UploadParts, PartSize: job.UploadPartSize, Size: job.Size}
+	if job.UploadPartsAt != nil {
+		token.At = *job.UploadPartsAt
+	}
+	return token
 }
 
 func (c *Controller) SetChannel(channel model.Channel) error {

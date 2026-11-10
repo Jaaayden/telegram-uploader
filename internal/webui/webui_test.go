@@ -16,8 +16,9 @@ func TestPageIsSelfContained(t *testing.T) {
 		t.Fatal("stylesheet or script was not inlined")
 	}
 	// An inlined script ends at the first closing tag, wherever it appears.
-	if strings.Count(page, "</script>") != 1 {
-		t.Fatalf("page contains %d closing script tags, want exactly 1", strings.Count(page, "</script>"))
+	// Two scripts: the small error reporter and the application.
+	if strings.Count(page, "</script>") != 2 {
+		t.Fatalf("page contains %d closing script tags, want exactly 2", strings.Count(page, "</script>"))
 	}
 	// The web view loads the page from a string limited to about 2 MB on
 	// Windows; stay far below that.

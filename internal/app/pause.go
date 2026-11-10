@@ -3,6 +3,8 @@ package app
 import (
 	"context"
 	"errors"
+
+	"github.com/Jaaayden/telegram-uploader/internal/model"
 )
 
 // Pause requests a soft pause. It never cancels the active Telegram request:
@@ -58,6 +60,36 @@ func (c *Controller) Pause() error {
 	// recoverable instead of making Pause wait for the longest retry delay.
 	if cancelRetryWait != nil {
 		cancelRetryWait()
+	}
+	return nil
+}
+
+// PauseNow pauses the queue and stops the file that is uploading right away
+// instead of letting it finish. The file stays runnable ("interrupted") and
+// keeps its resume state, so Start continues it — from where it stopped if
+// Telegram still has the uploaded parts, otherwise from the beginning.
+//
+// A file whose message is already being submitted is never interrupted: the
+// outcome of an aborted submission would be unknown. It finishes, as with
+// Pause.
+func (c *Controller) PauseNow() error {
+	if err := c.Pause(); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	var cancel context.CancelFunc
+	if c.running && c.activeID != "" && c.activeAttempt != 0 {
+		if index := findJobIndexLocked(c.jobs, c.activeID); index >= 0 && c.jobs[index].State == model.JobUploading {
+			// Recorded under the same lock prepareSendForAttempt takes, so the
+			// attempt either sees this and refuses to send, or has already
+			// become JobSending and is left alone.
+			c.interruptAttempt = c.activeAttempt
+			cancel = c.activeCancel
+		}
+	}
+	c.mu.Unlock()
+	if cancel != nil {
+		cancel()
 	}
 	return nil
 }

@@ -179,6 +179,12 @@ func run(opts options) int {
 			if err := json.Unmarshal([]byte(raw), &request); err != nil {
 				return
 			}
+			if request.Method == "__error" {
+				// A script error in the page: keep it for diagnosis.
+				_ = diagnostics.Logf("ui_script_error detail=%s", string(request.Params))
+				fmt.Fprintln(os.Stderr, "interface script error:", string(request.Params))
+				return
+			}
 			if smoke.handle(request.Method, request.Params) {
 				return
 			}
@@ -192,6 +198,7 @@ func run(opts options) int {
 				smoke.probe(window.Load())
 			}
 		},
+		OnFileDrop:     app.DropPaths,
 		OnCloseRequest: app.CloseRequested,
 		OnReady: func(created shell.Window) {
 			window.Store(&created)
@@ -239,6 +246,18 @@ func (h *desktopHost) PickFolder(title string) (string, error) {
 		return h.demoFolder, nil
 	}
 	return shell.PickFolder(title)
+}
+
+func (h *desktopHost) PickFiles(title string) ([]string, error) {
+	if h.headless {
+		// As above: development mode offers the demo folder's files.
+		entries, err := filepath.Glob(filepath.Join(h.demoFolder, "*.mp4"))
+		if h.demoFolder == "" {
+			return nil, nil
+		}
+		return entries, err
+	}
+	return shell.PickFiles(title)
 }
 
 func (h *desktopHost) OpenPath(path string) error { return shell.OpenPath(path) }

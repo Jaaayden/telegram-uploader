@@ -110,9 +110,13 @@ type Controller struct {
 	activeID      string
 	lastError     string
 
-	activeCancel       context.CancelFunc
-	activeAttempt      uint64
-	attemptRevision    uint64
+	activeCancel    context.CancelFunc
+	activeAttempt   uint64
+	attemptRevision uint64
+	// interruptAttempt is the attempt PauseNow decided to stop. It makes that
+	// attempt refuse to submit its message even if the upload finishes in the
+	// instant before the cancellation lands.
+	interruptAttempt   uint64
 	allCancel          context.CancelFunc
 	runDone            chan struct{}
 	cancelJobID        string

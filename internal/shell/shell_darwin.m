@@ -7,10 +7,46 @@
 extern void tvuGoMessage(char *message);
 extern int tvuGoCloseRequest(void);
 extern void tvuGoReady(void);
+extern void tvuGoDrop(char *jsonPaths);
+
+// Encodes file-system paths as a JSON array for Go. Returns nil when empty.
+static NSString *tvuPathsJSON(NSArray<NSURL *> *urls) {
+    NSMutableArray<NSString *> *paths = [NSMutableArray array];
+    for (NSURL *url in urls) {
+        if (url.isFileURL && url.path != nil) {
+            [paths addObject:url.path];
+        }
+    }
+    if (paths.count == 0) {
+        return nil;
+    }
+    NSData *data = [NSJSONSerialization dataWithJSONObject:paths options:0 error:nil];
+    return data == nil ? nil : [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+}
+
+// The page cannot see the paths of dropped files, so the view reads them from
+// the drag pasteboard. The drag still continues into WebKit, which gives the
+// page its usual drag events for the drop hint.
+@interface TVUWebView : WKWebView
+@end
+
+@implementation TVUWebView
+- (BOOL)performDragOperation:(id<NSDraggingInfo>)sender {
+    NSArray<NSURL *> *urls = [[sender draggingPasteboard]
+        readObjectsForClasses:@[[NSURL class]]
+                      options:@{NSPasteboardURLReadingFileURLsOnlyKey : @YES}];
+    NSString *json = tvuPathsJSON(urls);
+    if (json != nil) {
+        tvuGoDrop((char *)json.UTF8String);
+    }
+    return [super performDragOperation:sender];
+}
+@end
 
 static NSWindow *gWindow;
 static WKWebView *gWebView;
 static BOOL gForceClose;
+static BOOL gPageLoaded;
 
 @interface TVUDelegate : NSObject <NSApplicationDelegate, NSWindowDelegate, WKScriptMessageHandler, WKNavigationDelegate>
 @end
@@ -64,13 +100,18 @@ static BOOL gForceClose;
 - (void)webView:(WKWebView *)webView
     decidePolicyForNavigationAction:(WKNavigationAction *)action
                     decisionHandler:(void (^)(WKNavigationActionPolicy))decisionHandler {
-    // The page is a single document loaded from a string. Links are opened by
-    // Go in the default browser, never inside this window.
-    if (action.navigationType == WKNavigationTypeOther) {
+    // The page is a single document loaded from a string, once. Links are
+    // opened by Go in the default browser, and a dropped file must never
+    // replace the interface with a preview of that file.
+    if (!gPageLoaded && action.navigationType == WKNavigationTypeOther) {
         decisionHandler(WKNavigationActionPolicyAllow);
     } else {
         decisionHandler(WKNavigationActionPolicyCancel);
     }
+}
+
+- (void)webView:(WKWebView *)webView didFinishNavigation:(WKNavigation *)navigation {
+    gPageLoaded = YES;
 }
 
 @end
@@ -161,7 +202,7 @@ void tvuRun(const char *title, int width, int height, int minWidth, int minHeigh
             [configuration.preferences setValue:@YES forKey:@"developerExtrasEnabled"];
         }
 
-        gWebView = [[WKWebView alloc] initWithFrame:frame configuration:configuration];
+        gWebView = [[TVUWebView alloc] initWithFrame:frame configuration:configuration];
         gWebView.navigationDelegate = gDelegate;
         gWebView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
         // Let the window colour show until the page paints: no white flash in
@@ -210,6 +251,37 @@ char *tvuPickFolder(const char *title) {
         panel.prompt = @"选择";
         if ([panel runModal] == NSModalResponseOK && panel.URL.path != nil) {
             result = strdup(panel.URL.path.fileSystemRepresentation);
+        }
+    };
+    if ([NSThread isMainThread]) {
+        choose();
+    } else {
+        dispatch_sync(dispatch_get_main_queue(), choose);
+    }
+    return result;
+}
+
+char *tvuPickFiles(const char *title) {
+    NSString *message = [NSString stringWithUTF8String:title];
+    __block char *result = NULL;
+    void (^choose)(void) = ^{
+        NSOpenPanel *panel = [NSOpenPanel openPanel];
+        panel.canChooseFiles = YES;
+        panel.canChooseDirectories = NO;
+        panel.allowsMultipleSelection = YES;
+        panel.message = message;
+        panel.prompt = @"添加";
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        // The replacement needs the UniformTypeIdentifiers framework; the
+        // extension list is all this chooser needs.
+        panel.allowedFileTypes = @[ @"mp4" ];
+#pragma clang diagnostic pop
+        if ([panel runModal] == NSModalResponseOK) {
+            NSString *json = tvuPathsJSON(panel.URLs);
+            if (json != nil) {
+                result = strdup(json.UTF8String);
+            }
         }
     };
     if ([NSThread isMainThread]) {

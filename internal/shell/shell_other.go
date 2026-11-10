@@ -14,5 +14,8 @@ func Run(Options) error { return ErrUnsupported }
 // PickFolder is unavailable on this platform.
 func PickFolder(string) (string, error) { return "", ErrUnsupported }
 
+// PickFiles is unavailable on this platform.
+func PickFiles(string) ([]string, error) { return nil, ErrUnsupported }
+
 // ShowError prints the message; there is no window system to show it in.
 func ShowError(title, message string) { fmt.Fprintln(os.Stderr, title+": "+message) }

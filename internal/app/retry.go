@@ -49,9 +49,9 @@ func (c *Controller) uploadJobWithRetry(
 			c.beforeUploadAttempt(job)
 		}
 
-		// Reopen and revalidate the source for every attempt. Telegram uploads
-		// cannot resume a partially transferred file, and reusing an os.File at
-		// EOF would make the next attempt incomplete.
+		// Reopen and revalidate the source for every attempt: the file must be
+		// unchanged for a resumed upload to be valid, and a fresh handle keeps
+		// attempts independent of each other.
 		file, metadata, err := openVerifiedJob(job)
 		if err != nil {
 			return 0, err
@@ -101,9 +101,15 @@ func (c *Controller) uploadJobWithRetry(
 			_ = file.Close()
 			return 0, fmt.Errorf("任务状态已变为 %s，停止上传", currentState)
 		}
+		// Continue a recent partial upload of this file; otherwise start over.
+		resume := resumeToken(current)
+		if !resume.Fresh(current.Size, now) {
+			resume = tgtransport.ResumeToken{}
+			clearResume(current)
+		}
 		current.Metadata = metadata
 		current.State = model.JobUploading
-		current.Uploaded = 0
+		current.Uploaded = resume.ResumedBytes()
 		current.BytesPerSecond = 0
 		if retryIndex == 0 {
 			current.StartedAt = &now
@@ -157,6 +163,10 @@ func (c *Controller) uploadJobWithRetry(
 				Caption:  captionFromFilename(job.Name),
 				RandomID: job.RandomID,
 				Metadata: metadata,
+				Resume:   resume,
+				OnCheckpoint: func(token tgtransport.ResumeToken) {
+					c.applyCheckpoint(job.ID, attemptID, token)
+				},
 				BeforeSend: func() error {
 					return c.prepareSendForAttempt(job.ID, attemptID)
 				},

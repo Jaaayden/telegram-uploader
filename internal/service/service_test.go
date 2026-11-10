@@ -88,6 +88,7 @@ func (c *fakeClient) UploadVideo(ctx context.Context, request tgtransport.Upload
 type fakeHost struct {
 	mu     sync.Mutex
 	folder string
+	files  []string
 	quit   int
 }
 
@@ -95,6 +96,11 @@ func (h *fakeHost) PickFolder(string) (string, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return h.folder, nil
+}
+func (h *fakeHost) PickFiles(string) ([]string, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.files, nil
 }
 func (h *fakeHost) OpenPath(string) error { return nil }
 func (h *fakeHost) OpenURL(string) error  { return nil }
@@ -431,15 +437,20 @@ func TestInitReturnsFullQueueAndLaterEventsOnlyChanges(t *testing.T) {
 	})
 }
 
-func TestAddFolderMarksDuplicatesAndQueuesOnlySelection(t *testing.T) {
-	h := newHarness(t, nil)
-	h.seed(3)
-	h.connect()
+func (h *harness) waitForSnapshot(jobs int) {
+	h.t.Helper()
 	h.eventually("snapshot", func() bool {
 		h.service.mu.Lock()
 		defer h.service.mu.Unlock()
-		return len(h.service.snapshot.Jobs) == 3
+		return len(h.service.snapshot.Jobs) == jobs
 	})
+}
+
+func TestAddFolderMarksDuplicatesAndSkipsThemByDefault(t *testing.T) {
+	h := newHarness(t, nil)
+	h.seed(3)
+	h.connect()
+	h.waitForSnapshot(3)
 	h.host.folder = filepath.Join(h.root, "videos")
 	if err := demo.WriteSamples(h.host.folder, []demo.Sample{{Name: "video 0009.mp4", Size: 4096}, {Name: "video 0010.mp4", Size: 4096}}); err != nil {
 		t.Fatal(err)
@@ -452,16 +463,19 @@ func TestAddFolderMarksDuplicatesAndQueuesOnlySelection(t *testing.T) {
 		t.Fatalf("scan found %d candidates, want 5", len(scan.Candidates))
 	}
 	for index, candidate := range scan.Candidates {
-		if want := index < 3; candidate.Duplicate != want {
-			t.Fatalf("candidate %d duplicate = %v, want %v", index, candidate.Duplicate, want)
+		if want := index < 3; candidate.Duplicate != want || candidate.Replaceable != want {
+			t.Fatalf("candidate %d duplicate/replaceable = %v/%v, want %v", index, candidate.Duplicate, candidate.Replaceable, want)
+		}
+		if candidate.Duplicate && candidate.DuplicateState != string(model.JobQueued) {
+			t.Fatalf("candidate %d reports state %q", index, candidate.DuplicateState)
 		}
 	}
 	// Index 0 is a duplicate and 99 is out of range; only index 4 is added.
-	message, err := h.service.AddCandidates(scan.Token, []int{0, 4, 4, 99})
+	message, err := h.service.AddCandidates(scan.Token, []int{0, 4, 4, 99}, false)
 	if err != nil || message != "已添加 1 个视频" {
 		t.Fatalf("AddCandidates = %q, %v", message, err)
 	}
-	if _, err := h.service.AddCandidates(scan.Token, []int{3}); err == nil {
+	if _, err := h.service.AddCandidates(scan.Token, []int{3}, false); err == nil {
 		t.Fatal("a scan token must be single-use")
 	}
 	if got := len(h.controller.Snapshot().Jobs); got != 4 {
@@ -472,6 +486,183 @@ func TestAddFolderMarksDuplicatesAndQueuesOnlySelection(t *testing.T) {
 	cancelled, err := h.service.AddFolder()
 	if err != nil || !cancelled.Cancelled {
 		t.Fatalf("a dismissed folder chooser must report cancellation: %+v %v", cancelled, err)
+	}
+}
+
+func TestReplacingDuplicatesRequeuesThemAsNewEntries(t *testing.T) {
+	h := newHarness(t, nil)
+	jobs := h.seed(3)
+	h.connect()
+	h.waitForSnapshot(3)
+	// One entry was already handled; replacing it must queue it again.
+	if err := h.controller.CancelJob(jobs[1].ID); err != nil {
+		t.Fatal(err)
+	}
+	h.eventually("cancelled", func() bool {
+		h.service.mu.Lock()
+		defer h.service.mu.Unlock()
+		return h.service.snapshot.Jobs[1].State == model.JobCancelled
+	})
+
+	h.host.files = []string{jobs[1].Path, jobs[2].Path}
+	scan, err := h.service.AddFiles()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(scan.Candidates) != 2 || !scan.Candidates[0].Duplicate || scan.Candidates[0].DuplicateState != string(model.JobCancelled) {
+		t.Fatalf("unexpected scan: %+v", scan.Candidates)
+	}
+	message, err := h.service.AddCandidates(scan.Token, []int{0, 1}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if message != "已添加 2 个视频（其中 2 个替换了队列里的旧条目）" {
+		t.Fatalf("message = %q", message)
+	}
+	queue := h.controller.Snapshot().Jobs
+	if len(queue) != 3 {
+		t.Fatalf("queue has %d jobs, want 3 (replaced, not duplicated)", len(queue))
+	}
+	if queue[0].ID != jobs[0].ID {
+		t.Fatal("the untouched entry must keep its place")
+	}
+	for _, job := range queue[1:] {
+		if job.ID == jobs[1].ID || job.ID == jobs[2].ID {
+			t.Fatal("replaced entries must be new jobs with fresh identities")
+		}
+		if job.State != model.JobQueued {
+			t.Fatalf("replaced entry is %q, want queued", job.State)
+		}
+	}
+}
+
+func TestEntriesInFlightAreNeverReplaced(t *testing.T) {
+	h := newHarness(t, nil)
+	jobs := h.seed(2)
+	if err := h.controller.SetChannel(demo.Channel); err != nil {
+		t.Fatal(err)
+	}
+	client := h.connect()
+	release := make(chan struct{})
+	client.upload = func(ctx context.Context, _ tgtransport.UploadRequest, _ func(model.Progress)) (int, error) {
+		select {
+		case <-release:
+			return 1, nil
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		}
+	}
+	defer close(release)
+	h.waitForSnapshot(2)
+	if err := h.service.StartUploads(); err != nil {
+		t.Fatal(err)
+	}
+	h.eventually("uploading", func() bool {
+		h.service.mu.Lock()
+		defer h.service.mu.Unlock()
+		return h.service.snapshot.Jobs[0].State == model.JobUploading
+	})
+
+	scan, err := h.service.ScanPaths([]string{jobs[0].Path, jobs[1].Path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if scan.Candidates[0].Replaceable || !scan.Candidates[1].Replaceable {
+		t.Fatalf("only the waiting entry is replaceable: %+v", scan.Candidates)
+	}
+	message, err := h.service.AddCandidates(scan.Token, []int{0, 1}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if message != "已添加 1 个视频（其中 1 个替换了队列里的旧条目）；1 个仍在队列中处理，已跳过" {
+		t.Fatalf("message = %q", message)
+	}
+	queue := h.controller.Snapshot().Jobs
+	if len(queue) != 2 || queue[0].ID != jobs[0].ID || queue[0].State != model.JobUploading {
+		t.Fatalf("the uploading entry must be left alone: %+v", queue)
+	}
+}
+
+func TestSimilarFilesAndDroppedPathsAreReported(t *testing.T) {
+	h := newHarness(t, nil)
+	h.seed(2)
+	h.connect()
+	h.waitForSnapshot(2)
+	// A copy of a queued video in another folder: same name and size.
+	other := filepath.Join(h.root, "copies")
+	if err := demo.WriteSamples(other, []demo.Sample{{Name: "video 0001.mp4", Size: 4096}, {Name: "fresh.mp4", Size: 4096}}); err != nil {
+		t.Fatal(err)
+	}
+	h.service.DropPaths([]string{other, filepath.Join(other, "fresh.mp4"), filepath.Join(h.root, "settings.json")})
+	var scan ScanView
+	h.eventually("scan event", func() bool {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		for _, event := range h.events {
+			if view, ok := event.payload.(ScanView); ok && event.name == "scan" {
+				scan = view
+				return true
+			}
+		}
+		return false
+	})
+	if len(scan.Candidates) != 2 || scan.Ignored != 1 {
+		t.Fatalf("drop: %d candidates, %d ignored; want 2 and 1: %+v", len(scan.Candidates), scan.Ignored, scan)
+	}
+	for _, candidate := range scan.Candidates {
+		if candidate.Duplicate {
+			t.Fatalf("a different path is not a duplicate: %+v", candidate)
+		}
+		if want := candidate.Name == "video 0001.mp4"; candidate.Similar != want {
+			t.Fatalf("%s similar = %v, want %v", candidate.Name, candidate.Similar, want)
+		}
+	}
+}
+
+// TestScanAgainstLargeQueueStaysLinear guards the duplicate check: comparing
+// every candidate with every queued entry would be quadratic.
+func TestScanAgainstLargeQueueStaysLinear(t *testing.T) {
+	const queued, dropped = 5000, 300
+	h := newHarness(t, nil)
+	folder := filepath.Join(h.root, "drop")
+	samples := make([]demo.Sample, dropped)
+	paths := make([]string, dropped)
+	for index := range samples {
+		samples[index] = demo.Sample{Name: fmt.Sprintf("clip %04d.mp4", index), Size: 4096}
+		paths[index] = filepath.Join(folder, samples[index].Name)
+	}
+	if err := demo.WriteSamples(folder, samples); err != nil {
+		t.Fatal(err)
+	}
+	h.service.mu.Lock()
+	h.service.snapshot.Jobs = make([]model.Job, queued)
+	for index := range h.service.snapshot.Jobs {
+		path := fmt.Sprintf("/videos/video %05d.mp4", index)
+		if index < 100 {
+			path = paths[index] // the first hundred dropped files are queued already
+		}
+		h.service.snapshot.Jobs[index] = model.Job{ID: fmt.Sprintf("job-%05d", index), Name: filepath.Base(path), Path: path, Size: 700 << 20, State: model.JobQueued}
+	}
+	h.service.mu.Unlock()
+
+	started := time.Now()
+	scan, err := h.service.ScanPaths(paths)
+	elapsed := time.Since(started)
+	if err != nil {
+		t.Fatal(err)
+	}
+	duplicates := 0
+	for _, candidate := range scan.Candidates {
+		if candidate.Duplicate {
+			duplicates++
+		}
+	}
+	t.Logf("%d dropped files against %d queued: %v (includes reading %d files from disk)", dropped, queued, elapsed, dropped)
+	if duplicates != 100 || len(scan.Candidates) != dropped {
+		t.Fatalf("found %d duplicates among %d candidates, want 100 of %d", duplicates, len(scan.Candidates), dropped)
+	}
+	if elapsed > 3*time.Second {
+		t.Fatalf("scan took %v", elapsed)
 	}
 }
 
@@ -633,4 +824,81 @@ func TestJobDiffScalesWithChangesNotQueueLength(t *testing.T) {
 	if len(s.sentJobs) != total-1 {
 		t.Fatalf("baseline keeps %d rows after a removal; it must not grow without bound", len(s.sentJobs))
 	}
+}
+
+// A schedule can be set while uploading: the queue pauses at once and goes on
+// by itself when the time comes — no cancelling or resetting needed.
+func TestScheduleOnRunningQueuePausesNowAndResumesAtThatTime(t *testing.T) {
+	h := newHarness(t, nil)
+	h.seed(2)
+	if err := h.controller.SetChannel(demo.Channel); err != nil {
+		t.Fatal(err)
+	}
+	client := h.connect()
+	started := make(chan struct{})
+	var once sync.Once
+	client.upload = func(ctx context.Context, request tgtransport.UploadRequest, _ func(model.Progress)) (int, error) {
+		interrupted := false
+		once.Do(func() {
+			close(started)
+			<-ctx.Done() // still uploading when the schedule is set
+			interrupted = true
+		})
+		if interrupted {
+			return 0, ctx.Err()
+		}
+		if err := request.BeforeSend(); err != nil {
+			return 0, err
+		}
+		return 1, nil
+	}
+	h.waitForSnapshot(2)
+	if err := h.service.StartUploads(); err != nil {
+		t.Fatal(err)
+	}
+	<-started
+
+	at := time.Now().Add(2 * time.Second)
+	if err := h.service.SetSchedule(at.Unix()); err != nil {
+		t.Fatalf("a schedule must be accepted while uploading: %v", err)
+	}
+	h.eventually("paused", func() bool {
+		snapshot := h.controller.Snapshot()
+		return !snapshot.Running && snapshot.Paused && snapshot.Jobs[0].State == model.JobInterrupted
+	})
+	if view := h.service.State().Schedule; view.At == 0 || view.Due {
+		t.Fatalf("the schedule should be pending: %+v", view)
+	}
+	h.eventually("resumed and finished at the scheduled time", func() bool {
+		snapshot := h.controller.Snapshot()
+		return !snapshot.Running && snapshot.Jobs[0].State == model.JobSent && snapshot.Jobs[1].State == model.JobSent
+	})
+	if time.Now().Before(at.Truncate(time.Second)) {
+		t.Fatal("the queue resumed before the scheduled time")
+	}
+	if h.service.State().Schedule.At != 0 {
+		t.Fatal("the schedule must be consumed once it fired")
+	}
+}
+
+func TestScheduleOnPausedQueueResumesIt(t *testing.T) {
+	h := newHarness(t, nil)
+	h.seed(1)
+	if err := h.controller.SetChannel(demo.Channel); err != nil {
+		t.Fatal(err)
+	}
+	h.connect()
+	h.waitForSnapshot(1)
+	// Paused before anything ran, e.g. started by mistake and paused at once.
+	if err := h.service.PauseUploads(false); err != nil {
+		t.Fatal(err)
+	}
+	h.eventually("paused", func() bool { return h.controller.Snapshot().Paused })
+	if err := h.service.SetSchedule(time.Now().Add(2 * time.Second).Unix()); err != nil {
+		t.Fatalf("a schedule must be accepted on a paused queue: %v", err)
+	}
+	h.eventually("resumed by the schedule", func() bool {
+		snapshot := h.controller.Snapshot()
+		return !snapshot.Running && !snapshot.Paused && snapshot.Jobs[0].State == model.JobSent
+	})
 }

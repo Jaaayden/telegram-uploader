@@ -289,6 +289,7 @@ func (c *Controller) runQueue(ctx context.Context, cancel context.CancelFunc) {
 		c.jobs[current].ChannelID = channel.ID
 		c.jobs[current].CompletedAt = &completed
 		c.jobs[current].Error = ""
+		clearResume(&c.jobs[current])
 		c.queueRevision++
 		c.notifyLocked()
 		c.mu.Unlock()
@@ -468,6 +469,31 @@ func (c *Controller) applyProgressForAttempt(jobID string, attemptID uint64, pro
 	c.mu.Unlock()
 }
 
+// applyCheckpoint records how far a big upload got, in memory only: it is
+// written to disk with the next state change (pause, cancel, failure, exit),
+// never once per part. The zero token means Telegram dropped the parts.
+func (c *Controller) applyCheckpoint(jobID string, attemptID uint64, token tgtransport.ResumeToken) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.activeID != jobID || c.activeAttempt != attemptID {
+		return
+	}
+	index := findJobIndexLocked(c.jobs, jobID)
+	if index < 0 {
+		return
+	}
+	job := &c.jobs[index]
+	if token.FileID == 0 {
+		clearResume(job)
+		return
+	}
+	at := token.At
+	job.UploadFileID = token.FileID
+	job.UploadParts = token.Parts
+	job.UploadPartSize = token.PartSize
+	job.UploadPartsAt = &at
+}
+
 func (c *Controller) prepareSendForAttempt(jobID string, attemptID uint64) error {
 	c.mu.Lock()
 	currentIndex := findJobIndexLocked(c.jobs, jobID)
@@ -489,6 +515,11 @@ func (c *Controller) prepareSendForAttempt(jobID string, attemptID uint64) error
 		c.mu.Unlock()
 		return nil
 	}
+	if c.interruptAttempt == attemptID {
+		// PauseNow stopped this attempt; do not submit a message for it.
+		c.mu.Unlock()
+		return errQueuePaused
+	}
 	job.State = model.JobSending
 	job.Uploaded = job.Size
 	job.BytesPerSecond = 0
@@ -496,8 +527,8 @@ func (c *Controller) prepareSendForAttempt(jobID string, attemptID uint64) error
 	c.notifyLocked()
 	c.mu.Unlock()
 
-	// Partial file parts cannot resume, so intermediate byte counters stay in
-	// memory. This one transition is different: it is the durable boundary that
+	// Intermediate byte counters and resume checkpoints stay in memory. This
+	// one transition is different: it is the durable boundary that
 	// makes a crash during messages.sendMedia recover as Confirming rather than
 	// blindly retrying a possibly delivered message.
 	if err := c.persist(); err != nil {

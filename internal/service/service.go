@@ -53,6 +53,9 @@ type Client interface {
 type Host interface {
 	// PickFolder shows a folder chooser. It returns "" when cancelled.
 	PickFolder(title string) (string, error)
+	// PickFiles shows a multi-selection chooser for MP4 files. It returns an
+	// empty list when cancelled.
+	PickFiles(title string) ([]string, error)
 	// OpenPath reveals a local directory in the file manager.
 	OpenPath(path string) error
 	// OpenURL opens a web page in the default browser.

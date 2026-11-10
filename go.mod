@@ -5,7 +5,7 @@ go 1.26.0
 require (
 	github.com/Eyevinn/mp4ff v0.60.0
 	github.com/gotd/td v0.162.0
-	github.com/jchv/go-webview2 v0.0.0-20260205173254-56598839c808
+	github.com/wailsapp/go-webview2 v1.0.23
 	github.com/zalando/go-keyring v0.2.8
 	golang.org/x/net v0.61.0
 	golang.org/x/sys v0.49.0
