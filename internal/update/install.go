@@ -63,7 +63,8 @@ func (u *Updater) locate() (target, error) {
 		if filepath.Base(macOS) != "MacOS" || filepath.Base(contents) != "Contents" || !strings.HasSuffix(bundle, ".app") {
 			return target{}, fmt.Errorf("%w：程序不是从 .app 应用包运行的", ErrNotInstallable)
 		}
-		if strings.Contains(bundle, "/AppTranslocation/") {
+		// ToSlash keeps the check independent of the host's path separator.
+		if strings.Contains(filepath.ToSlash(bundle), "/AppTranslocation/") {
 			return target{}, fmt.Errorf("%w：请先把应用拖到“应用程序”文件夹，再从那里打开", ErrNotInstallable)
 		}
 		parent := filepath.Dir(bundle)
