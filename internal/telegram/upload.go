@@ -242,12 +242,7 @@ func (c *Client) UploadVideo(ctx context.Context, request UploadRequest, onProgr
 
 	progress := newUploadProgressReporter(onProgress)
 	uploadEngine := newUploadEngine(uploadAPI, progress, uploadConcurrency)
-	var inputFile tg.InputFileClass
-	if request.File != nil {
-		inputFile, err = uploadEngine.FromFile(requestCtx, request.File)
-	} else {
-		inputFile, err = uploadEngine.FromPath(requestCtx, request.Path)
-	}
+	inputFile, err := c.uploadFileData(requestCtx, uploadEngine, request, info)
 	progress.Close()
 	if err != nil {
 		return 0, fmt.Errorf("%w：上传视频数据失败：%w", ErrUploadData, err)
@@ -293,6 +288,29 @@ func (c *Client) UploadVideo(ctx context.Context, request UploadRequest, onProgr
 		return 0, fmt.Errorf("%w：消息已发送但无法读取消息 ID：%w", ErrSendOutcomeUnknown, err)
 	}
 	return messageID, nil
+}
+
+// uploadFileData transfers the file parts. With a rate limiter configured the
+// file is read through a pacing reader; otherwise gotd reads it directly.
+func (c *Client) uploadFileData(ctx context.Context, engine *uploader.Uploader, request UploadRequest, info os.FileInfo) (tg.InputFileClass, error) {
+	limiter := c.cfg.RateLimiter
+	if limiter == nil {
+		if request.File != nil {
+			return engine.FromFile(ctx, request.File)
+		}
+		return engine.FromPath(ctx, request.Path)
+	}
+	file := request.File
+	if file == nil {
+		opened, err := os.Open(filepath.Clean(request.Path))
+		if err != nil {
+			return nil, fmt.Errorf("打开视频文件失败：%w", err)
+		}
+		defer opened.Close()
+		file = opened
+	}
+	reader := &throttledReader{ctx: ctx, reader: file, limiter: limiter}
+	return engine.Upload(ctx, uploader.NewUpload(info.Name(), reader, info.Size()))
 }
 
 // prepareUploadRequest fills only the Telegram document filename. Caption is
