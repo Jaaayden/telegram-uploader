@@ -13,6 +13,10 @@ import (
 
 const settingsSchemaVersion = 1
 
+// DataDirEnv overrides the application data directory. It exists for
+// development, demos and automated smoke tests; end users never need it.
+const DataDirEnv = "TVU_DATA_DIR"
+
 type Paths struct {
 	Root     string
 	Settings string
@@ -21,11 +25,14 @@ type Paths struct {
 }
 
 func DefaultPaths() (Paths, error) {
-	configDir, err := os.UserConfigDir()
-	if err != nil {
-		return Paths{}, fmt.Errorf("读取系统配置目录失败：%w", err)
+	root := os.Getenv(DataDirEnv)
+	if root == "" {
+		configDir, err := os.UserConfigDir()
+		if err != nil {
+			return Paths{}, fmt.Errorf("读取系统配置目录失败：%w", err)
+		}
+		root = filepath.Join(configDir, "TelegramVideoUploader")
 	}
-	root := filepath.Join(configDir, "TelegramVideoUploader")
 	if err := os.MkdirAll(root, 0o700); err != nil {
 		return Paths{}, fmt.Errorf("创建应用数据目录失败：%w", err)
 	}
@@ -48,7 +55,17 @@ type Settings struct {
 	LastFolder         string `json:"last_folder,omitempty"`
 	ScheduledStartUnix int64  `json:"scheduled_start_unix,omitempty"`
 	UploadConcurrency  int    `json:"upload_concurrency"`
+	// UploadLimitKBps caps the upload rate in KiB per second. Zero means
+	// unlimited, which is also what settings files from older versions decode to.
+	UploadLimitKBps int `json:"upload_limit_kbps,omitempty"`
+	// DisableUpdateCheck turns off the automatic update check. It is stored
+	// negated so that older settings files keep the default (checking enabled).
+	DisableUpdateCheck bool `json:"disable_update_check,omitempty"`
 }
+
+// MaxUploadLimitKBps bounds the configurable limit (about 1 GiB/s) so a typo
+// cannot overflow the byte-rate arithmetic.
+const MaxUploadLimitKBps = 1 << 20
 
 type settingsDocument struct {
 	SchemaVersion int      `json:"schema_version"`
@@ -93,6 +110,12 @@ func SaveSettings(path string, settings Settings) error {
 }
 
 func normalizeSettings(settings Settings) Settings {
+	if settings.UploadLimitKBps < 0 {
+		settings.UploadLimitKBps = 0
+	}
+	if settings.UploadLimitKBps > MaxUploadLimitKBps {
+		settings.UploadLimitKBps = MaxUploadLimitKBps
+	}
 	switch settings.UploadConcurrency {
 	case tgtransport.UploadConcurrencyCompatibility,
 		tgtransport.UploadConcurrencyBalanced,

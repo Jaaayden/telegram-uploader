@@ -79,7 +79,6 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	write("internal/ui/icon.png", encodePNG(render(icon, 512)))
 	write("packaging/icon/icon-256.png", encodePNG(render(icon, 256)))
 	write("packaging/windows/icon.ico", ico([]int{16, 24, 32, 48, 64, 128, 256}, icon))
 

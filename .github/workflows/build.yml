@@ -13,11 +13,23 @@ on:
 permissions:
   contents: read
 
+# A newer push to the same pull request makes the older run pointless. Runs on
+# main and on tags are never cancelled: each one publishes a release.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # go.mod pins the minimum (1.26.0); build with the newest 1.26.x patch so
+  # standard-library security fixes reach CI and the shipped binaries.
+  GO_VERSION: '1.26.x'
+
 jobs:
   verify:
     name: Lint and test (Linux)
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -25,13 +37,22 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          # go.mod pins the minimum (1.26.0); build with the newest 1.26.x patch
-          # so standard-library security fixes reach CI and the shipped binaries.
-          go-version: '1.26.x'
+          go-version: ${{ env.GO_VERSION }}
           check-latest: true
-          cache: true
+          # Cached below with restore-keys: setup-go's own cache is keyed on
+          # go.sum alone, so every dependency update would start cold.
+          cache: false
 
-      - name: Check version consistency
+      - name: Restore Go caches
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-${{ runner.os }}-verify-${{ hashFiles('go.sum') }}
+          restore-keys: go-${{ runner.os }}-verify-
+
+      - name: Check version, formatting and modules
         shell: bash
         run: |
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
@@ -39,10 +60,6 @@ jobs:
           else
             ./scripts/check-version.sh
           fi
-
-      - name: Check formatting and modules
-        shell: bash
-        run: |
           unformatted="$(gofmt -l .)"
           if [[ -n "$unformatted" ]]; then
             echo "gofmt needed:" >&2
@@ -52,24 +69,26 @@ jobs:
           go mod verify
           go mod tidy -diff
 
-      # The Fyne UI needs a C toolchain and GL headers, so the headless
-      # packages are checked here and the UI is vetted and tested on the
-      # native macOS/Windows builds below.
-      - name: Vet, race-test and staticcheck headless packages
-        shell: bash
+      # Every package builds without a C toolchain on Linux (the window has a
+      # stub there), so the whole module is vetted and race-tested here. The
+      # Windows build is pure Go too and is vetted by cross-compiling.
+      - name: Vet (Linux and Windows)
         run: |
-          pkgs="$(go list ./... | grep -v -e '/internal/ui$' -e '/cmd/tg-video-uploader$')"
-          go vet $pkgs
-          go test -race $pkgs
-          go run honnef.co/go/tools/cmd/staticcheck@v0.8.2 $pkgs
+          go vet ./...
+          GOOS=windows GOARCH=amd64 go vet ./...
+
+      - name: Race tests
+        run: go test -race ./...
+
+      - name: Staticcheck
+        run: go run honnef.co/go/tools/cmd/staticcheck@v0.8.2 ./...
 
   vulncheck:
     name: Vulnerability scan
     # Not required for publishing: new advisories must not block a release,
     # but they should be visible on every run and weekly.
-    runs-on: macos-15
-    env:
-      CGO_ENABLED: 1
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -77,57 +96,32 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          # go.mod pins the minimum (1.26.0); build with the newest 1.26.x patch
-          # so standard-library security fixes reach CI and the shipped binaries.
-          go-version: '1.26.x'
+          go-version: ${{ env.GO_VERSION }}
           check-latest: true
-          cache: true
+          cache: false
 
-      - name: govulncheck
-        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
+      - name: Restore Go caches
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-${{ runner.os }}-vuln-${{ hashFiles('go.sum') }}
+          restore-keys: go-${{ runner.os }}-vuln-
 
-  test-and-build:
-    name: ${{ matrix.name }}
+      # The shipped platforms are scanned from Linux: both analyses are pure
+      # Go (the macOS window shim is excluded without cgo and has a stub).
+      - name: govulncheck (Windows and macOS code paths)
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.9.0
+          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 govulncheck ./...
+          GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 govulncheck ./...
+
+  macos:
+    name: macOS (arm64 and x86_64)
     if: github.event_name != 'schedule'
-    runs-on: ${{ matrix.os }}
-    env:
-      CGO_ENABLED: 1
-      MACOSX_DEPLOYMENT_TARGET: ${{ matrix.deployment_target }}
-      CGO_CFLAGS: ${{ matrix.cgo_cflags }}
-      CGO_CXXFLAGS: ${{ matrix.cgo_cflags }}
-      CGO_LDFLAGS: ${{ matrix.cgo_ldflags }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: macOS arm64
-            os: macos-15
-            artifact: TelegramVideoUploader-macos-arm64
-            extension: ""
-            ldflags: -s -w
-            upload: build/TelegramVideoUploader-macos-arm64.zip
-            deployment_target: '11.0'
-            cgo_cflags: -O2 -g -mmacosx-version-min=11.0
-            cgo_ldflags: -mmacosx-version-min=11.0
-          - name: macOS x86_64
-            os: macos-15-intel
-            artifact: TelegramVideoUploader-macos-x86_64
-            extension: ""
-            ldflags: -s -w
-            upload: build/TelegramVideoUploader-macos-x86_64.zip
-            deployment_target: '11.0'
-            cgo_cflags: -O2 -g -mmacosx-version-min=11.0
-            cgo_ldflags: -mmacosx-version-min=11.0
-          - name: Windows amd64
-            os: windows-latest
-            artifact: TelegramVideoUploader-windows-amd64
-            extension: .exe
-            ldflags: -s -w -H=windowsgui
-            upload: build/TelegramVideoUploader-windows-amd64.exe
-            deployment_target: ""
-            cgo_cflags: -O2 -g
-            cgo_ldflags: ""
-
+    runs-on: macos-15
+    timeout-minutes: 20
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -135,18 +129,18 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          # go.mod pins the minimum (1.26.0); build with the newest 1.26.x patch
-          # so standard-library security fixes reach CI and the shipped binaries.
-          go-version: '1.26.x'
+          go-version: ${{ env.GO_VERSION }}
           check-latest: true
-          cache: true
+          cache: false
 
-      - name: Download dependencies
-        run: go mod download
-
-      - name: Check native C compiler
-        shell: bash
-        run: gcc --version
+      - name: Restore Go caches
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/Library/Caches/go-build
+          key: go-${{ runner.os }}-build-${{ hashFiles('go.sum') }}
+          restore-keys: go-${{ runner.os }}-build-
 
       - name: Run vet and tests
         run: |
@@ -155,52 +149,126 @@ jobs:
 
       - name: Compute build version
         id: version
-        shell: bash
         run: |
           base="$(./scripts/version.sh)"
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
-            version="$base"
+            echo "value=$base" >> "$GITHUB_OUTPUT"
           else
-            version="${base}-dev.${GITHUB_SHA::7}"
+            echo "value=${base}-dev.${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
           fi
-          echo "value=$version" >> "$GITHUB_OUTPUT"
 
-      - name: Build standalone application
+      # Both architectures are built on the one Apple-silicon runner; the
+      # Intel build only needs clang's -arch flag.
+      - name: Build and package both architectures
+        env:
+          BUILD_VERSION: ${{ steps.version.outputs.value }}
+          BUILD_COMMIT: ${{ github.sha }}
+          SKIP_TESTS: '1'
+        run: |
+          GOARCH=arm64 ARCHIVE=TelegramVideoUploader-macos-arm64.zip ./scripts/build.sh
+          GOARCH=amd64 ARCHIVE=TelegramVideoUploader-macos-x86_64.zip ./scripts/build.sh
+          ls -l build/*.zip
+          # Size budget: the archives are about 6-7 MB. A jump past 12 MB means
+          # a dependency defeated dead-code elimination or assets crept in.
+          for archive in build/*.zip; do
+            size="$(stat -f %z "$archive")"
+            if (( size > 12 * 1024 * 1024 )); then
+              echo "$archive is $size bytes, over the 12 MB budget" >&2
+              exit 1
+            fi
+          done
+
+      # Opens the real window in demo mode and checks that the interface
+      # loads and talks to Go in both directions.
+      - name: Smoke-test the packaged application
+        timeout-minutes: 3
+        run: |
+          build/arm64/TelegramVideoUploader.app/Contents/MacOS/TelegramVideoUploader --version
+          build/arm64/TelegramVideoUploader.app/Contents/MacOS/TelegramVideoUploader --smoke
+
+      - name: Upload application artifacts
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: TelegramVideoUploader-macos
+          path: build/TelegramVideoUploader-macos-*.zip
+          if-no-files-found: error
+
+  windows:
+    name: Windows amd64
+    if: github.event_name != 'schedule'
+    runs-on: windows-latest
+    timeout-minutes: 20
+    env:
+      # Pure Go: no C compiler, no cgo build of a GUI toolkit.
+      CGO_ENABLED: '0'
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: true
+          cache: false
+
+      - name: Restore Go caches
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~\go\pkg\mod
+            ~\AppData\Local\go-build
+          key: go-${{ runner.os }}-build-${{ hashFiles('go.sum') }}
+          restore-keys: go-${{ runner.os }}-build-
+
+      - name: Run vet and tests
+        run: |
+          go vet ./...
+          go test ./...
+
+      - name: Build application
         shell: bash
         env:
-          OUTPUT: build/${{ matrix.artifact }}${{ matrix.extension }}
-          LDFLAGS: ${{ matrix.ldflags }} -X github.com/Jaaayden/telegram-uploader/internal/buildinfo.Version=${{ steps.version.outputs.value }}
+          BUILD_COMMIT: ${{ github.sha }}
+          SKIP_TESTS: '1'
+          OUTPUT: build/TelegramVideoUploader-windows-amd64.exe
         run: |
-          mkdir -p build
-          go build -trimpath -ldflags="$LDFLAGS" -o "$OUTPUT" ./cmd/tg-video-uploader
+          base="$(./scripts/version.sh)"
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            export BUILD_VERSION="$base"
+          else
+            export BUILD_VERSION="${base}-dev.${GITHUB_SHA::7}"
+          fi
+          pwsh -File scripts/build.ps1
+          ls -l build/
+          # Size budget: the executable is about 20 MB. A jump past 30 MB means
+          # a dependency defeated dead-code elimination or assets crept in.
+          size="$(stat -c %s "$OUTPUT")"
+          if (( size > 30 * 1024 * 1024 )); then
+            echo "$OUTPUT is $size bytes, over the 30 MB budget" >&2
+            exit 1
+          fi
 
-      - name: Package macOS application bundle
-        if: runner.os == 'macOS'
-        shell: bash
-        env:
-          BINARY: build/${{ matrix.artifact }}
-          ARCHIVE: build/${{ matrix.artifact }}.zip
+      # Opens the real window (WebView2) in demo mode and checks that the
+      # interface loads and talks to Go in both directions.
+      - name: Smoke-test the application
+        timeout-minutes: 3
+        shell: pwsh
         run: |
-          APP_BUNDLE="build/TelegramVideoUploader.app"
-          mkdir -p "$APP_BUNDLE/Contents/MacOS" "$APP_BUNDLE/Contents/Resources"
-          cp "$BINARY" "$APP_BUNDLE/Contents/MacOS/TelegramVideoUploader"
-          cp packaging/macos/Info.plist "$APP_BUNDLE/Contents/Info.plist"
-          cp packaging/macos/AppIcon.icns "$APP_BUNDLE/Contents/Resources/AppIcon.icns"
-          plutil -lint "$APP_BUNDLE/Contents/Info.plist"
-          codesign --force --deep --sign - "$APP_BUNDLE"
-          codesign --verify --deep --strict "$APP_BUNDLE"
-          ditto -c -k --sequesterRsrc --keepParent "$APP_BUNDLE" "$ARCHIVE"
+          $process = Start-Process -FilePath build\TelegramVideoUploader-windows-amd64.exe -ArgumentList '--smoke' -Wait -PassThru
+          Write-Host "smoke exit code: $($process.ExitCode)"
+          if ($process.ExitCode -ne 0) { exit 1 }
 
       - name: Upload application artifact
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: ${{ matrix.artifact }}
-          path: ${{ matrix.upload }}
+          name: TelegramVideoUploader-windows-amd64
+          path: build/TelegramVideoUploader-windows-amd64.exe
           if-no-files-found: error
 
   publish-release:
     name: Publish GitHub Release
-    needs: [verify, test-and-build]
+    needs: [verify, macos, windows]
     if: >-
       success() &&
       github.event_name == 'push' &&
@@ -209,6 +277,7 @@ jobs:
         startsWith(github.ref, 'refs/tags/v')
       )
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     concurrency:
       group: release-${{ github.ref }}
       cancel-in-progress: false
@@ -222,6 +291,8 @@ jobs:
           path: release-assets
           merge-multiple: true
 
+      # The in-app updater looks these names up and verifies them against
+      # SHA256SUMS; do not rename them.
       - name: Verify release assets and generate checksums
         working-directory: release-assets
         shell: bash
@@ -231,6 +302,7 @@ jobs:
           test -f TelegramVideoUploader-macos-x86_64.zip
           test -f TelegramVideoUploader-windows-amd64.exe
           sha256sum TelegramVideoUploader-* > SHA256SUMS
+          cat SHA256SUMS
 
       - name: Publish release
         env:
