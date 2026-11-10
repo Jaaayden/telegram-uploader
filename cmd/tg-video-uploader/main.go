@@ -179,6 +179,7 @@ func run(opts options) int {
 			if err := json.Unmarshal([]byte(raw), &request); err != nil {
 				return
 			}
+			smoke.stage("message from page: " + request.Method)
 			if request.Method == "__error" {
 				// A script error in the page: keep it for diagnosis.
 				_ = diagnostics.Logf("ui_script_error detail=%s", string(request.Params))
@@ -311,10 +312,18 @@ type smokeCheck struct {
 
 func newSmokeCheck(enabled bool) *smokeCheck { return &smokeCheck{enabled: enabled} }
 
+// stage records progress of the self-test, so a failure shows how far it got.
+func (s *smokeCheck) stage(text string) {
+	if s.enabled {
+		fmt.Fprintln(os.Stderr, "smoke:", text)
+	}
+}
+
 func (s *smokeCheck) arm(window shell.Window) {
 	if !s.enabled {
 		return
 	}
+	s.stage("window created")
 	s.window.Store(&window)
 	time.AfterFunc(45*time.Second, func() {
 		fmt.Fprintln(os.Stderr, "SMOKE FAIL: the interface did not report within 45 seconds")
@@ -327,6 +336,7 @@ func (s *smokeCheck) probe(window *shell.Window) {
 	if !s.enabled || window == nil {
 		return
 	}
+	s.stage("page requested its state; asking it to report")
 	(*window).Eval(`(function(){var n=0,t=setInterval(function(){var rows=document.querySelectorAll('.row-item').length;` +
 		`if(rows>0||++n>100){clearInterval(t);window.__tvuPost(JSON.stringify({id:0,method:'__smoke',params:{rows:rows,` +
 		`title:document.getElementById('connTitle').textContent}}));}},100);})()`)

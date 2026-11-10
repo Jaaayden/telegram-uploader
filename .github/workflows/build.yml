@@ -255,7 +255,9 @@ jobs:
         timeout-minutes: 3
         shell: pwsh
         run: |
-          $process = Start-Process -FilePath build\TelegramVideoUploader-windows-amd64.exe -ArgumentList '--smoke' -Wait -PassThru
+          # A GUI program has no console; capture its output to show it.
+          $process = Start-Process -FilePath build\TelegramVideoUploader-windows-amd64.exe -ArgumentList '--smoke' -Wait -PassThru -RedirectStandardOutput smoke-out.txt -RedirectStandardError smoke-err.txt
+          Get-Content smoke-out.txt, smoke-err.txt -ErrorAction SilentlyContinue
           Write-Host "smoke exit code: $($process.ExitCode)"
           if ($process.ExitCode -ne 0) { exit 1 }
 

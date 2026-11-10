@@ -324,6 +324,12 @@ func Run(options Options) error {
 		_, _, _ = procSendMessageW.Call(hwnd, wmSetIcon, iconSmall, smallIcon)
 	}
 
+	// Show the window before embedding: a WebView2 created inside a hidden
+	// parent considers itself invisible and suspends the page's timers.
+	_, _, _ = procShowWindow.Call(hwnd, swShow)
+	_, _, _ = procUpdateWindow.Call(hwnd)
+	_, _, _ = procSetFocus.Call(hwnd)
+
 	chromium := w.chromium
 	chromium.DataPath = options.DataDir
 	chromium.Debug = options.Debug
@@ -359,11 +365,8 @@ func Run(options Options) error {
 	}
 	chromium.Init(bridgeScript)
 	chromium.Resize()
+	_ = chromium.Show()
 	chromium.NavigateToString(options.HTML)
-
-	_, _, _ = procShowWindow.Call(hwnd, swShow)
-	_, _, _ = procUpdateWindow.Call(hwnd)
-	_, _, _ = procSetFocus.Call(hwnd)
 	chromium.Focus()
 	if options.OnReady != nil {
 		options.OnReady(w)
