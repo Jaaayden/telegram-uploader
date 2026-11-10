@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Prints the application version. FyneApp.toml is the single source of truth;
-# scripts/check-version.sh verifies the other copies agree with it.
+# Prints the application version. The VERSION file is the single source of
+# truth: the build scripts inject it into the binary and the macOS Info.plist.
 set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-sed -n 's/^Version *= *"\(.*\)"$/\1/p' "$ROOT_DIR/FyneApp.toml" | head -n1
+tr -d '[:space:]' < "$ROOT_DIR/VERSION"

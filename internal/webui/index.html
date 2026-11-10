@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Telegram 视频顺序上传器</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<div id="app" class="app" hidden>
+  <header class="topbar">
+    <button id="connChip" class="conn" type="button" title="打开连接设置">
+      <span class="dot" id="connDot"></span>
+      <span class="conn-text">
+        <span id="connTitle" class="conn-title">正在加载…</span>
+        <span id="connSub" class="conn-sub"></span>
+      </span>
+    </button>
+    <div class="topbar-right">
+      <div class="popover-anchor">
+        <button id="limitChip" class="chip" type="button" title="上传限速">
+          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 3a8 8 0 0 0-6.9 12h13.8A8 8 0 0 0 10 3Zm0 2a6 6 0 0 1 5.6 8H4.4A6 6 0 0 1 10 5Zm3.2 2.4L10.7 10a1.5 1.5 0 1 1-1.4-1.4l2.6-2.5 1.3 1.3Z"/></svg>
+          <span id="limitChipText">不限速</span>
+        </button>
+        <div id="limitPopover" class="popover" hidden>
+          <div class="popover-title">上传限速</div>
+          <form id="limitCustomForm" class="popover-row">
+            <input id="limitCustom" class="input" type="number" min="0" step="0.05" placeholder="输入数值" aria-label="限速（MB/s）">
+            <span class="unit">MB/s</span>
+            <button class="btn small" type="submit">应用</button>
+          </form>
+          <div class="menu-sep"></div>
+          <div id="limitPresets" class="menu"></div>
+          <p class="hint">立即生效，包括正在上传的视频。</p>
+        </div>
+      </div>
+      <button id="updateBadge" class="chip accent" type="button" hidden></button>
+      <button id="settingsBtn" class="btn ghost" type="button">
+        <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M8.3 2h3.4l.5 2.2c.5.2.9.4 1.300.7l2.100-.7 1.700 3-1.600 1.500a6 6 0 0 1 0 1.500l1.600 1.500-1.700 3-2.100-.7c-.4.3-.8.5-1.300.7l-.5 2.200H8.300l-.5-2.200a6 6 0 0 1-1.300-.7l-2.100.7-1.700-3 1.600-1.500a6 6 0 0 1 0-1.500L2.700 7.200l1.700-3 2.100.7c.4-.3.8-.5 1.300-.7L8.300 2Zm1.700 5.500a2.500 2.500 0 1 0 0 5 2.500 2.500 0 0 0 0-5Z"/></svg>
+        设置
+      </button>
+    </div>
+  </header>
+
+  <div id="banner" class="banner" hidden>
+    <span id="bannerText"></span>
+    <button id="bannerAction" class="btn small" type="button"></button>
+  </div>
+
+  <main class="main">
+    <div class="toolbar">
+      <div id="filters" class="tabs" role="tablist"></div>
+      <div class="toolbar-right">
+        <div class="popover-anchor">
+          <button id="moreBtn" class="btn ghost" type="button" title="更多队列操作">更多</button>
+          <div id="moreMenu" class="popover menu right" hidden></div>
+        </div>
+        <button id="addBtn" class="btn primary" type="button">
+          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M9 4h2v5h5v2h-5v5H9v-5H4V9h5V4Z"/></svg>
+          添加文件夹
+        </button>
+      </div>
+    </div>
+
+    <div id="selectionBar" class="selection" hidden>
+      <span id="selectionText"></span>
+      <button class="btn small" data-act="reset-selected" type="button">重置为待上传</button>
+      <button class="btn small danger" data-act="remove-selected" type="button">从队列删除</button>
+      <button class="btn small ghost" data-act="select-none" type="button">取消选择</button>
+    </div>
+
+    <div id="listWrap" class="list-wrap">
+      <div id="list" class="list" tabindex="0"><div id="listSpacer" class="list-spacer"></div></div>
+      <div id="empty" class="empty" hidden></div>
+    </div>
+  </main>
+
+  <footer class="transport">
+    <button id="startBtn" class="btn primary big" type="button">开始上传</button>
+    <div class="transport-mid">
+      <div class="bar"><div id="totalBar" class="bar-fill"></div></div>
+      <div class="transport-line">
+        <span id="summary" class="summary"></span>
+        <span id="activity" class="activity"></span>
+      </div>
+    </div>
+    <div class="transport-right">
+      <button id="scheduleBtn" class="btn ghost" type="button">
+        <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 2a8 8 0 1 1 0 16 8 8 0 0 1 0-16Zm0 2a6 6 0 1 0 0 12 6 6 0 0 0 0-12Zm1 2v3.600l2.500 2.500-1.400 1.400L9 10.400V6h2Z"/></svg>
+        <span id="scheduleText">定时开始</span>
+      </button>
+      <button id="cancelAllBtn" class="btn ghost danger" type="button" hidden>全部取消</button>
+    </div>
+  </footer>
+</div>
+
+<aside id="settings" class="panel" hidden aria-label="设置">
+  <div class="panel-head">
+    <h2>设置</h2>
+    <button id="settingsClose" class="icon-btn" type="button" aria-label="关闭设置">✕</button>
+  </div>
+  <div class="panel-body">
+    <section id="secConnection">
+      <h3>Telegram 连接</h3>
+      <p id="settingsProblem" class="notice error" hidden></p>
+      <form id="connForm" autocomplete="off">
+        <label class="field"><span>API ID</span>
+          <input id="fApiId" class="input" inputmode="numeric" placeholder="例如 1234567"></label>
+        <label class="field"><span>API Hash</span>
+          <input id="fApiHash" class="input" type="password" placeholder="从 my.telegram.org 获取"></label>
+        <label class="field"><span>Bot Token</span>
+          <input id="fBotToken" class="input" type="password" placeholder="从 BotFather 获取"></label>
+        <p class="hint">
+          凭据保存在系统凭据库，不写入文件。
+          <a href="#" data-link="telegram-apps">获取 API ID / Hash</a> ·
+          <a href="#" data-link="botfather">创建 Bot</a>
+        </p>
+        <label class="check"><input id="fProxyEnabled" type="checkbox"><span>通过 SOCKS5 代理连接</span></label>
+        <div id="proxyFields" hidden>
+          <label class="field"><span>代理地址</span>
+            <input id="fProxyAddress" class="input" placeholder="host:port，例如 127.0.0.1:1080"></label>
+          <div class="field-row">
+            <label class="field"><span>用户名（可选）</span><input id="fProxyUser" class="input"></label>
+            <label class="field"><span>密码（可选）</span><input id="fProxyPass" class="input" type="password"></label>
+          </div>
+        </div>
+        <div class="row">
+          <button id="connSave" class="btn primary" type="submit">保存并连接</button>
+          <span id="connStatus" class="status-text"></span>
+        </div>
+      </form>
+    </section>
+
+    <section id="secChannel">
+      <h3>目标频道</h3>
+      <div class="row between">
+        <div>
+          <div id="channelName" class="strong">尚未绑定</div>
+          <div id="channelHint" class="hint">Bot 只需要频道的“发布消息”权限。</div>
+        </div>
+        <button id="bindBtn" class="btn" type="button">绑定频道</button>
+      </div>
+    </section>
+
+    <section id="secUpload">
+      <h3>上传</h3>
+      <div class="field"><span>并发档位</span>
+        <div id="concurrency" class="segmented"></div></div>
+      <p class="hint">网络不稳或代理受限用“兼容”；延迟高而带宽充足可试“高速”。从下一个视频起生效。</p>
+      <div class="field"><span>限速</span>
+        <form id="limitForm" class="limit-row">
+          <input id="limitInput" class="input" type="number" min="0" step="0.05" placeholder="不限速" aria-label="限速（MB/s）">
+          <span class="unit">MB/s</span>
+          <button class="btn" type="submit">应用</button>
+        </form>
+        <div id="limitSeg" class="segmented"></div></div>
+      <p id="limitHint" class="hint"></p>
+      <p id="maxSize" class="hint"></p>
+    </section>
+
+    <section id="secUpdate">
+      <h3>关于与更新</h3>
+      <div class="row between">
+        <div>
+          <div id="aboutVersion" class="strong"></div>
+          <div id="updateStatus" class="hint"></div>
+        </div>
+        <button id="updateBtn" class="btn" type="button">检查更新</button>
+      </div>
+      <div id="updateProgress" class="bar" hidden><div id="updateBar" class="bar-fill"></div></div>
+      <pre id="updateNotes" class="notes" hidden></pre>
+      <label class="check"><input id="fAutoUpdate" type="checkbox"><span>自动检查更新</span></label>
+      <div class="row wrap">
+        <button class="btn small ghost" type="button" data-link="repository">源码仓库</button>
+        <button class="btn small ghost" type="button" data-link="releases">发布页面</button>
+        <button id="logsBtn" class="btn small ghost" type="button">打开诊断日志文件夹</button>
+      </div>
+      <p class="hint">日志只保存在本机，不会自动上传；把 crash 日志发给别人之前请先检查内容。</p>
+    </section>
+  </div>
+</aside>
+<div id="scrim" class="scrim" hidden></div>
+
+<div id="modalRoot"></div>
+<div id="toasts" class="toasts" aria-live="polite"></div>
+<script src="app.js"></script>
+</body>
+</html>

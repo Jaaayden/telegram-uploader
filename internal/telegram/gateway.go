@@ -35,6 +35,9 @@ type Config struct {
 	// UploadConcurrency controls the number of parts transferred in parallel
 	// for one video. Zero and unsupported values use the balanced default.
 	UploadConcurrency int
+	// RateLimiter optionally caps the upload rate. It may be shared between
+	// clients and adjusted at any time; nil means unlimited.
+	RateLimiter *RateLimiter
 }
 
 const (

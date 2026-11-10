@@ -1,4 +1,4 @@
-package ui
+package service
 
 import (
 	"sync"

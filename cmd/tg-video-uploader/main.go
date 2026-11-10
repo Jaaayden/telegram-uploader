@@ -1,77 +1,347 @@
+// Command tg-video-uploader is the desktop application.
 package main
 
 import (
+	"encoding/json"
+	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	coreapp "github.com/Jaaayden/telegram-uploader/internal/app"
 	"github.com/Jaaayden/telegram-uploader/internal/buildinfo"
 	"github.com/Jaaayden/telegram-uploader/internal/credentials"
+	"github.com/Jaaayden/telegram-uploader/internal/demo"
 	"github.com/Jaaayden/telegram-uploader/internal/diagnostics"
 	"github.com/Jaaayden/telegram-uploader/internal/mover"
+	"github.com/Jaaayden/telegram-uploader/internal/platform"
 	"github.com/Jaaayden/telegram-uploader/internal/queue"
-	"github.com/Jaaayden/telegram-uploader/internal/ui"
+	"github.com/Jaaayden/telegram-uploader/internal/scanner"
+	"github.com/Jaaayden/telegram-uploader/internal/service"
+	"github.com/Jaaayden/telegram-uploader/internal/shell"
+	tgtransport "github.com/Jaaayden/telegram-uploader/internal/telegram"
+	"github.com/Jaaayden/telegram-uploader/internal/update"
+	"github.com/Jaaayden/telegram-uploader/internal/webui"
 )
 
-func main() {
-	os.Exit(run())
+const windowTitle = "Telegram 视频顺序上传器"
+
+type options struct {
+	demo    bool
+	smoke   bool
+	debug   bool
+	version bool
+	devHTTP string
+	waitPID int
 }
 
-func run() int {
-	paths, err := coreapp.DefaultPaths()
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "初始化应用目录失败：", err)
-		ui.ShowFatal(fmt.Sprintf("初始化应用目录失败：%v", err))
-		return 1
+func main() {
+	var opts options
+	flag.BoolVar(&opts.version, "version", false, "print the version and exit")
+	flag.BoolVar(&opts.demo, "demo", false, "run with sample videos and a simulated Telegram (no credentials, no network)")
+	flag.BoolVar(&opts.smoke, "smoke", false, "self-test: open the window in demo mode, check that the interface loads, exit")
+	flag.BoolVar(&opts.debug, "debug", false, "enable the web inspector")
+	flag.StringVar(&opts.devHTTP, "dev-http", "", "development only: serve the interface on this loopback address instead of opening a window")
+	flag.IntVar(&opts.waitPID, "wait-pid", 0, "wait for this process to exit before starting (used when restarting after an update)")
+	flag.Parse()
+	if opts.version {
+		fmt.Println(buildinfo.Version)
+		return
+	}
+	os.Exit(run(opts))
+}
+
+func run(opts options) int {
+	if opts.waitPID > 0 {
+		platform.WaitProcessExit(opts.waitPID, 20*time.Second)
+	}
+	if opts.smoke {
+		opts.demo = true
+	}
+	if opts.demo {
+		// Never touch the real queue, settings or keychain in demo mode.
+		directory, err := os.MkdirTemp("", "tvu-demo-*")
+		if err != nil {
+			return fatal("创建演示目录失败", err)
+		}
+		defer os.RemoveAll(directory)
+		_ = os.Setenv(coreapp.DataDirEnv, filepath.Join(directory, "data"))
 	}
 
-	diagnosticSession, diagnosticErr := diagnostics.Start(paths.Root)
+	paths, err := coreapp.DefaultPaths()
+	if err != nil {
+		return fatal("初始化应用目录失败", err)
+	}
+	session, diagnosticErr := diagnostics.Start(paths.Root)
 	if diagnosticErr != nil {
-		// Diagnostics must never become a new startup dependency. The GUI can
-		// still run, although Windows users will have less information if this
-		// particular run ends unexpectedly.
+		// Diagnostics must never become a startup dependency.
 		fmt.Fprintln(os.Stderr, "初始化诊断日志失败：", diagnosticErr)
 	}
 	cleanExit := false
-	if diagnosticSession != nil {
-		_ = diagnosticSession.Logf(
-			"application_start name=%q version=%s build=%d repository=%s previous_run_unclean=%t",
-			buildinfo.Name,
-			buildinfo.Version,
-			buildinfo.Build,
-			buildinfo.RepositoryURL,
-			diagnosticSession.PreviousRunUnclean(),
-		)
+	if session != nil {
+		_ = session.Logf("application_start name=%q version=%s commit=%s previous_run_unclean=%t",
+			buildinfo.Name, buildinfo.Version, buildinfo.Commit, session.PreviousRunUnclean())
 		defer func() {
 			if !cleanExit {
-				// Keep run-state.json unclean and the crash sink installed until
-				// process exit so the next launch can distinguish this path from a
-				// user-confirmed close.
-				_ = diagnosticSession.Logf("application_end clean=false")
+				// Keep run-state.json unclean so the next launch can tell this
+				// apart from a normal close.
+				_ = session.Logf("application_end clean=false")
 				return
 			}
-			if err := diagnosticSession.Close(); err != nil {
+			if err := session.Close(); err != nil {
 				fmt.Fprintln(os.Stderr, "关闭诊断日志失败：", err)
 			}
 		}()
 	}
 
-	secrets := credentials.NewStore()
-	queueStore := queue.NewStore(paths.Queue)
-	controller := coreapp.NewController(queueStore, mover.New())
-
-	var notices []error
+	controller := coreapp.NewController(queue.NewStore(paths.Queue), mover.New())
+	var notices []string
 	if err := controller.Load(); err != nil {
-		// The UI can still start without a queue file. The message contains no
-		// credentials and gives the user a chance to rescan the folder.
-		fmt.Fprintln(os.Stderr, "读取上传队列失败：", err)
+		// The interface can still start; the message contains no credentials.
 		_ = diagnostics.LogError(err, "queue_load_failed")
-		notices = append(notices, fmt.Errorf("读取上传队列失败：%w", err))
+		notices = append(notices, "读取上传队列失败："+err.Error())
 	} else {
 		_ = diagnostics.Logf("queue_loaded jobs=%d", len(controller.Snapshot().Jobs))
 	}
 
-	cleanExit = ui.Run(controller, paths, secrets, notices...)
+	host := &desktopHost{}
+	serviceOptions := service.Options{
+		Controller: controller,
+		Paths:      paths,
+		Secrets:    credentials.NewStore(),
+		Host:       host,
+		Notices:    notices,
+		Updater: &update.Updater{
+			Repository: buildinfo.Repository,
+			Current:    buildinfo.Version,
+			StageDir:   filepath.Join(paths.Root, "updates"),
+		},
+	}
+	if opts.demo {
+		folder, err := seedDemo(controller, paths)
+		if err != nil {
+			return fatal("准备演示数据失败", err)
+		}
+		host.demoFolder = folder
+		serviceOptions.Secrets = demo.NewSecrets()
+		serviceOptions.Updater = nil
+		serviceOptions.NewClient = func(config tgtransport.Config, events tgtransport.Events) (service.Client, error) {
+			return demo.NewClient(config, events), nil
+		}
+	}
+	app, err := service.New(serviceOptions)
+	if err != nil {
+		return fatal("启动失败", err)
+	}
+
+	if opts.devHTTP != "" {
+		host.headless = true
+		return serveDev(opts.devHTTP, app)
+	}
+
+	smoke := newSmokeCheck(opts.smoke)
+	var window atomic.Pointer[shell.Window]
+	send := func(message any) {
+		target := window.Load()
+		if target == nil {
+			return
+		}
+		encoded, err := json.Marshal(message)
+		if err != nil {
+			return
+		}
+		// encoding/json escapes <, >, & and the line separators, so the result
+		// is safe to embed in a script.
+		(*target).Eval("window.__tvuReceive(" + string(encoded) + ")")
+	}
+	app.SetEmitter(func(event string, payload any) {
+		send(map[string]any{"event": event, "payload": payload})
+	})
+
+	runErr := shell.Run(shell.Options{
+		Title:     windowTitle,
+		Width:     1080,
+		Height:    720,
+		MinWidth:  760,
+		MinHeight: 520,
+		HTML:      webui.Page(),
+		DataDir:   filepath.Join(paths.Root, "webview"),
+		Debug:     opts.debug,
+		OnMessage: func(raw string) {
+			var request struct {
+				ID     int64           `json:"id"`
+				Method string          `json:"method"`
+				Params json.RawMessage `json:"params"`
+			}
+			if err := json.Unmarshal([]byte(raw), &request); err != nil {
+				return
+			}
+			if smoke.handle(request.Method, request.Params) {
+				return
+			}
+			result, err := app.Handle(request.Method, request.Params)
+			if err != nil {
+				send(map[string]any{"id": request.ID, "error": err.Error()})
+				return
+			}
+			send(map[string]any{"id": request.ID, "result": result})
+			if request.Method == "init" {
+				smoke.probe(window.Load())
+			}
+		},
+		OnCloseRequest: app.CloseRequested,
+		OnReady: func(created shell.Window) {
+			window.Store(&created)
+			host.window.Store(&created)
+			app.Start()
+			smoke.arm(created)
+		},
+	})
+	if runErr != nil {
+		_ = diagnostics.LogError(runErr, "window_failed")
+		app.Shutdown(false)
+		fmt.Fprintln(os.Stderr, runErr)
+		if !opts.smoke {
+			// An unattended self-test must fail, not wait on a dialog.
+			shell.ShowError(windowTitle, runErr.Error())
+		}
+		return 1
+	}
+	cleanExit = app.Shutdown(false)
 	_ = diagnostics.Logf("ui_event_loop_returned clean=%t", cleanExit)
+	return smoke.exitCode()
+}
+
+func fatal(context string, err error) int {
+	message := fmt.Sprintf("%s：%v", context, err)
+	fmt.Fprintln(os.Stderr, message)
+	shell.ShowError(windowTitle, message)
+	return 1
+}
+
+// desktopHost connects the service to the native window.
+type desktopHost struct {
+	window     atomic.Pointer[shell.Window]
+	headless   bool
+	demoFolder string
+}
+
+func (h *desktopHost) PickFolder(title string) (string, error) {
+	if h.headless {
+		// A browser cannot show a native folder chooser; development mode
+		// uses the demo folder or an explicit override.
+		if folder := os.Getenv("TVU_DEV_FOLDER"); folder != "" {
+			return folder, nil
+		}
+		return h.demoFolder, nil
+	}
+	return shell.PickFolder(title)
+}
+
+func (h *desktopHost) OpenPath(path string) error { return shell.OpenPath(path) }
+func (h *desktopHost) OpenURL(url string) error   { return shell.OpenURL(url) }
+
+func (h *desktopHost) Quit() {
+	if window := h.window.Load(); window != nil {
+		(*window).Close()
+		return
+	}
+	if h.headless {
+		os.Exit(0)
+	}
+}
+
+// seedDemo fills the queue with sample videos and returns a second folder for
+// the "add folder" flow.
+func seedDemo(controller *coreapp.Controller, paths coreapp.Paths) (string, error) {
+	videos := filepath.Join(filepath.Dir(paths.Root), "课程视频")
+	extras := filepath.Join(filepath.Dir(paths.Root), "番外")
+	if err := demo.WriteSamples(videos, demo.QueueSamples); err != nil {
+		return "", err
+	}
+	if err := demo.WriteSamples(extras, demo.FolderSamples); err != nil {
+		return "", err
+	}
+	jobs, err := scanner.Scan(videos, demo.MaxUploadBytes)
+	if err != nil {
+		return "", err
+	}
+	if _, err := controller.AddJobs(jobs); err != nil {
+		return "", err
+	}
+	if err := controller.SetChannel(demo.Channel); err != nil {
+		return "", err
+	}
+	if err := coreapp.SaveSettings(paths.Settings, coreapp.Settings{APIID: 1234567, LastFolder: videos}); err != nil {
+		return "", err
+	}
+	return extras, nil
+}
+
+// smokeCheck implements --smoke: it proves that the packaged application can
+// create its window, load the page and exchange messages in both directions.
+type smokeCheck struct {
+	enabled bool
+	once    sync.Once
+	passed  atomic.Bool
+	window  atomic.Pointer[shell.Window]
+}
+
+func newSmokeCheck(enabled bool) *smokeCheck { return &smokeCheck{enabled: enabled} }
+
+func (s *smokeCheck) arm(window shell.Window) {
+	if !s.enabled {
+		return
+	}
+	s.window.Store(&window)
+	time.AfterFunc(45*time.Second, func() {
+		fmt.Fprintln(os.Stderr, "SMOKE FAIL: the interface did not report within 45 seconds")
+		window.Close()
+	})
+}
+
+// probe asks the page to report what it rendered once the queue is visible.
+func (s *smokeCheck) probe(window *shell.Window) {
+	if !s.enabled || window == nil {
+		return
+	}
+	(*window).Eval(`(function(){var n=0,t=setInterval(function(){var rows=document.querySelectorAll('.row-item').length;` +
+		`if(rows>0||++n>100){clearInterval(t);window.__tvuPost(JSON.stringify({id:0,method:'__smoke',params:{rows:rows,` +
+		`title:document.getElementById('connTitle').textContent}}));}},100);})()`)
+}
+
+func (s *smokeCheck) handle(method string, params json.RawMessage) bool {
+	if method != "__smoke" {
+		return false
+	}
+	if !s.enabled {
+		return true
+	}
+	s.once.Do(func() {
+		var report struct {
+			Rows  int    `json:"rows"`
+			Title string `json:"title"`
+		}
+		_ = json.Unmarshal(params, &report)
+		if report.Rows > 0 {
+			s.passed.Store(true)
+			fmt.Printf("SMOKE OK: %d queue rows rendered, status %q\n", report.Rows, report.Title)
+		} else {
+			fmt.Fprintln(os.Stderr, "SMOKE FAIL: the page loaded but rendered no queue rows")
+		}
+		if window := s.window.Load(); window != nil {
+			(*window).Close()
+		}
+	})
+	return true
+}
+
+func (s *smokeCheck) exitCode() int {
+	if s.enabled && !s.passed.Load() {
+		return 1
+	}
 	return 0
 }
