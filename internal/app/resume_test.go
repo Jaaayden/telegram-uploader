@@ -166,9 +166,9 @@ func TestInterruptedAttemptRefusesToSend(t *testing.T) {
 	}
 }
 
-func TestStaleOrLostCheckpointStartsOver(t *testing.T) {
+func TestOldCheckpointIsTriedAndALostOneStartsOver(t *testing.T) {
 	jobs := resumeTestJobs(t, 1)
-	old := time.Now().Add(-tgtransport.ResumeWindow - time.Minute)
+	old := time.Now().Add(-72 * time.Hour)
 	jobs[0].State = model.JobInterrupted
 	jobs[0].UploadFileID = 4242
 	jobs[0].UploadParts = 1
@@ -180,8 +180,7 @@ func TestStaleOrLostCheckpointStartsOver(t *testing.T) {
 	gateway.upload = func(_ context.Context, request tgtransport.UploadRequest, _ func(model.Progress)) (int, error) {
 		attempt++
 		if attempt == 1 {
-			// Telegram reports at send time that the parts are gone.
-			request.OnCheckpoint(checkpointFor(jobs[0], 1))
+			// The transport could not restore the parts under this file ID.
 			request.OnCheckpoint(tgtransport.ResumeToken{})
 			return 0, tgtransport.ErrUploadData
 		}
@@ -200,12 +199,40 @@ func TestStaleOrLostCheckpointStartsOver(t *testing.T) {
 	if len(calls) != 2 {
 		t.Fatalf("%d attempts, want 2", len(calls))
 	}
-	if calls[0].Resume.FileID != 0 {
-		t.Fatal("a checkpoint older than the resume window must be ignored")
+	if calls[0].Resume.FileID != 4242 || calls[0].Resume.Parts != 1 {
+		t.Fatalf("a checkpoint must be tried however old it is: %+v", calls[0].Resume)
 	}
 	if calls[1].Resume.FileID != 0 {
-		t.Fatal("after Telegram dropped the parts the retry must start from scratch")
+		t.Fatal("after the parts were reported lost the retry must start from scratch")
 	}
+}
+
+func TestRepairProgressIsShownWhileSending(t *testing.T) {
+	jobs := resumeTestJobs(t, 1)
+	store := &memoryQueueStore{jobs: jobs, channel: testChannel()}
+	gateway := &fakeGateway{}
+	repairing := make(chan struct{})
+	release := make(chan struct{})
+	gateway.upload = func(_ context.Context, request tgtransport.UploadRequest, _ func(model.Progress)) (int, error) {
+		if err := request.BeforeSend(); err != nil {
+			return 0, err
+		}
+		request.OnRepair(350, 1000)
+		close(repairing)
+		<-release
+		return 6, nil
+	}
+	controller := newLoadedController(t, store, gateway)
+	if err := controller.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	<-repairing
+	during := waitForSnapshot(t, controller, func(s Snapshot) bool { return s.Jobs[0].Note != "" })
+	if during.Jobs[0].State != model.JobSending || during.Jobs[0].Note != "Telegram 清理了之前上传的部分，正在补传 35%" {
+		t.Fatalf("state=%s note=%q", during.Jobs[0].State, during.Jobs[0].Note)
+	}
+	close(release)
+	waitForSnapshot(t, controller, func(s Snapshot) bool { return !s.Running && s.Jobs[0].State == model.JobSent })
 }
 
 func TestRetryAndResetDiscardCheckpoint(t *testing.T) {

@@ -190,7 +190,7 @@
         const rate = job.speed > 0 ? ' · ' + speed(job.speed) : '';
         return { tone: 'accent', text: `${warn}上传中 ${percent}%${rate}`, bar: job.size > 0 ? job.uploaded / job.size : 0, actions: [['cancel', '取消']] };
       }
-      case 'sending': return { tone: 'accent', text: '正在提交频道消息…', bar: 1, actions: [] };
+      case 'sending': return { tone: 'accent', text: job.note || '正在提交频道消息…', bar: 1, actions: [] };
       case 'confirming': return {
         tone: 'warn', text: '不确定是否已送达，请到频道里确认' + (job.error ? '（' + job.error + '）' : ''),
         actions: [['mark-sent', '已送达'], ['retry-confirm', '重新上传'], ['skip', '跳过']],
@@ -205,7 +205,7 @@
         const percent = job.size > 0 ? Math.floor((job.uploaded / job.size) * 100) : 0;
         return {
           tone: 'warn', actions: [['cancel', '取消']], bar: percent > 0 ? job.uploaded / job.size : null,
-          text: percent > 0 ? `已暂停在 ${percent}%，继续时接着传（停太久会从头开始）` : '已中断，继续时重新上传',
+          text: percent > 0 ? `已暂停在 ${percent}%，继续时接着传` : '已中断，继续时重新上传',
         };
       }
       default: return { tone: '', text: job.state, actions: [] };

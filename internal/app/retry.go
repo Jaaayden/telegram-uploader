@@ -101,9 +101,9 @@ func (c *Controller) uploadJobWithRetry(
 			_ = file.Close()
 			return 0, fmt.Errorf("任务状态已变为 %s，停止上传", currentState)
 		}
-		// Continue a recent partial upload of this file; otherwise start over.
+		// Continue a partial upload of this file whenever there is one.
 		resume := resumeToken(current)
-		if !resume.Fresh(current.Size, now) {
+		if !resume.Usable(current.Size) {
 			resume = tgtransport.ResumeToken{}
 			clearResume(current)
 		}
@@ -115,6 +115,7 @@ func (c *Controller) uploadJobWithRetry(
 			current.StartedAt = &now
 		}
 		current.Error = ""
+		current.Note = ""
 		c.activeID = job.ID
 		c.activeCancel = cancel
 		c.attemptRevision++
@@ -166,6 +167,9 @@ func (c *Controller) uploadJobWithRetry(
 				Resume:   resume,
 				OnCheckpoint: func(token tgtransport.ResumeToken) {
 					c.applyCheckpoint(job.ID, attemptID, token)
+				},
+				OnRepair: func(done, total int64) {
+					c.applyRepairProgress(job.ID, attemptID, done, total)
 				},
 				BeforeSend: func() error {
 					return c.prepareSendForAttempt(job.ID, attemptID)

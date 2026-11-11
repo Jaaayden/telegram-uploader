@@ -252,13 +252,18 @@ func (c *Client) UploadVideo(ctx context.Context, request UploadRequest, onProgr
 	progress := newUploadProgressReporter(onProgress)
 	uploadEngine := newUploadEngine(uploadAPI, progress, uploadConcurrency)
 	var inputFile tg.InputFileClass
+	// Set when this attempt continued an earlier one: how to send the earlier
+	// parts again should Telegram turn out to have dropped them.
+	var repair func() error
 	if request.File != nil && info.Size() > bigFileThreshold {
 		// Big files go through the resumable path so a pause or a dropped
 		// connection continues where it stopped.
-		if request.Resume.usable(info.Size(), uploadPartSize, time.Now()) {
-			progress.startAt(int64(request.Resume.Parts) * int64(uploadPartSize))
+		resumedParts := 0
+		if request.Resume.usable(info.Size(), uploadPartSize) {
+			resumedParts = request.Resume.Parts
+			progress.startAt(request.Resume.ResumedBytes())
 		}
-		inputFile, err = (&resumableUpload{
+		big := &resumableUpload{
 			api:        uploadAPI,
 			file:       request.File,
 			name:       info.Name(),
@@ -268,7 +273,12 @@ func (c *Client) UploadVideo(ctx context.Context, request UploadRequest, onProgr
 			limiter:    c.cfg.RateLimiter,
 			progress:   progress.Chunk,
 			checkpoint: request.OnCheckpoint,
-		}).run(requestCtx, request.Resume)
+		}
+		var fileID int64
+		inputFile, fileID, err = big.run(requestCtx, request.Resume)
+		if resumedParts > 0 {
+			repair = func() error { return big.repair(requestCtx, fileID, resumedParts, request.OnRepair) }
+		}
 	} else {
 		inputFile, err = c.uploadFileData(requestCtx, uploadEngine, request, info)
 	}
@@ -301,17 +311,36 @@ func (c *Client) UploadVideo(ctx context.Context, request UploadRequest, onProgr
 		video.SupportsStreaming()
 	}
 
+	submit := func() (tg.UpdatesClass, error) {
+		return message.NewSender(api).
+			WithUploader(uploadEngine).
+			To(&tg.InputPeerChannel{ChannelID: request.Channel.ID, AccessHash: request.Channel.AccessHash}).
+			RandomID(request.RandomID).
+			Media(requestCtx, video)
+	}
 	if err := c.reserveSendSlot(requestCtx); err != nil {
 		return 0, err
 	}
-	updatesResult, err := message.NewSender(api).
-		WithUploader(uploadEngine).
-		To(&tg.InputPeerChannel{ChannelID: request.Channel.ID, AccessHash: request.Channel.AccessHash}).
-		RandomID(request.RandomID).
-		Media(requestCtx, video)
+	updatesResult, err := submit()
+	if isMissingPartsError(err) && repair != nil {
+		// Telegram dropped parts of the earlier session. That answer means no
+		// message was created, so send those parts again under the same file
+		// ID and submit once more: nothing already uploaded is wasted.
+		if repairErr := repair(); repairErr != nil {
+			if ctxErr := requestCtx.Err(); ctxErr != nil {
+				// Stopped while restoring parts; no submission is in flight.
+				return 0, ctxErr
+			}
+			return 0, fmt.Errorf("%w：补传被 Telegram 清理的分片失败：%w", ErrUploadData, repairErr)
+		}
+		if err := c.reserveSendSlot(requestCtx); err != nil {
+			return 0, err
+		}
+		updatesResult, err = submit()
+	}
 	if isMissingPartsError(err) {
-		// Telegram no longer has (all of) the uploaded parts. Nothing was
-		// posted; forget the checkpoint so the retry uploads the whole file.
+		// Still missing (or nothing to repair with): nothing was posted.
+		// Forget the checkpoint so the retry uploads the whole file afresh.
 		if request.OnCheckpoint != nil {
 			request.OnCheckpoint(ResumeToken{})
 		}

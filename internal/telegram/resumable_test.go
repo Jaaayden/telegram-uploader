@@ -98,7 +98,7 @@ func TestResumableUploadSendsEveryPartOnce(t *testing.T) {
 		progressMu.Unlock()
 		return nil
 	}
-	input, err := upload.run(context.Background(), ResumeToken{})
+	input, _, err := upload.run(context.Background(), ResumeToken{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -120,6 +120,12 @@ func TestResumableUploadSendsEveryPartOnce(t *testing.T) {
 	if final.FileID != big.ID || final.Parts != 11 || final.PartSize != partSize || final.Size != int64(len(data)) {
 		t.Fatalf("final checkpoint = %+v", final)
 	}
+	// Workers finish in any order, but a checkpoint must never move back.
+	for index := 1; index < len(*checkpoints); index++ {
+		if (*checkpoints)[index].Parts <= (*checkpoints)[index-1].Parts {
+			t.Fatalf("checkpoint %d went from %d to %d parts", index, (*checkpoints)[index-1].Parts, (*checkpoints)[index].Parts)
+		}
+	}
 }
 
 func TestResumableUploadContinuesAfterFailureWithSameFileID(t *testing.T) {
@@ -128,7 +134,7 @@ func TestResumableUploadContinuesAfterFailureWithSameFileID(t *testing.T) {
 	store := &partStore{failAt: 8, failWith: errors.New("connection reset")}
 	// One worker makes "the first seven parts are stored" deterministic.
 	upload, checkpoints := newTestUpload(store, data, partSize, 1)
-	if _, err := upload.run(context.Background(), ResumeToken{}); err == nil {
+	if _, _, err := upload.run(context.Background(), ResumeToken{}); err == nil {
 		t.Fatal("the injected failure was swallowed")
 	}
 	token := (*checkpoints)[len(*checkpoints)-1]
@@ -146,7 +152,7 @@ func TestResumableUploadContinuesAfterFailureWithSameFileID(t *testing.T) {
 		}
 		return nil
 	}
-	input, err := resumed.run(context.Background(), token)
+	input, _, err := resumed.run(context.Background(), token)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -165,26 +171,36 @@ func TestResumableUploadContinuesAfterFailureWithSameFileID(t *testing.T) {
 	}
 }
 
-func TestResumableUploadIgnoresStaleOrMismatchedTokens(t *testing.T) {
+func TestResumableUploadIgnoresMismatchedTokensButNotOldOnes(t *testing.T) {
 	const partSize = 1024
 	data := testPayload(6 * partSize)
 	now := time.Now()
-	good := ResumeToken{FileID: 77, Parts: 3, PartSize: partSize, Size: int64(len(data)), At: now}
-	if !good.usable(int64(len(data)), partSize, now) {
-		t.Fatal("a recent matching token must be usable")
+	// Age is not a reason to give up: an old checkpoint is tried like a new one.
+	for name, at := range map[string]time.Time{"recent": now, "days old": now.Add(-72 * time.Hour), "no timestamp": {}} {
+		t.Run(name, func(t *testing.T) {
+			store := &partStore{}
+			upload, _ := newTestUpload(store, data, partSize, 2)
+			token := ResumeToken{FileID: 77, Parts: 3, PartSize: partSize, Size: int64(len(data)), At: at}
+			input, fileID, err := upload.run(context.Background(), token)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if input.(*tg.InputFileBig).ID != 77 || fileID != 77 || store.calls != 3 {
+				t.Fatalf("the checkpoint was not used: id=%d calls=%d", fileID, store.calls)
+			}
+		})
 	}
 	cases := map[string]ResumeToken{
-		"expired":        {FileID: 77, Parts: 3, PartSize: partSize, Size: int64(len(data)), At: now.Add(-ResumeWindow - time.Second)},
 		"other size":     {FileID: 77, Parts: 3, PartSize: partSize, Size: int64(len(data)) + 1, At: now},
 		"other layout":   {FileID: 77, Parts: 3, PartSize: partSize * 2, Size: int64(len(data)), At: now},
 		"too many parts": {FileID: 77, Parts: 99, PartSize: partSize, Size: int64(len(data)), At: now},
-		"no timestamp":   {FileID: 77, Parts: 3, PartSize: partSize, Size: int64(len(data))},
+		"no parts":       {FileID: 77, PartSize: partSize, Size: int64(len(data)), At: now},
 	}
 	for name, token := range cases {
 		t.Run(name, func(t *testing.T) {
 			store := &partStore{}
 			upload, _ := newTestUpload(store, data, partSize, 2)
-			input, err := upload.run(context.Background(), token)
+			input, _, err := upload.run(context.Background(), token)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -196,12 +212,58 @@ func TestResumableUploadIgnoresStaleOrMismatchedTokens(t *testing.T) {
 	}
 }
 
+// When Telegram has dropped the parts of the earlier session, only those are
+// sent again, under the same file ID: the total transferred is one file.
+func TestRepairResendsOnlyTheEarlierPartsUnderTheSameFileID(t *testing.T) {
+	const partSize = 1024
+	data := testPayload(20*partSize + 10)
+	store := &partStore{}
+	// An earlier session confirmed 8 parts, which Telegram has since dropped.
+	token := ResumeToken{FileID: 555, Parts: 8, PartSize: partSize, Size: int64(len(data))}
+	upload, _ := newTestUpload(store, data, partSize, 4)
+	if _, _, err := upload.run(context.Background(), token); err != nil {
+		t.Fatal(err)
+	}
+	if _, complete := store.assemble(555); complete {
+		t.Fatal("test setup: the earlier parts should be missing")
+	}
+	if store.calls != 13 {
+		t.Fatalf("the resumed run sent %d parts, want the 13 remaining ones", store.calls)
+	}
+
+	var mu sync.Mutex
+	var lastDone, lastTotal int64
+	err := upload.repair(context.Background(), 555, token.Parts, func(done, total int64) {
+		mu.Lock()
+		lastDone, lastTotal = max(lastDone, done), total
+		mu.Unlock()
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored, complete := store.assemble(555); !complete || !bytes.Equal(stored, data) {
+		t.Fatal("after the repair the file must be complete and identical")
+	}
+	if store.calls != 21 {
+		t.Fatalf("%d part uploads in total for a 21-part file; a repair must not resend what is still there", store.calls)
+	}
+	if lastDone != 8*partSize || lastTotal != 8*partSize {
+		t.Fatalf("repair progress ended at %d / %d", lastDone, lastTotal)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := upload.repair(ctx, 555, token.Parts, nil); !errors.Is(err, context.Canceled) {
+		t.Fatalf("a cancelled repair = %v", err)
+	}
+}
+
 func TestResumableUploadRetriesRefusedPartsAndStopsOnCancel(t *testing.T) {
 	const partSize = 1024
 	data := testPayload(4 * partSize)
 	store := &partStore{refuse: 3}
 	upload, _ := newTestUpload(store, data, partSize, 2)
-	input, err := upload.run(context.Background(), ResumeToken{})
+	input, _, err := upload.run(context.Background(), ResumeToken{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -212,7 +274,7 @@ func TestResumableUploadRetriesRefusedPartsAndStopsOnCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	cancelled, _ := newTestUpload(&partStore{}, data, partSize, 2)
-	if _, err := cancelled.run(ctx, ResumeToken{}); !errors.Is(err, context.Canceled) {
+	if _, _, err := cancelled.run(ctx, ResumeToken{}); !errors.Is(err, context.Canceled) {
 		t.Fatalf("run on a cancelled context = %v", err)
 	}
 }
@@ -225,7 +287,7 @@ func TestResumableUploadHonoursRateLimit(t *testing.T) {
 	upload, _ := newTestUpload(store, data, partSize, 4)
 	upload.limiter = limiter
 	start := clock.now()
-	if _, err := upload.run(context.Background(), ResumeToken{}); err != nil {
+	if _, _, err := upload.run(context.Background(), ResumeToken{}); err != nil {
 		t.Fatal(err)
 	}
 	// 1 MiB at 256 KiB/s is about four seconds of simulated time.

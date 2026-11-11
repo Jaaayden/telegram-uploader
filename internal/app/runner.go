@@ -494,6 +494,27 @@ func (c *Controller) applyCheckpoint(jobID string, attemptID uint64, token tgtra
 	job.UploadPartsAt = &at
 }
 
+// applyRepairProgress shows that parts Telegram had dropped are being sent
+// again. It runs once per part, but only notifies when the whole percentage
+// changes: at most a hundred snapshots for one repair.
+func (c *Controller) applyRepairProgress(jobID string, attemptID uint64, done, total int64) {
+	if total <= 0 {
+		return
+	}
+	note := fmt.Sprintf("Telegram 清理了之前上传的部分，正在补传 %d%%", min(done*100/total, 100))
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.activeID != jobID || c.activeAttempt != attemptID {
+		return
+	}
+	index := findJobIndexLocked(c.jobs, jobID)
+	if index < 0 || c.jobs[index].Note == note {
+		return
+	}
+	c.jobs[index].Note = note
+	c.notifyLocked()
+}
+
 func (c *Controller) prepareSendForAttempt(jobID string, attemptID uint64) error {
 	c.mu.Lock()
 	currentIndex := findJobIndexLocked(c.jobs, jobID)

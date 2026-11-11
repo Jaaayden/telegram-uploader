@@ -87,12 +87,15 @@ type UploadRequest struct {
 	Caption  string
 	RandomID int64
 	Metadata model.VideoMetadata
-	// Resume continues an earlier attempt for the same file when it is recent
-	// enough; the zero value starts over. OnCheckpoint reports how far the
+	// Resume continues an earlier attempt for the same file; the zero value
+	// starts over. OnCheckpoint reports how far the
 	// upload got so the caller can pass it back in a later request, and
 	// reports the zero token when Telegram no longer has the uploaded parts.
 	Resume       ResumeToken
 	OnCheckpoint func(ResumeToken)
+	// OnRepair reports progress while parts that Telegram had dropped are
+	// sent again before the message can be submitted.
+	OnRepair func(done, total int64)
 	// BeforeSend runs after every file part is confirmed but before the
 	// messages.sendMedia request. Returning an error guarantees that no channel
 	// message is submitted.

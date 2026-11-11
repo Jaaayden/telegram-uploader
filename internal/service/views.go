@@ -21,6 +21,8 @@ type JobView struct {
 	Uploaded  int64  `json:"uploaded"`
 	Error     string `json:"error,omitempty"`
 	MessageID int    `json:"messageId,omitempty"`
+	// Note explains a longer wait while the message is being submitted.
+	Note string `json:"note,omitempty"`
 	// Truncated marks an MP4 whose media data is shorter than declared.
 	Truncated bool `json:"truncated,omitempty"`
 	// Removing marks an active job that is being cancelled for removal.
@@ -66,7 +68,12 @@ func computeStats(jobs []model.Job) queueStats {
 }
 
 func jobView(job model.Job, removing bool) JobView {
+	note := ""
+	if job.State == model.JobSending {
+		note = job.Note
+	}
 	return JobView{
+		Note:      note,
 		ID:        job.ID,
 		Name:      job.Name,
 		Path:      job.Path,
