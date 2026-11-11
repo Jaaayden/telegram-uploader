@@ -52,11 +52,14 @@ type Job struct {
 	StartedAt       *time.Time    `json:"started_at,omitempty"`
 	CompletedAt     *time.Time    `json:"completed_at,omitempty"`
 	MoveDestination string        `json:"move_destination,omitempty"`
+	// Note is a transient remark about the attempt in progress. It is never
+	// persisted and only meaningful while the job is being sent.
+	Note string `json:"-"`
 
 	// Resume state of a partially uploaded big file: the file ID Telegram
 	// knows it by, how many leading parts are confirmed, and when the newest
-	// one was. Telegram only keeps parts for a limited time, so this is
-	// trusted for a short window and otherwise ignored.
+	// one was. Telegram only keeps parts for a limited time; a resumed upload
+	// finds out when it submits and then sends the missing ones again.
 	UploadFileID   int64      `json:"upload_file_id,omitempty"`
 	UploadParts    int        `json:"upload_parts,omitempty"`
 	UploadPartSize int        `json:"upload_part_size,omitempty"`

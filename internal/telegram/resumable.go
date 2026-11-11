@@ -22,16 +22,16 @@ const (
 	// bigFileThreshold is where Telegram switches to upload.saveBigFilePart.
 	// Only those uploads can be resumed; smaller files finish in seconds.
 	bigFileThreshold = 10 << 20
-	// ResumeWindow is how long a checkpoint is trusted. Telegram keeps
-	// uploaded parts "between several minutes and several hours"; an older
-	// checkpoint would upload the rest only to learn at the very end that the
-	// first parts are gone, so after this window the upload starts over.
-	ResumeWindow = 30 * time.Minute
 )
 
 // ResumeToken identifies a partially uploaded big file on Telegram's side:
 // the file ID chosen for it and how many leading parts were confirmed. The
 // zero value means "start a new upload".
+//
+// A token is always worth trying, however old it is. Telegram only keeps
+// parts for a limited, undocumented time, but it reports missing ones when
+// the message is submitted, and they can then be sent again under the same
+// file ID. Trying therefore never transfers more than starting over would.
 type ResumeToken struct {
 	FileID int64
 	// Parts is the number of parts confirmed without a gap from the start.
@@ -39,14 +39,14 @@ type ResumeToken struct {
 	// PartSize and Size guard against resuming with a different layout.
 	PartSize int
 	Size     int64
-	// At is when the newest part was confirmed.
+	// At is when the newest part was confirmed (informational).
 	At time.Time
 }
 
-// Fresh reports whether the token can still continue an upload of a file of
-// size bytes with this client's part size.
-func (t ResumeToken) Fresh(size int64, now time.Time) bool {
-	return t.usable(size, uploadPartSize, now)
+// Usable reports whether the token can continue an upload of a file of size
+// bytes with this client's part size.
+func (t ResumeToken) Usable(size int64) bool {
+	return t.usable(size, uploadPartSize)
 }
 
 // ResumedBytes is how much of the file the token already covers.
@@ -54,11 +54,9 @@ func (t ResumeToken) ResumedBytes() int64 {
 	return min(int64(t.Parts)*int64(t.PartSize), t.Size)
 }
 
-// usable reports whether the token can continue an upload of size bytes.
-func (t ResumeToken) usable(size int64, partSize int, now time.Time) bool {
+func (t ResumeToken) usable(size int64, partSize int) bool {
 	return t.FileID != 0 && t.Parts > 0 && t.PartSize == partSize && t.Size == size &&
-		int64(t.Parts)*int64(partSize) < size+int64(partSize) &&
-		!t.At.IsZero() && now.Sub(t.At) < ResumeWindow
+		int64(t.Parts)*int64(partSize) < size+int64(partSize)
 }
 
 // bigPartSaver is the one RPC the resumable uploader needs.
@@ -92,29 +90,27 @@ func newFileID() (int64, error) {
 	return int64(binary.LittleEndian.Uint64(raw[:])), nil
 }
 
+func (u *resumableUpload) totalParts() int {
+	return int((u.size + int64(u.partSize) - 1) / int64(u.partSize))
+}
+
 // run uploads every part that token does not already cover and returns the
-// input file for messages.sendMedia.
-func (u *resumableUpload) run(ctx context.Context, token ResumeToken) (tg.InputFileClass, error) {
+// input file for messages.sendMedia together with the file ID it used.
+func (u *resumableUpload) run(ctx context.Context, token ResumeToken) (tg.InputFileClass, int64, error) {
 	if u.now == nil {
 		u.now = time.Now
 	}
-	totalParts := int((u.size + int64(u.partSize) - 1) / int64(u.partSize))
+	totalParts := u.totalParts()
 	fileID, firstPart := token.FileID, token.Parts
-	if !token.usable(u.size, u.partSize, u.now()) {
+	if !token.usable(u.size, u.partSize) {
 		id, err := newFileID()
 		if err != nil {
-			return nil, fmt.Errorf("生成文件标识失败：%w", err)
+			return nil, 0, fmt.Errorf("生成文件标识失败：%w", err)
 		}
 		fileID, firstPart = id, 0
 	}
 	firstPart = min(firstPart, totalParts)
 
-	partBytes := func(part int) int64 {
-		if part == totalParts-1 {
-			return u.size - int64(part)*int64(u.partSize)
-		}
-		return int64(u.partSize)
-	}
 	var (
 		mu        sync.Mutex
 		done      = make([]bool, totalParts)
@@ -125,7 +121,63 @@ func (u *resumableUpload) run(ctx context.Context, token ResumeToken) (tg.InputF
 		// Show the resumed position at once instead of starting from zero.
 		_ = u.progress(ctx, uploader.ProgressState{Uploaded: confirmed, Total: u.size})
 	}
+	err := u.transfer(ctx, fileID, firstPart, totalParts, func(ctx context.Context, part, length int) error {
+		mu.Lock()
+		done[part] = true
+		confirmed += int64(length)
+		uploaded := confirmed
+		advanced := false
+		for prefix < totalParts && done[prefix] {
+			prefix++
+			advanced = true
+		}
+		resume := ResumeToken{FileID: fileID, Parts: prefix, PartSize: u.partSize, Size: u.size, At: u.now()}
+		mu.Unlock()
+		if advanced && u.checkpoint != nil {
+			u.checkpoint(resume)
+		}
+		if u.progress != nil {
+			return u.progress(ctx, uploader.ProgressState{Uploaded: uploaded, Total: u.size})
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, fileID, err
+	}
+	return &tg.InputFileBig{ID: fileID, Parts: totalParts, Name: u.name}, fileID, nil
+}
 
+// repair sends parts [0, parts) again under the same file ID. It is used when
+// Telegram reports at submission that parts of a resumed upload are gone:
+// those can only be the ones from the earlier session. report receives the
+// repaired byte count and may be called concurrently.
+func (u *resumableUpload) repair(ctx context.Context, fileID int64, parts int, report func(done, total int64)) error {
+	parts = min(parts, u.totalParts())
+	total := min(int64(parts)*int64(u.partSize), u.size)
+	var mu sync.Mutex
+	var done int64
+	return u.transfer(ctx, fileID, 0, parts, func(_ context.Context, _, length int) error {
+		mu.Lock()
+		done += int64(length)
+		current := done
+		mu.Unlock()
+		if report != nil {
+			report(current, total)
+		}
+		return nil
+	})
+}
+
+// transfer uploads parts [from, to) with the configured concurrency and rate
+// limit. confirmed runs on a worker after each part is stored.
+func (u *resumableUpload) transfer(ctx context.Context, fileID int64, from, to int, confirmed func(ctx context.Context, part, length int) error) error {
+	totalParts := u.totalParts()
+	partBytes := func(part int) int64 {
+		if part == totalParts-1 {
+			return u.size - int64(part)*int64(u.partSize)
+		}
+		return int64(u.partSize)
+	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	parts := make(chan int)
@@ -160,31 +212,15 @@ func (u *resumableUpload) run(ctx context.Context, token ResumeToken) (tg.InputF
 					fail(err)
 					return
 				}
-				mu.Lock()
-				done[part] = true
-				confirmed += int64(length)
-				uploaded := confirmed
-				advanced := false
-				for prefix < totalParts && done[prefix] {
-					prefix++
-					advanced = true
-				}
-				resume := ResumeToken{FileID: fileID, Parts: prefix, PartSize: u.partSize, Size: u.size, At: u.now()}
-				mu.Unlock()
-				if advanced && u.checkpoint != nil {
-					u.checkpoint(resume)
-				}
-				if u.progress != nil {
-					if err := u.progress(ctx, uploader.ProgressState{Uploaded: uploaded, Total: u.size}); err != nil {
-						fail(err)
-						return
-					}
+				if err := confirmed(ctx, part, length); err != nil {
+					fail(err)
+					return
 				}
 			}
 		}()
 	}
 feed:
-	for part := firstPart; part < totalParts; part++ {
+	for part := from; part < to; part++ {
 		select {
 		case parts <- part:
 		case <-ctx.Done():
@@ -194,12 +230,9 @@ feed:
 	close(parts)
 	wg.Wait()
 	if failure != nil {
-		return nil, failure
+		return failure
 	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	return &tg.InputFileBig{ID: fileID, Parts: totalParts, Name: u.name}, nil
+	return ctx.Err()
 }
 
 // pace spends the rate-limit allowance in small slices so several workers

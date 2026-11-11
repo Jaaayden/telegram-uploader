@@ -94,7 +94,7 @@ func (c *Client) UploadVideo(ctx context.Context, request tgtransport.UploadRequ
 	var done, windowBytes int64
 	// Like the real transport, continue a recent partial upload.
 	fileID := request.Resume.FileID
-	if request.Resume.Fresh(total, time.Now()) {
+	if request.Resume.Usable(total) {
 		done = request.Resume.ResumedBytes()
 		windowBytes = done
 	} else {
