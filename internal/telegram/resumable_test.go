@@ -224,12 +224,12 @@ func TestResumableUploadHonoursRateLimit(t *testing.T) {
 	store := &partStore{}
 	upload, _ := newTestUpload(store, data, partSize, 4)
 	upload.limiter = limiter
-	start := clock.at
+	start := clock.now()
 	if _, err := upload.run(context.Background(), ResumeToken{}); err != nil {
 		t.Fatal(err)
 	}
 	// 1 MiB at 256 KiB/s is about four seconds of simulated time.
-	if elapsed := clock.at.Sub(start); elapsed < 3*time.Second || elapsed > 5*time.Second {
+	if elapsed := clock.since(start); elapsed < 3*time.Second || elapsed > 5*time.Second {
 		t.Fatalf("1 MiB at 256 KiB/s took %v of simulated time", elapsed)
 	}
 }
