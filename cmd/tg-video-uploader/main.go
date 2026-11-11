@@ -179,6 +179,13 @@ func run(opts options) int {
 			if err := json.Unmarshal([]byte(raw), &request); err != nil {
 				return
 			}
+			smoke.stage("message from page: " + request.Method)
+			if request.Method == "__error" {
+				// A script error in the page: keep it for diagnosis.
+				_ = diagnostics.Logf("ui_script_error detail=%s", string(request.Params))
+				fmt.Fprintln(os.Stderr, "interface script error:", string(request.Params))
+				return
+			}
 			if smoke.handle(request.Method, request.Params) {
 				return
 			}
@@ -192,6 +199,7 @@ func run(opts options) int {
 				smoke.probe(window.Load())
 			}
 		},
+		OnFileDrop:     app.DropPaths,
 		OnCloseRequest: app.CloseRequested,
 		OnReady: func(created shell.Window) {
 			window.Store(&created)
@@ -239,6 +247,18 @@ func (h *desktopHost) PickFolder(title string) (string, error) {
 		return h.demoFolder, nil
 	}
 	return shell.PickFolder(title)
+}
+
+func (h *desktopHost) PickFiles(title string) ([]string, error) {
+	if h.headless {
+		// As above: development mode offers the demo folder's files.
+		entries, err := filepath.Glob(filepath.Join(h.demoFolder, "*.mp4"))
+		if h.demoFolder == "" {
+			return nil, nil
+		}
+		return entries, err
+	}
+	return shell.PickFiles(title)
 }
 
 func (h *desktopHost) OpenPath(path string) error { return shell.OpenPath(path) }
@@ -292,10 +312,18 @@ type smokeCheck struct {
 
 func newSmokeCheck(enabled bool) *smokeCheck { return &smokeCheck{enabled: enabled} }
 
+// stage records progress of the self-test, so a failure shows how far it got.
+func (s *smokeCheck) stage(text string) {
+	if s.enabled {
+		fmt.Fprintln(os.Stderr, "smoke:", text)
+	}
+}
+
 func (s *smokeCheck) arm(window shell.Window) {
 	if !s.enabled {
 		return
 	}
+	s.stage("window created")
 	s.window.Store(&window)
 	time.AfterFunc(45*time.Second, func() {
 		fmt.Fprintln(os.Stderr, "SMOKE FAIL: the interface did not report within 45 seconds")
@@ -308,6 +336,7 @@ func (s *smokeCheck) probe(window *shell.Window) {
 	if !s.enabled || window == nil {
 		return
 	}
+	s.stage("page requested its state; asking it to report")
 	(*window).Eval(`(function(){var n=0,t=setInterval(function(){var rows=document.querySelectorAll('.row-item').length;` +
 		`if(rows>0||++n>100){clearInterval(t);window.__tvuPost(JSON.stringify({id:0,method:'__smoke',params:{rows:rows,` +
 		`title:document.getElementById('connTitle').textContent}}));}},100);})()`)

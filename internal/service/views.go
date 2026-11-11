@@ -300,9 +300,7 @@ func channelTitle(channel model.Channel) string {
 func (s *Service) scheduleWaitingLocked() string {
 	switch {
 	case s.snapshot.Running:
-		return "队列正在运行"
-	case s.snapshot.Paused || s.snapshot.PauseRequested:
-		return "等待手动继续"
+		return "等待当前视频停下"
 	case !s.connected:
 		return "等待 Telegram 连接"
 	case s.snapshot.Channel.ID == 0:

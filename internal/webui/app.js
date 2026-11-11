@@ -201,7 +201,13 @@
       case 'skipped': return { tone: 'muted', text: '已跳过', actions: [['retry', '重试']] };
       case 'moving': return { tone: 'accent', text: '正在移动…', actions: [] };
       case 'moved': return { tone: 'success', text: '已移动到超限文件夹', actions: [] };
-      case 'interrupted': return { tone: 'warn', text: '上次运行时中断，会重新上传', actions: [['cancel', '取消']] };
+      case 'interrupted': {
+        const percent = job.size > 0 ? Math.floor((job.uploaded / job.size) * 100) : 0;
+        return {
+          tone: 'warn', actions: [['cancel', '取消']], bar: percent > 0 ? job.uploaded / job.size : null,
+          text: percent > 0 ? `已暂停在 ${percent}%，继续时接着传（停太久会从头开始）` : '已中断，继续时重新上传',
+        };
+      }
       default: return { tone: '', text: job.state, actions: [] };
     }
   }
@@ -341,7 +347,7 @@
       for (const button of bar.querySelectorAll('button')) if (button.dataset.act !== 'select-none') button.disabled ||= S.move.active;
     }
     $('addBtn').disabled = S.scanning || S.move.active;
-    $('addBtn').lastChild.textContent = S.scanning ? ' 正在扫描…' : ' 添加文件夹';
+    $('addBtnText').textContent = S.scanning ? '正在扫描…' : '添加视频';
   }
 
   function renderEmpty() {
@@ -368,7 +374,7 @@
         step(2, bound, connected && !bound, '绑定目标频道',
           bound ? S.channel.title : '在频道里发一条验证码，自动完成绑定', '绑定频道', 'bind'),
         step(3, false, connected && bound, '添加视频',
-          '选择文件夹，勾选要上传的 MP4，按文件名顺序排队', '添加文件夹', 'add'))));
+          '把视频或文件夹拖进窗口，或点“添加视频”选择；按文件名顺序排队', '添加视频', 'add'))));
   }
 
   function buildRow() {
@@ -442,12 +448,14 @@
     const start = $('startBtn');
     const busy = S.move.active;
     if (q.running) {
-      start.textContent = q.pauseRequested ? '当前视频传完后暂停' : '暂停';
-      start.disabled = q.pauseRequested;
+      start.textContent = q.pauseRequested ? '立即暂停' : '暂停';
+      start.title = q.pauseRequested ? '正在等当前视频传完；点这里立即停下，之后接着传' : '立即停下，之后从停下的位置接着传';
+      start.disabled = false;
       start.dataset.act = 'pause';
       start.classList.remove('primary');
     } else {
       start.textContent = q.paused ? '继续上传' : '开始上传';
+      start.title = '';
       start.disabled = busy || counts.runnable === 0;
       start.dataset.act = 'start';
       start.classList.add('primary');
@@ -461,7 +469,7 @@
     if (q.running && q.speed > 0) activity = speed(q.speed) + (q.etaSeconds > 0 ? ' · 剩余约 ' + duration(q.etaSeconds) : '');
     else if (q.running && q.pauseRequested) activity = '传完当前视频后暂停';
     else if (q.running) activity = '正在准备…';
-    else if (q.paused) activity = '已暂停';
+    else if (q.paused) activity = S.schedule.at && !S.schedule.due ? '已暂停，' + clock(S.schedule.at) + ' 继续' : '已暂停';
     else if (q.lastError) activity = q.lastError;
     $('activity').textContent = activity;
     $('activity').title = activity;
@@ -470,13 +478,13 @@
     const button = $('scheduleBtn');
     button.classList.toggle('scheduled', schedule.at > 0);
     if (schedule.at > 0) {
-      $('scheduleText').textContent = schedule.due ? '定时已到 · ' + (schedule.waiting || '') : clock(schedule.at) + ' 开始';
+      $('scheduleText').textContent = schedule.due ? '定时已到 · ' + (schedule.waiting || '') : clock(schedule.at) + (q.paused ? ' 继续' : ' 开始');
       button.title = '点击修改或取消定时';
       button.disabled = false;
     } else {
       $('scheduleText').textContent = '定时开始';
-      button.title = '在指定时间自动开始上传（应用需保持打开）';
-      button.disabled = q.running || q.paused || busy || counts.runnable === 0;
+      button.title = q.running ? '现在暂停，到指定时间自动继续' : '在指定时间自动开始或继续上传（应用需保持打开）';
+      button.disabled = busy || (!q.running && counts.runnable === 0);
     }
   }
 
@@ -609,41 +617,100 @@
     });
   }
 
-  async function addFolder() {
+  const STATE_LABEL = {
+    queued: '等待上传', oversize: '超过上限', uploading: '正在上传', sending: '正在提交', confirming: '待确认',
+    sent: '已发送', cancelled: '已取消', failed: '失败', skipped: '已跳过', moving: '正在移动', moved: '已移动', interrupted: '已中断',
+  };
+
+  async function pickAndAdd(method) {
     let scan;
-    try { scan = await call('addFolder'); } catch (error) { toast('error', error.message); return; }
-    if (!scan || scan.cancelled) return;
-    if (!scan.candidates.length) { toast('info', '这个文件夹的顶层没有 MP4 文件（不会扫描子文件夹）'); return; }
-    const picked = scan.candidates.map((candidate) => !candidate.duplicate);
-    const added = await openModal((box, close) => {
+    try { scan = await call(method); } catch (error) { toast('error', error.message); return; }
+    if (scan && !scan.cancelled) chooseCandidates(scan);
+  }
+
+  // Shows what a scan found and lets the user decide what to queue. Files
+  // that are already queued are never added silently: the user chooses
+  // between skipping them and queueing them again.
+  async function chooseCandidates(scan) {
+    const ignored = scan.ignored ? `已忽略 ${scan.ignored} 个不是 MP4 的项目。` : '';
+    if (!scan.candidates.length) {
+      toast('info', ignored ? ignored.replace('。', '') + '，没有可添加的视频' : '没有找到 MP4 视频（文件夹只看顶层，不进子文件夹）');
+      return;
+    }
+    const items = scan.candidates;
+    const duplicates = items.filter((item) => item.duplicate);
+    const replaceable = duplicates.filter((item) => item.replaceable).length;
+    const similar = items.filter((item) => item.similar).length;
+    const folders = new Set(items.map((item) => item.folder));
+    let replace = false;
+    // Probable copies start unchecked; exact duplicates follow the choice below.
+    const picked = items.map((item) => !item.duplicate && !item.similar);
+
+    const result = await openModal((box, close) => {
       const count = el('span', { class: 'hint spacer' });
       const add = el('button', { class: 'btn primary', text: '加入队列' });
       const list = el('div', { class: 'cand-list' });
       const boxes = [];
+      const selectable = (item) => (item.duplicate ? replace && item.replaceable : true);
       const refresh = () => {
         const total = picked.filter(Boolean).length;
-        const duplicates = scan.candidates.filter((candidate) => candidate.duplicate).length;
-        count.textContent = `已选 ${total} / ${scan.candidates.length}` + (duplicates ? `，${duplicates} 个已在队列` : '');
+        count.textContent = `已选 ${total} / ${items.length}`;
         add.disabled = total === 0;
+        items.forEach((item, index) => {
+          boxes[index].disabled = !selectable(item);
+          boxes[index].checked = picked[index];
+          boxes[index].closest('.cand').classList.toggle('off', !selectable(item));
+        });
       };
-      scan.candidates.forEach((candidate, index) => {
-        const check = el('input', { type: 'checkbox', checked: picked[index], disabled: candidate.duplicate,
-          onchange: () => { picked[index] = check.checked; refresh(); } });
+      items.forEach((item, index) => {
+        const check = el('input', { type: 'checkbox', onchange: () => { picked[index] = check.checked; refresh(); } });
         boxes.push(check);
-        list.append(el('label', { class: 'cand' + (candidate.duplicate ? ' off' : '') }, check,
-          el('span', { class: 'name', text: candidate.name, title: candidate.name }),
-          el('span', { class: 'meta' + (candidate.oversize ? ' warn' : ''),
-            text: bytes(candidate.size) + (candidate.duplicate ? ' · 已在队列' : candidate.oversize ? ' · 超过上限' : '') })));
+        let note = '', warn = false;
+        if (item.duplicate) {
+          note = ' · 已在队列（' + (STATE_LABEL[item.duplicateState] || item.duplicateState) + '）' + (item.replaceable ? '' : '，处理中不能替换');
+          warn = true;
+        } else if (item.similar) { note = ' · 疑似重复：队列里有同名同大小的视频'; warn = true; }
+        else if (item.oversize) { note = ' · 超过上限'; warn = true; }
+        list.append(el('label', { class: 'cand' }, check,
+          el('span', { class: 'name', title: item.folder + ' / ' + item.name },
+            el('span', { text: item.name }),
+            folders.size > 1 ? el('span', { class: 'folder', text: item.folder.split(/[\\/]/).pop() }) : null),
+          el('span', { class: 'meta' + (warn ? ' warn' : ''), text: bytes(item.size) + note })));
       });
       const setAll = (value) => {
-        scan.candidates.forEach((candidate, index) => { if (!candidate.duplicate) { picked[index] = value; boxes[index].checked = value; } });
+        items.forEach((item, index) => { if (selectable(item)) picked[index] = value; });
         refresh();
       };
-      add.onclick = () => close(picked.flatMap((value, index) => (value ? [index] : [])));
+
+      let duplicateBox = null;
+      if (duplicates.length) {
+        const modes = el('div', { class: 'segmented' });
+        const hint = el('div', { class: 'hint' });
+        const setMode = (value) => {
+          replace = value;
+          items.forEach((item, index) => { if (item.duplicate) picked[index] = replace && item.replaceable; });
+          modes.children[0].classList.toggle('active', !replace);
+          modes.children[1].classList.toggle('active', replace);
+          hint.textContent = replace
+            ? '队列里的旧条目会被删除，这些视频作为新的待上传条目排到队尾。已经发送过的会再发一次，频道里会出现重复消息。'
+            : '保持队列里现有的条目不变，只添加新的视频。';
+          refresh();
+        };
+        modes.append(
+          el('button', { type: 'button', text: '跳过重复的', onclick: () => setMode(false) }),
+          el('button', { type: 'button', text: `重新加入队列（${replaceable}）`, disabled: replaceable === 0, onclick: () => setMode(true) }));
+        duplicateBox = el('div', { class: 'dup-box' },
+          el('div', {}, el('b', { text: `${duplicates.length} 个视频已经在队列里。` }), '要怎么处理？'), modes, hint);
+        queueMicrotask(() => setMode(false));
+      }
+
+      add.onclick = () => close({ indexes: picked.flatMap((value, index) => (value ? [index] : [])), replace });
       box.append(
         el('div', { class: 'modal-head', text: '选择要加入队列的视频' }),
         el('div', { class: 'modal-body plain' },
-          el('div', { class: 'hint', text: scan.folder, title: scan.folder }),
+          el('div', { class: 'hint', text: scan.source + (ignored ? ' · ' + ignored : ''), title: scan.source }),
+          duplicateBox,
+          similar ? el('div', { class: 'hint', text: `${similar} 个疑似重复的视频默认没有勾选，确认不是同一个再勾上。` }) : null,
           el('div', { class: 'quick' },
             el('button', { class: 'btn small', type: 'button', text: '全选', onclick: () => setAll(true) }),
             el('button', { class: 'btn small', type: 'button', text: '全不选', onclick: () => setAll(false) })),
@@ -652,7 +719,7 @@
           el('button', { class: 'btn', text: '取消', onclick: () => close(null) }), add));
       refresh();
     }, { wide: true });
-    if (added) await run('addCandidates', { token: scan.token, indexes: added });
+    if (result) await run('addCandidates', { token: scan.token, indexes: result.indexes, replaceDuplicates: result.replace });
     else call('discardScan', { token: scan.token }).catch(() => {});
   }
 
@@ -682,18 +749,21 @@
       box.append(
         el('div', { class: 'modal-head', text: '定时开始上传' }),
         el('div', { class: 'modal-body plain' },
-          el('p', { text: '到点后自动开始。应用需要保持打开；退出后计划会保留，下次打开时恢复。' }),
+          el('p', { text: (S.queue.running
+            ? '上传会立即暂停，到点后自动继续（正在传的视频尽量从停下的位置接着传）。'
+            : S.queue.paused ? '到点后自动继续上传。' : '到点后自动开始上传。')
+            + '应用需要保持打开；退出后计划会保留，下次打开时恢复。' }),
           el('div', { class: 'quick' }, ...quick.map(([label, make]) =>
             el('button', { class: 'btn small', type: 'button', text: label, onclick: () => { input.value = local(make()); error.textContent = ''; } }))),
           input, error),
         el('div', { class: 'modal-foot' },
           current ? el('button', { class: 'btn danger spacer', text: '取消定时', onclick: () => close({ cancel: true }) }) : null,
           el('button', { class: 'btn', text: '关闭', onclick: () => close(null) }),
-          el('button', { class: 'btn primary', text: current ? '修改时间' : '设置定时', onclick: submit })));
+          el('button', { class: 'btn primary', text: current ? '修改时间' : S.queue.running ? '暂停并定时' : '设置定时', onclick: submit })));
     });
     if (!result) return;
     if (result.cancel) { if (await run('cancelSchedule')) toast('info', '已取消定时'); return; }
-    if (await run('setSchedule', { unix: result.unix })) toast('info', '已设置：' + clock(result.unix * 1000) + ' 开始上传');
+    if (await run('setSchedule', { unix: result.unix })) toast('info', '已设置：' + clock(result.unix * 1000) + ' 自动开始');
   }
 
   async function resetDialog() {
@@ -730,7 +800,10 @@
   const actions = {
     settings: () => openSettings(),
     bind: bindChannel,
-    add: addFolder,
+    // Deferred: the click that triggered this would close the menu again.
+    add: () => setTimeout(() => { $('addMenu').hidden = false; }),
+    'add-files': () => { $('addMenu').hidden = true; pickAndAdd('addFiles'); },
+    'add-folder': () => { $('addMenu').hidden = true; pickAndAdd('addFolder'); },
     'cancel-move': () => run('cancelMove'),
     start: () => run('start').then((ok) => { if (!ok && S.connection.status !== 'connected') openSettings(); }),
     pause: () => run('pause'),
@@ -768,6 +841,7 @@
     }, el('span', { text: label }), typeof count === 'number' ? el('span', { class: 'count', text: String(count) }) : null);
     menu.replaceChildren(
       item('全选', order.length, () => { for (const id of view) selected.add(id); recompute(); }),
+      item('传完当前视频后暂停', S.queue.running && !S.queue.pauseRequested, () => run('pause', { finishCurrent: true })),
       item('重置任务…', counts.resettable.all, resetDialog),
       item('移动超限文件…', S.queue.running ? 0 : counts.oversize, () => run('moveOversize')),
       el('div', { class: 'menu-sep' }),
@@ -814,6 +888,7 @@
         for (const box of document.querySelectorAll('.modal[data-kind="bind"]')) box.parentNode.remove();
         toast('success', '频道绑定成功：' + payload.title);
         break;
+      case 'scan': chooseCandidates(payload); break;
       case 'confirm-quit': confirmQuit(payload); break;
     }
   }
@@ -846,7 +921,7 @@
         else if (actions[button.dataset.act]) actions[button.dataset.act]();
       }
       // Clicking elsewhere closes open popovers.
-      for (const [popover, anchor] of [['limitPopover', 'limitChip'], ['moreMenu', 'moreBtn']]) {
+      for (const [popover, anchor] of [['limitPopover', 'limitChip'], ['moreMenu', 'moreBtn'], ['addMenu', 'addBtn']]) {
         if (!$(popover).hidden && !event.target.closest('#' + popover) && !event.target.closest('#' + anchor)) $(popover).hidden = true;
       }
     });
@@ -857,7 +932,7 @@
     $('updateBadge').onclick = () => openSettings('secUpdate');
     $('limitChip').onclick = () => { buildLimitMenu(); $('limitPopover').hidden = !$('limitPopover').hidden; };
     $('moreBtn').onclick = () => { buildMoreMenu(); $('moreMenu').hidden = !$('moreMenu').hidden; };
-    $('addBtn').onclick = addFolder;
+    $('addBtn').onclick = () => { $('addMenu').hidden = !$('addMenu').hidden; };
     $('scheduleBtn').onclick = scheduleDialog;
     $('bindBtn').onclick = bindChannel;
     $('logsBtn').onclick = () => run('openLogs');
@@ -934,7 +1009,7 @@
       const typing = /^(INPUT|TEXTAREA|SELECT)$/.test(event.target.tagName);
       if (event.key === 'Escape') {
         if ($('modalRoot').children.length) return;
-        if (!$('limitPopover').hidden || !$('moreMenu').hidden) { $('limitPopover').hidden = true; $('moreMenu').hidden = true; }
+        if (!$('limitPopover').hidden || !$('moreMenu').hidden || !$('addMenu').hidden) { $('limitPopover').hidden = true; $('moreMenu').hidden = true; $('addMenu').hidden = true; }
         else if (!$('settings').hidden) closeSettings();
         else if (selected.size) { selected.clear(); recompute(); }
         return;
@@ -952,7 +1027,34 @@
     // The page is an application, not a document: no browser context menu
     // outside text fields, and no file drops navigating away.
     document.addEventListener('contextmenu', (event) => { if (!/^(INPUT|TEXTAREA)$/.test(event.target.tagName)) event.preventDefault(); });
-    for (const type of ['dragover', 'drop']) document.addEventListener(type, (event) => event.preventDefault());
+    // Dropped files: the page only shows the hint. The real paths reach Go
+    // through the window (macOS reads the drag pasteboard, Windows receives
+    // the file handles), and Go answers with a "scan" event.
+    let dragDepth = 0;
+    const carriesFiles = (event) => [...(event.dataTransfer?.types || [])].includes('Files');
+    const endDrag = () => { dragDepth = 0; $('dropHint').hidden = true; };
+    document.addEventListener('dragenter', (event) => {
+      if (!carriesFiles(event)) return;
+      event.preventDefault();
+      dragDepth++;
+      $('dropHint').hidden = false;
+    });
+    document.addEventListener('dragleave', () => { if (--dragDepth <= 0) endDrag(); });
+    document.addEventListener('dragover', (event) => {
+      event.preventDefault();
+      if (event.dataTransfer) event.dataTransfer.dropEffect = carriesFiles(event) ? 'copy' : 'none';
+    });
+    document.addEventListener('drop', (event) => {
+      event.preventDefault();
+      const files = carriesFiles(event);
+      endDrag();
+      if (!files) return;
+      if (typeof window.__tvuDropFiles === 'function') {
+        if (!window.__tvuDropFiles(event.dataTransfer.files)) toast('error', '系统的 WebView2 版本太旧，不支持拖入；请用“添加视频”按钮');
+      } else if (!native) {
+        toast('info', '浏览器预览拿不到文件路径；请在应用窗口里拖入');
+      }
+    });
     // Relative times ("今天 23:00") and flood-wait banners age without events.
     setInterval(() => { if (S && (S.schedule.at || S.connection.floodWaitUntil)) renderAll(); }, 30000);
   }

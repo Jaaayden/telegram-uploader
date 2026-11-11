@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -14,27 +15,39 @@ import (
 	"github.com/Jaaayden/telegram-uploader/internal/scanner"
 )
 
-// scanResult holds the candidates of the last folder scan until the user
-// chooses which ones to add. Only the newest scan is kept.
+// scanResult holds the candidates of the last scan until the user chooses
+// which ones to add. Only the newest scan is kept.
 type scanResult struct {
 	token      string
 	candidates []model.Job
-	duplicate  []bool
+	// existing is the ID of the queue entry with the same path, or "".
+	existing []string
 }
 
 // Candidate is one scanned file offered for the queue.
 type Candidate struct {
-	Name      string `json:"name"`
-	Size      int64  `json:"size"`
-	Oversize  bool   `json:"oversize,omitempty"`
-	Duplicate bool   `json:"duplicate,omitempty"`
+	Name string `json:"name"`
+	// Folder is the containing directory, shown when sources are mixed.
+	Folder   string `json:"folder"`
+	Size     int64  `json:"size"`
+	Oversize bool   `json:"oversize,omitempty"`
+	// Duplicate means this exact file is already in the queue.
+	// DuplicateState is the state of that entry; Replaceable is false while
+	// it is uploading, being moved or awaiting confirmation.
+	Duplicate      bool   `json:"duplicate,omitempty"`
+	DuplicateState string `json:"duplicateState,omitempty"`
+	Replaceable    bool   `json:"replaceable,omitempty"`
+	// Similar means a different file with the same name and size is already
+	// queued — probably a copy of the same video.
+	Similar bool `json:"similar,omitempty"`
 }
 
-// ScanView is the result of choosing and scanning a folder.
+// ScanView is the result of scanning chosen or dropped files and folders.
 type ScanView struct {
 	Cancelled  bool        `json:"cancelled,omitempty"`
 	Token      string      `json:"token,omitempty"`
-	Folder     string      `json:"folder,omitempty"`
+	Source     string      `json:"source,omitempty"`
+	Ignored    int         `json:"ignored,omitempty"`
 	Candidates []Candidate `json:"candidates"`
 }
 
@@ -53,19 +66,82 @@ func canonicalPathKey(path string) string {
 	return path
 }
 
-// AddFolder lets the user choose a folder and scans its top level for MP4
-// files. Nothing is queued until AddCandidates is called.
+// replaceableState reports whether a queued entry may be swapped for a fresh
+// one. Entries in flight are excluded: removing them could lose track of a
+// message that is being, or may have been, submitted.
+func replaceableState(state model.JobState) bool {
+	switch state {
+	case model.JobUploading, model.JobSending, model.JobConfirming, model.JobMoving:
+		return false
+	}
+	return true
+}
+
+// AddFolder lets the user choose a folder and scans it.
 func (s *Service) AddFolder() (ScanView, error) {
+	return s.pickAndScan(func() ([]string, error) {
+		folder, err := s.host.PickFolder("选择包含 MP4 视频的文件夹")
+		if err != nil || folder == "" {
+			return nil, err
+		}
+		return []string{folder}, nil
+	})
+}
+
+// AddFiles lets the user choose individual videos and scans them.
+func (s *Service) AddFiles() (ScanView, error) {
+	return s.pickAndScan(func() ([]string, error) { return s.host.PickFiles("选择要上传的 MP4 视频") })
+}
+
+func (s *Service) pickAndScan(pick func() ([]string, error)) (ScanView, error) {
+	s.mu.Lock()
+	busy := s.moveActive
+	s.mu.Unlock()
+	if busy {
+		return ScanView{}, errors.New("请等待当前文件移动完成，再添加视频")
+	}
+	paths, err := pick()
+	if err != nil {
+		return ScanView{}, err
+	}
+	if len(paths) == 0 {
+		return ScanView{Cancelled: true, Candidates: []Candidate{}}, nil
+	}
+	return s.ScanPaths(paths)
+}
+
+// DropPaths handles files and folders dragged onto the window. The result is
+// delivered as a "scan" event because nothing in the page asked for it.
+func (s *Service) DropPaths(paths []string) {
+	if len(paths) == 0 || s.isClosed() {
+		return
+	}
+	view, err := s.ScanPaths(paths)
+	if err != nil {
+		s.toastError(err)
+		return
+	}
+	s.emit("scan", view)
+}
+
+// ScanPaths scans files and folders (the top level of each folder) for MP4
+// videos and compares them with the queue. Nothing is queued until
+// AddCandidates is called.
+func (s *Service) ScanPaths(paths []string) (ScanView, error) {
 	s.mu.Lock()
 	if s.moveActive {
 		s.mu.Unlock()
-		return ScanView{}, errors.New("请等待当前文件移动完成，再添加文件夹")
+		return ScanView{}, errors.New("请等待当前文件移动完成，再添加视频")
 	}
 	if s.scanning {
 		s.mu.Unlock()
-		return ScanView{}, errors.New("正在扫描另一个文件夹，请稍候")
+		return ScanView{}, errors.New("正在扫描，请稍候")
 	}
 	s.scanning = true
+	maxBytes := int64(0)
+	if s.connected {
+		maxBytes = s.identity.MaxUploadBytes
+	}
 	s.mu.Unlock()
 	s.invalidate()
 	defer func() {
@@ -76,78 +152,93 @@ func (s *Service) AddFolder() (ScanView, error) {
 		s.scheduler.RetryDue()
 	}()
 
-	folder, err := s.host.PickFolder("选择包含 MP4 视频的文件夹")
+	scanned, err := scanner.ScanPaths(paths, maxBytes)
 	if err != nil {
-		return ScanView{}, err
+		return ScanView{}, fmt.Errorf("扫描失败：%w", err)
 	}
-	if folder == "" {
-		return ScanView{Cancelled: true, Candidates: []Candidate{}}, nil
-	}
-	folder = filepath.Clean(folder)
-	if err := s.updateSettings(func(settings *coreapp.Settings) { settings.LastFolder = folder }); err != nil {
-		return ScanView{}, err
-	}
-	s.mu.Lock()
-	maxBytes := int64(0)
-	if s.connected {
-		maxBytes = s.identity.MaxUploadBytes
-	}
-	s.mu.Unlock()
-
-	candidates, err := scanner.Scan(folder, maxBytes)
-	if err != nil {
-		return ScanView{}, fmt.Errorf("扫描文件夹失败：%w", err)
+	source := filepath.Clean(paths[0])
+	if len(paths) > 1 {
+		source = fmt.Sprintf("%s 等 %d 项", filepath.Base(source), len(paths))
+	} else if info, statErr := os.Stat(source); statErr == nil && info.IsDir() {
+		// Remember the folder for next time; individual files are not a "source".
+		if err := s.updateSettings(func(settings *coreapp.Settings) { settings.LastFolder = source }); err != nil {
+			return ScanView{}, err
+		}
 	}
 
 	s.mu.Lock()
-	existing := make(map[string]struct{}, len(s.snapshot.Jobs))
+	// One pass over the queue builds both lookups; each candidate is then O(1).
+	type nameSize struct {
+		name string
+		size int64
+	}
+	byPath := make(map[string]*model.Job, len(s.snapshot.Jobs))
+	byNameSize := make(map[nameSize]struct{}, len(s.snapshot.Jobs))
 	for index := range s.snapshot.Jobs {
-		existing[canonicalPathKey(s.snapshot.Jobs[index].Path)] = struct{}{}
+		job := &s.snapshot.Jobs[index]
+		byPath[canonicalPathKey(job.Path)] = job
+		byNameSize[nameSize{strings.ToLower(job.Name), job.Size}] = struct{}{}
 	}
 	s.scanCounter++
 	result := &scanResult{
 		token:      fmt.Sprintf("scan-%d", s.scanCounter),
-		candidates: candidates,
-		duplicate:  make([]bool, len(candidates)),
+		candidates: scanned.Jobs,
+		existing:   make([]string, len(scanned.Jobs)),
 	}
-	view := ScanView{Token: result.token, Folder: folder, Candidates: make([]Candidate, len(candidates))}
-	for index, candidate := range candidates {
-		_, duplicate := existing[canonicalPathKey(candidate.Path)]
-		result.duplicate[index] = duplicate
-		view.Candidates[index] = Candidate{
-			Name:      candidate.Name,
-			Size:      candidate.Size,
-			Oversize:  candidate.State == model.JobOversize,
-			Duplicate: duplicate,
+	view := ScanView{Token: result.token, Source: source, Ignored: scanned.Ignored, Candidates: make([]Candidate, len(scanned.Jobs))}
+	for index, candidate := range scanned.Jobs {
+		item := Candidate{
+			Name:     candidate.Name,
+			Folder:   filepath.Dir(candidate.Path),
+			Size:     candidate.Size,
+			Oversize: candidate.State == model.JobOversize,
 		}
+		if existing, ok := byPath[canonicalPathKey(candidate.Path)]; ok {
+			result.existing[index] = existing.ID
+			item.Duplicate = true
+			item.DuplicateState = string(existing.State)
+			item.Replaceable = replaceableState(existing.State)
+		} else if _, ok := byNameSize[nameSize{strings.ToLower(candidate.Name), candidate.Size}]; ok {
+			item.Similar = true
+		}
+		view.Candidates[index] = item
 	}
 	s.scan = result
 	s.mu.Unlock()
 	return view, nil
 }
 
-// AddCandidates queues the chosen files of a previous scan.
-func (s *Service) AddCandidates(token string, indexes []int) (string, error) {
+// AddCandidates queues the chosen files of a previous scan. A chosen file
+// that is already queued is skipped unless replaceDuplicates is set, in which
+// case its old entry is removed and the file is queued again from scratch.
+func (s *Service) AddCandidates(token string, indexes []int, replaceDuplicates bool) (string, error) {
 	s.mu.Lock()
 	result := s.scan
 	if result == nil || result.token != token {
 		s.mu.Unlock()
-		return "", errors.New("这次扫描结果已失效，请重新添加文件夹")
+		return "", errors.New("这次扫描结果已失效，请重新添加")
 	}
 	if s.moveActive {
 		s.mu.Unlock()
 		return "", errors.New("请等待当前文件移动完成，再添加视频")
 	}
 	selected := make([]model.Job, 0, len(indexes))
+	var replace []string
 	seen := make(map[int]struct{}, len(indexes))
 	for _, index := range indexes {
-		if index < 0 || index >= len(result.candidates) || result.duplicate[index] {
+		if index < 0 || index >= len(result.candidates) {
 			continue
 		}
 		if _, ok := seen[index]; ok {
 			continue
 		}
 		seen[index] = struct{}{}
+		if existing := result.existing[index]; existing != "" {
+			if !replaceDuplicates {
+				continue
+			}
+			replace = append(replace, existing)
+		}
 		selected = append(selected, result.candidates[index])
 	}
 	s.scan = nil
@@ -155,15 +246,43 @@ func (s *Service) AddCandidates(token string, indexes []int) (string, error) {
 	if len(selected) == 0 {
 		return "", errors.New("没有选择可添加的视频")
 	}
+
+	replaced := 0
+	if len(replace) > 0 {
+		// Re-check against the live queue: an entry may have started uploading
+		// since the scan. Those stay, and AddJobs then skips the new copy.
+		states := make(map[string]model.JobState, len(replace))
+		for _, job := range s.controller.Snapshot().Jobs {
+			states[job.ID] = job.State
+		}
+		safe := replace[:0]
+		for _, id := range replace {
+			if state, ok := states[id]; ok && replaceableState(state) {
+				safe = append(safe, id)
+			}
+		}
+		if len(safe) > 0 {
+			removal, err := s.controller.RemoveJobs(safe)
+			if err != nil {
+				return "", err
+			}
+			replaced = removal.Removed
+		}
+	}
 	added, err := s.controller.AddJobs(selected)
 	if err != nil {
 		return "", err
 	}
 	s.scheduler.RetryDue()
-	if skipped := len(selected) - added; skipped > 0 {
-		return fmt.Sprintf("已添加 %d 个视频；%d 个已在队列中，已跳过", added, skipped), nil
+
+	parts := []string{fmt.Sprintf("已添加 %d 个视频", added)}
+	if replaced > 0 {
+		parts[0] = fmt.Sprintf("已添加 %d 个视频（其中 %d 个替换了队列里的旧条目）", added, replaced)
 	}
-	return fmt.Sprintf("已添加 %d 个视频", added), nil
+	if skipped := len(selected) - added; skipped > 0 {
+		parts = append(parts, fmt.Sprintf("%d 个仍在队列中处理，已跳过", skipped))
+	}
+	return strings.Join(parts, "；"), nil
 }
 
 // DiscardScan forgets a scan the user dismissed.
@@ -252,9 +371,16 @@ func (s *Service) beginUploads(scheduled bool) error {
 	return nil
 }
 
-// PauseUploads finishes the current file and stops before the next one.
-func (s *Service) PauseUploads() error {
-	err := s.controller.Pause()
+// PauseUploads pauses the queue. By default the file that is uploading stops
+// right away and continues later from where it was; with finishCurrent it is
+// allowed to finish and the queue stops before the next file.
+func (s *Service) PauseUploads(finishCurrent bool) error {
+	var err error
+	if finishCurrent {
+		err = s.controller.Pause()
+	} else {
+		err = s.controller.PauseNow()
+	}
 	s.invalidate()
 	return err
 }
@@ -453,17 +579,25 @@ func (s *Service) restoreSchedule() {
 	s.invalidate()
 }
 
-// SetSchedule plans an automatic start at the given Unix time (seconds).
+// SetSchedule plans an automatic start at the given Unix time (seconds). It
+// can be set at any time: on an idle or paused queue it plans when to start
+// or continue, and on a running queue it pauses now and continues then.
 func (s *Service) SetSchedule(unix int64) error {
 	startAt := time.Unix(unix, 0)
 	if !startAt.After(time.Now()) {
 		return errors.New("定时开始的时间必须晚于现在")
 	}
 	s.mu.Lock()
-	busy := s.snapshot.Running || s.moveActive
+	moving := s.moveActive
 	s.mu.Unlock()
-	if busy {
-		return errors.New("上传或文件移动进行中，不能设置定时")
+	if moving {
+		return errors.New("文件移动进行中，不能设置定时")
+	}
+	if s.controller.Snapshot().Running {
+		// A schedule on a running queue means "stop now, go on at that time".
+		if err := s.controller.PauseNow(); err != nil {
+			return err
+		}
 	}
 	if err := s.updateSettings(func(settings *coreapp.Settings) { settings.ScheduledStartUnix = startAt.Unix() }); err != nil {
 		return err
@@ -501,7 +635,9 @@ func (s *Service) tryScheduledStart() {
 		return
 	}
 	s.mu.Lock()
-	blocked := s.closed || s.snapshot.Running || s.moveActive || s.scanning || s.snapshot.Paused || s.snapshot.PauseRequested
+	// A paused queue is not an obstacle: the schedule is what resumes it. A
+	// queue that is still winding down is retried when it has stopped.
+	blocked := s.closed || s.snapshot.Running || s.moveActive || s.scanning
 	connected := s.connected && s.client != nil
 	ready := s.snapshot.Channel.ID != 0 && s.stats.Runnable
 	s.mu.Unlock()

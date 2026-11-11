@@ -67,6 +67,15 @@ func newUploadProgressReporter(callback func(model.Progress)) *uploadProgressRep
 	return p
 }
 
+// startAt tells the reporter that an upload resumes with bytes already on the
+// server, so they are not counted as transferred during this attempt.
+func (p *uploadProgressReporter) startAt(bytes int64) {
+	p.mu.Lock()
+	p.lastBytes = bytes
+	p.samples = append(p.samples[:0], speedSample{at: p.started, bytes: bytes})
+	p.mu.Unlock()
+}
+
 func (p *uploadProgressReporter) Chunk(ctx context.Context, state uploader.ProgressState) error {
 	p.mu.Lock()
 	if err := ctx.Err(); err != nil {
@@ -242,7 +251,27 @@ func (c *Client) UploadVideo(ctx context.Context, request UploadRequest, onProgr
 
 	progress := newUploadProgressReporter(onProgress)
 	uploadEngine := newUploadEngine(uploadAPI, progress, uploadConcurrency)
-	inputFile, err := c.uploadFileData(requestCtx, uploadEngine, request, info)
+	var inputFile tg.InputFileClass
+	if request.File != nil && info.Size() > bigFileThreshold {
+		// Big files go through the resumable path so a pause or a dropped
+		// connection continues where it stopped.
+		if request.Resume.usable(info.Size(), uploadPartSize, time.Now()) {
+			progress.startAt(int64(request.Resume.Parts) * int64(uploadPartSize))
+		}
+		inputFile, err = (&resumableUpload{
+			api:        uploadAPI,
+			file:       request.File,
+			name:       info.Name(),
+			size:       info.Size(),
+			partSize:   uploadPartSize,
+			threads:    uploadConcurrency,
+			limiter:    c.cfg.RateLimiter,
+			progress:   progress.Chunk,
+			checkpoint: request.OnCheckpoint,
+		}).run(requestCtx, request.Resume)
+	} else {
+		inputFile, err = c.uploadFileData(requestCtx, uploadEngine, request, info)
+	}
 	progress.Close()
 	if err != nil {
 		return 0, fmt.Errorf("%w：上传视频数据失败：%w", ErrUploadData, err)
@@ -280,6 +309,14 @@ func (c *Client) UploadVideo(ctx context.Context, request UploadRequest, onProgr
 		To(&tg.InputPeerChannel{ChannelID: request.Channel.ID, AccessHash: request.Channel.AccessHash}).
 		RandomID(request.RandomID).
 		Media(requestCtx, video)
+	if isMissingPartsError(err) {
+		// Telegram no longer has (all of) the uploaded parts. Nothing was
+		// posted; forget the checkpoint so the retry uploads the whole file.
+		if request.OnCheckpoint != nil {
+			request.OnCheckpoint(ResumeToken{})
+		}
+		return 0, fmt.Errorf("%w：Telegram 已清理之前上传的分片，需要重新上传：%w", ErrUploadData, err)
+	}
 	if err != nil {
 		return 0, fmt.Errorf("%w：提交频道消息失败：%w", ErrSendOutcomeUnknown, err)
 	}

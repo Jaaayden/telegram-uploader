@@ -90,15 +90,18 @@ func (s *Service) Handle(method string, params json.RawMessage) (any, error) {
 	// Queue.
 	case "addFolder":
 		return s.AddFolder()
+	case "addFiles":
+		return s.AddFiles()
 	case "addCandidates":
 		input, err := decode[struct {
-			Token   string `json:"token"`
-			Indexes []int  `json:"indexes"`
+			Token             string `json:"token"`
+			Indexes           []int  `json:"indexes"`
+			ReplaceDuplicates bool   `json:"replaceDuplicates"`
 		}](params)
 		if err != nil {
 			return nil, err
 		}
-		return message(s.AddCandidates(input.Token, input.Indexes))
+		return message(s.AddCandidates(input.Token, input.Indexes, input.ReplaceDuplicates))
 	case "discardScan":
 		input, err := decode[struct {
 			Token string `json:"token"`
@@ -111,7 +114,13 @@ func (s *Service) Handle(method string, params json.RawMessage) (any, error) {
 	case "start":
 		return nil, s.StartUploads()
 	case "pause":
-		return nil, s.PauseUploads()
+		input, err := decode[struct {
+			FinishCurrent bool `json:"finishCurrent"`
+		}](params)
+		if err != nil {
+			return nil, err
+		}
+		return nil, s.PauseUploads(input.FinishCurrent)
 	case "cancelAll":
 		return message(s.CancelAll())
 	case "cancelJob", "retryJob", "skipJob", "markSent":

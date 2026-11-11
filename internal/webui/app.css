@@ -331,3 +331,22 @@ svg { width: 16px; height: 16px; fill: currentColor; flex: none; }
 
 .limit-row { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
 .limit-row .input { width: 120px; }
+
+/* ---------- drag and drop ---------- */
+.drop-hint {
+  position: fixed; top: 0; right: 0; bottom: 0; left: 0; z-index: 70; display: grid; place-items: center;
+  background: rgba(47, 125, 246, .14); pointer-events: none;
+}
+.drop-hint > div {
+  padding: 22px 34px; border: 2px dashed var(--accent); border-radius: 16px; background: var(--surface);
+  box-shadow: var(--shadow); text-align: center;
+}
+.drop-hint b { display: block; font-size: 16px; margin-bottom: 4px; color: var(--accent); }
+.drop-hint span { color: var(--text-2); }
+
+/* ---------- duplicate choice ---------- */
+.dup-box { margin-top: 10px; padding: 10px 12px; border-radius: 9px; background: var(--warn-soft); color: var(--text); }
+.dup-box b { color: var(--warn); }
+.dup-box .segmented { margin: 8px 0 6px; background: var(--surface-2); }
+.dup-box .hint { color: var(--text-2); }
+.cand .folder { color: var(--text-3); font-size: 12px; margin-left: 6px; }

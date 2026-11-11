@@ -11,11 +11,13 @@ void tvuRun(const char *title, int width, int height, int minWidth, int minHeigh
 void tvuEval(const char *script);
 void tvuClose(void);
 char *tvuPickFolder(const char *title);
+char *tvuPickFiles(const char *title);
 void tvuAlert(const char *title, const char *message);
 */
 import "C"
 
 import (
+	"encoding/json"
 	"errors"
 	"runtime"
 	"sync"
@@ -87,6 +89,21 @@ func tvuGoMessage(message *C.char) {
 	go options.OnMessage(text)
 }
 
+// tvuGoDrop receives a JSON array of dropped file-system paths.
+//
+//export tvuGoDrop
+func tvuGoDrop(encoded *C.char) {
+	options := current()
+	if options == nil || options.OnFileDrop == nil {
+		return
+	}
+	var paths []string
+	if err := json.Unmarshal([]byte(C.GoString(encoded)), &paths); err != nil || len(paths) == 0 {
+		return
+	}
+	go options.OnFileDrop(paths)
+}
+
 //export tvuGoCloseRequest
 func tvuGoCloseRequest() C.int {
 	options := current()
@@ -114,6 +131,24 @@ func PickFolder(title string) (string, error) {
 	}
 	defer C.free(unsafe.Pointer(result))
 	return C.GoString(result), nil
+}
+
+// PickFiles shows the system file chooser for one or more MP4 files and
+// returns an empty list when the user cancels. It must not be called from the
+// UI thread.
+func PickFiles(title string) ([]string, error) {
+	text := C.CString(title)
+	defer C.free(unsafe.Pointer(text))
+	result := C.tvuPickFiles(text)
+	if result == nil {
+		return nil, nil
+	}
+	defer C.free(unsafe.Pointer(result))
+	var paths []string
+	if err := json.Unmarshal([]byte(C.GoString(result)), &paths); err != nil {
+		return nil, err
+	}
+	return paths, nil
 }
 
 // ShowError shows a modal alert. It works before Run and must be called from

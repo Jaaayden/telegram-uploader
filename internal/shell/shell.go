@@ -4,6 +4,8 @@
 // view's native message channel.
 //
 // Page → Go: window.__tvuPost(string)
+// Dropped files: the page shows its own drop hint from the DOM drag events;
+// the real paths never reach the page and arrive through OnFileDrop.
 // Go → page: Window.Eval, which the application uses to call
 // window.__tvuReceive(...)
 package shell
@@ -31,6 +33,9 @@ type Options struct {
 	// OnMessage receives strings posted by the page. It is called on its own
 	// goroutine and may block.
 	OnMessage func(message string)
+	// OnFileDrop receives the paths of files and folders dragged onto the
+	// window. It is called on its own goroutine.
+	OnFileDrop func(paths []string)
 	// OnCloseRequest runs on the UI thread when the user closes the window or
 	// quits. Returning false keeps the window open.
 	OnCloseRequest func() bool

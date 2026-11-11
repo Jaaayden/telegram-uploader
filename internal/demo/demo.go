@@ -92,6 +92,14 @@ func (c *Client) UploadVideo(ctx context.Context, request tgtransport.UploadRequ
 	total := info.Size()
 	windowStart := time.Now()
 	var done, windowBytes int64
+	// Like the real transport, continue a recent partial upload.
+	fileID := request.Resume.FileID
+	if request.Resume.Fresh(total, time.Now()) {
+		done = request.Resume.ResumedBytes()
+		windowBytes = done
+	} else {
+		fileID = time.Now().UnixNano()
+	}
 	rate := float64(simulatedRate)
 	step := simulatedRate / int64(time.Second/tick)
 	for done < total {
@@ -109,6 +117,12 @@ func (c *Client) UploadVideo(ctx context.Context, request tgtransport.UploadRequ
 			return 0, ctx.Err()
 		}
 		done += chunk
+		if request.OnCheckpoint != nil {
+			request.OnCheckpoint(tgtransport.ResumeToken{
+				FileID: fileID, Parts: int(done / tgtransport.UploadPartSize),
+				PartSize: tgtransport.UploadPartSize, Size: total, At: time.Now(),
+			})
+		}
 		if onProgress != nil {
 			// Report the recent rate so a changed limit shows up at once.
 			now := time.Now()
