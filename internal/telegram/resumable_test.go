@@ -120,6 +120,12 @@ func TestResumableUploadSendsEveryPartOnce(t *testing.T) {
 	if final.FileID != big.ID || final.Parts != 11 || final.PartSize != partSize || final.Size != int64(len(data)) {
 		t.Fatalf("final checkpoint = %+v", final)
 	}
+	// Workers finish in any order, but a checkpoint must never move back.
+	for index := 1; index < len(*checkpoints); index++ {
+		if (*checkpoints)[index].Parts <= (*checkpoints)[index-1].Parts {
+			t.Fatalf("checkpoint %d went from %d to %d parts", index, (*checkpoints)[index-1].Parts, (*checkpoints)[index].Parts)
+		}
+	}
 }
 
 func TestResumableUploadContinuesAfterFailureWithSameFileID(t *testing.T) {

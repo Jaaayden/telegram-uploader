@@ -116,6 +116,9 @@ func (u *resumableUpload) run(ctx context.Context, token ResumeToken) (tg.InputF
 		done      = make([]bool, totalParts)
 		prefix    = firstPart
 		confirmed = min(int64(firstPart)*int64(u.partSize), u.size)
+		// reportMu orders checkpoint callbacks; reported is the newest one.
+		reportMu sync.Mutex
+		reported = firstPart
 	)
 	if u.progress != nil && confirmed > 0 {
 		// Show the resumed position at once instead of starting from zero.
@@ -134,7 +137,15 @@ func (u *resumableUpload) run(ctx context.Context, token ResumeToken) (tg.InputF
 		resume := ResumeToken{FileID: fileID, Parts: prefix, PartSize: u.partSize, Size: u.size, At: u.now()}
 		mu.Unlock()
 		if advanced && u.checkpoint != nil {
-			u.checkpoint(resume)
+			// Workers reach this point in any order. Report under a lock and
+			// skip anything older than what was already reported, so the
+			// caller only ever sees the checkpoint move forward.
+			reportMu.Lock()
+			if resume.Parts > reported {
+				reported = resume.Parts
+				u.checkpoint(resume)
+			}
+			reportMu.Unlock()
 		}
 		if u.progress != nil {
 			return u.progress(ctx, uploader.ProgressState{Uploaded: uploaded, Total: u.size})
