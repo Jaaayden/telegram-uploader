@@ -3,7 +3,7 @@ module github.com/Jaaayden/telegram-uploader
 go 1.26.0
 
 require (
-	github.com/Eyevinn/mp4ff v0.60.0
+	github.com/Eyevinn/mp4ff v0.62.0
 	github.com/gotd/td v0.162.0
 	github.com/wailsapp/go-webview2 v1.0.23
 	github.com/zalando/go-keyring v0.2.8
