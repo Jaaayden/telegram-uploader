@@ -3,12 +3,14 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	coreapp "github.com/Jaaayden/telegram-uploader/internal/app"
@@ -197,6 +199,27 @@ func run(opts options) int {
 			send(map[string]any{"id": request.ID, "result": result})
 			if request.Method == "init" {
 				smoke.probe(window.Load())
+			}
+		},
+		OnError: func(operation string, err error, fatal bool) {
+			// A system error code says more than its localized text.
+			code := uint64(0)
+			var errno syscall.Errno
+			if errors.As(err, &errno) {
+				code = uint64(errno)
+			}
+			_ = diagnostics.Logf("webview_error operation=%s fatal=%t code=%#x detail=%q", operation, fatal, code, err.Error())
+			fmt.Fprintf(os.Stderr, "web view error: %s (fatal=%t): %v\n", operation, fatal, err)
+			if opts.smoke {
+				// An unattended self-test must fail, not wait on a dialog.
+				return
+			}
+			switch {
+			case fatal:
+				shell.ShowError(windowTitle, fmt.Sprintf("界面组件（WebView2）出错，应用需要退出。\n\n%v\n\n重新打开后，未完成的上传会从断点继续。", err))
+			case operation == shell.ErrorBrowserExited:
+				// Not on the UI thread: the window must keep handling messages.
+				go shell.ShowError(windowTitle, "界面进程意外退出，窗口无法继续显示。\n\n正在进行的上传不受影响；关闭窗口并重新打开应用即可恢复界面。")
 			}
 		},
 		OnFileDrop:     app.DropPaths,

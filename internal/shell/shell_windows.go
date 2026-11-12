@@ -85,6 +85,7 @@ var (
 	procMessageBoxW                   = user32.NewProc("MessageBoxW")
 	procSetProcessDpiAwarenessContext = user32.NewProc("SetProcessDpiAwarenessContext")
 	procGetDpiForSystem               = user32.NewProc("GetDpiForSystem")
+	procIsIconic                      = user32.NewProc("IsIconic")
 	procExtractIconExW                = shell32.NewProc("ExtractIconExW")
 	procCoInitializeEx                = ole32.NewProc("CoInitializeEx")
 	procCoUninitialize                = ole32.NewProc("CoUninitialize")
@@ -99,6 +100,8 @@ var (
 	// active is only touched on the UI thread, except through its own locks.
 	active *windowsWindow
 )
+
+var errProcessExited = errors.New("process exited unexpectedly")
 
 type point struct{ x, y int32 }
 
@@ -135,13 +138,19 @@ type minMaxInfo struct {
 }
 
 type windowsWindow struct {
-	hwnd         uintptr
-	thread       uintptr
-	chromium     *edge.Chromium
-	options      Options
-	minSize      point
-	embedded     bool
-	forceClose   bool
+	hwnd       uintptr
+	thread     uintptr
+	chromium   *edge.Chromium
+	options    Options
+	minSize    point
+	embedded   bool
+	forceClose bool
+	// guard keeps a refused WebView2 call from ending the process.
+	guard callGuard
+	// dead is set when the WebView2 browser process is gone: nothing can be
+	// shown or asked any more.
+	dead         bool
+	reported     map[string]struct{}
 	dispatchLock sync.Mutex
 	dispatchList []func()
 }
@@ -154,8 +163,65 @@ func (w *windowsWindow) dispatch(fn func()) {
 	_, _, _ = procPostThreadMessageW.Call(w.thread, wmApp, 0, 0)
 }
 
+// report passes a WebView2 error to the application. A repeated harmless
+// error is reported once, so a dead view cannot flood the log.
+func (w *windowsWindow) report(operation string, err error, fatal bool) {
+	if !fatal {
+		key := operation + "\x00" + err.Error()
+		if _, seen := w.reported[key]; seen {
+			return
+		}
+		if w.reported == nil {
+			w.reported = make(map[string]struct{})
+		}
+		w.reported[key] = struct{}{}
+	}
+	if w.options.OnError != nil {
+		w.options.OnError(operation, err, fatal)
+	}
+}
+
+// try runs a call into the binding that may fail without consequences. It
+// must be called on the UI thread.
+func (w *windowsWindow) try(operation string, fn func()) {
+	if w.dead {
+		return
+	}
+	if err := w.guard.run(fn); err != nil {
+		w.report(operation, err, false)
+	}
+}
+
+func (w *windowsWindow) minimized() bool {
+	iconic, _, _ := procIsIconic.Call(w.hwnd)
+	return iconic != 0
+}
+
+// focus moves the keyboard focus into the page. WebView2 refuses this in
+// several ordinary situations (a minimized or not yet visible view, a window
+// that lost the foreground again); that is never worth more than a log line.
+func (w *windowsWindow) focus() {
+	if w.dead || !w.embedded || w.minimized() {
+		return
+	}
+	controller := w.chromium.GetController()
+	if controller == nil {
+		return
+	}
+	if err := controller.MoveFocus(edge.COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC); err != nil {
+		w.report(ErrorFocus, err, false)
+	}
+}
+
+func (w *windowsWindow) resize() {
+	if !w.embedded || w.minimized() {
+		return
+	}
+	w.try(ErrorResize, w.chromium.Resize)
+}
+
 func (w *windowsWindow) Eval(script string) {
-	w.dispatch(func() { w.chromium.Eval(script) })
+	w.dispatch(func() { w.try(ErrorEval, func() { w.chromium.Eval(script) }) })
 }
 
 func (w *windowsWindow) Close() {
@@ -173,16 +239,16 @@ func windowProc(hwnd, msg, wParam, lParam uintptr) uintptr {
 	}
 	switch msg {
 	case wmMove, wmMoving:
-		if w.embedded {
+		if w.embedded && !w.dead {
 			_ = w.chromium.NotifyParentWindowPositionChanged()
 		}
 	case wmSize:
-		if w.embedded {
-			w.chromium.Resize()
-		}
+		w.resize()
 	case wmActivate:
-		if wParam != waInactive && w.embedded {
-			w.chromium.Focus()
+		// The low word is the activation state; the high word is set while
+		// the window is minimized.
+		if wParam&0xffff != waInactive && wParam>>16 == 0 {
+			w.focus()
 		}
 	case wmGetMinMaxInfo:
 		if w.minSize.x > 0 && w.minSize.y > 0 {
@@ -192,7 +258,8 @@ func windowProc(hwnd, msg, wParam, lParam uintptr) uintptr {
 		}
 	case wmClose:
 		// Ask before abandoning an upload, unless Go already decided to close.
-		if !w.forceClose && w.options.OnCloseRequest != nil && !w.options.OnCloseRequest() {
+		// A dead page cannot show the question, so it must not block closing.
+		if !w.forceClose && !w.dead && w.options.OnCloseRequest != nil && !w.options.OnCloseRequest() {
 			return 0
 		}
 		w.chromium.ShuttingDown()
@@ -334,9 +401,32 @@ func Run(options Options) error {
 	chromium.DataPath = options.DataDir
 	chromium.Debug = options.Debug
 	chromium.SetErrorCallback(func(err error) {
-		// The binding calls os.Exit right after this returns; record why.
-		_, _ = os.Stderr.WriteString("webview2: " + err.Error() + "\n")
+		// Inside try this does not return: the call is abandoned, not the
+		// process.
+		w.guard.fail(err)
+		// Otherwise the binding calls os.Exit right after this returns; the
+		// application records why and tells the user.
+		w.report(ErrorFatal, err, true)
 	})
+	chromium.ProcessFailedCallback = func(_ *edge.ICoreWebView2, args *edge.ICoreWebView2ProcessFailedEventArgs) {
+		kind, err := args.GetProcessFailedKind()
+		if err != nil {
+			return
+		}
+		switch kind {
+		case edge.COREWEBVIEW2_PROCESS_FAILED_KIND_BROWSER_PROCESS_EXITED:
+			// The view is closed for good; uploads keep running.
+			w.dead = true
+			w.report(ErrorBrowserExited, errProcessExited, false)
+		case edge.COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_EXITED:
+			// WebView2 shows an error page; load the interface again once this
+			// event has been handled. The page asks for its state on load.
+			w.report(ErrorRendererExited, errProcessExited, false)
+			w.dispatch(func() {
+				w.try(ErrorReload, func() { chromium.NavigateToString(options.HTML) })
+			})
+		}
+	}
 	chromium.MessageCallback = func(text string, _ *edge.ICoreWebView2, _ *edge.ICoreWebView2WebMessageReceivedEventArgs) {
 		if options.OnMessage != nil && text != dropMessage {
 			go options.OnMessage(text)
@@ -364,10 +454,10 @@ func Run(options Options) error {
 		_ = settings.PutIsZoomControlEnabled(false)
 	}
 	chromium.Init(bridgeScript)
-	chromium.Resize()
+	w.resize()
 	_ = chromium.Show()
 	chromium.NavigateToString(options.HTML)
-	chromium.Focus()
+	w.focus()
 	if options.OnReady != nil {
 		options.OnReady(w)
 	}
