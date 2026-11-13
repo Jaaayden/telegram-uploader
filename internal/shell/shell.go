@@ -41,7 +41,27 @@ type Options struct {
 	OnCloseRequest func() bool
 	// OnReady runs once the window exists, before the event loop starts.
 	OnReady func(Window)
+	// OnError receives failures of the embedded web view (Windows). operation
+	// is one of the Error constants. It runs on the UI thread. With fatal the
+	// process ends as soon as it returns; otherwise the window keeps working
+	// and OnError must not block.
+	OnError func(operation string, err error, fatal bool)
 }
+
+// Operations reported to Options.OnError.
+const (
+	// ErrorFatal is a failure the web view cannot continue after.
+	ErrorFatal = "fatal"
+	// ErrorBrowserExited means the web view's browser process is gone: the
+	// window stays blank until the application is restarted.
+	ErrorBrowserExited = "browser-exited"
+	// ErrorRendererExited means the page's process ended; it is reloaded.
+	ErrorRendererExited = "renderer-exited"
+	ErrorReload         = "reload"
+	ErrorFocus          = "focus"
+	ErrorResize         = "resize"
+	ErrorEval           = "eval"
+)
 
 // Window is the handle given to OnReady. Its methods may be called from any
 // goroutine.

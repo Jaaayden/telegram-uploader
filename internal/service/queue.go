@@ -627,9 +627,10 @@ func (s *Service) CancelSchedule() error {
 // tryScheduledStart runs whenever a due schedule might be able to start: when
 // the time arrives and again after every change that could unblock it.
 func (s *Service) tryScheduledStart() {
-	if !s.scheduleStartMu.TryLock() {
-		return
-	}
+	// Wait for an attempt in progress instead of giving up: that attempt may
+	// have looked before the change this call reports (the connection coming
+	// up, for example), and nothing else would try again.
+	s.scheduleStartMu.Lock()
 	defer s.scheduleStartMu.Unlock()
 	if _, set, due := s.scheduler.State(); !set || !due {
 		return
