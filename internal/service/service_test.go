@@ -902,3 +902,29 @@ func TestScheduleOnPausedQueueResumesIt(t *testing.T) {
 		return !snapshot.Running && !snapshot.Paused && snapshot.Jobs[0].State == model.JobSent
 	})
 }
+
+// A due schedule is retried from several places at once when the application
+// starts (the queue snapshot arrives, the connection comes up). None of those
+// attempts may be dropped, or the schedule stays due and never starts.
+func TestDueScheduleIsNotLostWhenAttemptsOverlap(t *testing.T) {
+	for round := 0; round < 60; round++ {
+		h := newHarness(t, nil)
+		h.seed(20)
+		if err := h.controller.SetChannel(demo.Channel); err != nil {
+			t.Fatal(err)
+		}
+		if err := h.service.updateSettings(func(settings *coreapp.Settings) {
+			settings.APIID = 42
+			settings.ScheduledStartUnix = time.Now().Add(-time.Second).Unix()
+		}); err != nil {
+			t.Fatal(err)
+		}
+		h.service.Start()
+		close(h.client(0).ready)
+		h.eventually(fmt.Sprintf("round %d: scheduled start", round), func() bool {
+			_, set, _ := h.service.scheduler.State()
+			return !set
+		})
+		h.service.Shutdown(true)
+	}
+}
