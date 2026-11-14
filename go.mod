@@ -8,7 +8,7 @@ require (
 	github.com/wailsapp/go-webview2 v1.0.23
 	github.com/zalando/go-keyring v0.2.8
 	golang.org/x/net v0.61.0
-	golang.org/x/sys v0.49.0
+	golang.org/x/sys v0.50.0
 )
 
 require (
