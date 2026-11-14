@@ -18,7 +18,7 @@ const (
 // builds override it with
 //
 //	-ldflags "-X github.com/Jaaayden/telegram-uploader/internal/buildinfo.Version=<version>"
-var Version = "2.1.2"
+var Version = "2.2.0"
 
 // Commit is the source revision of a release or CI build. It is empty for
 // plain "go build" and "go run".
