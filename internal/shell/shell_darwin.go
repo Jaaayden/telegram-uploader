@@ -7,7 +7,9 @@ package shell
 #cgo LDFLAGS: -framework Cocoa -framework WebKit
 #include <stdlib.h>
 
-void tvuRun(const char *title, int width, int height, int minWidth, int minHeight, const char *html, int debug);
+void tvuRun(const char *title, int width, int height, int minWidth, int minHeight, const char *html, int debug, int background);
+char *tvuSelfTestBackground(void);
+void tvuRequestQuitAsync(void);
 void tvuEval(const char *script);
 void tvuClose(void);
 char *tvuPickFolder(const char *title);
@@ -69,7 +71,32 @@ func Run(options Options) error {
 	if options.Debug {
 		debug = 1
 	}
-	C.tvuRun(title, C.int(options.Width), C.int(options.Height), C.int(options.MinWidth), C.int(options.MinHeight), html, debug)
+	background := C.int(0)
+	if options.RunInBackground {
+		background = 1
+	}
+	C.tvuRun(title, C.int(options.Width), C.int(options.Height), C.int(options.MinWidth), C.int(options.MinHeight), html, debug, background)
+	return nil
+}
+
+// AcquireSingleInstance reports whether another instance already runs. On
+// macOS, opening the application again makes LaunchServices reactivate the
+// running one, so nothing needs to be done here.
+func AcquireSingleInstance(string) bool { return false }
+
+// SelfTestBackground checks the background behaviour of a running window:
+// closing hides it and keeps the menu bar item, showing brings it back. It
+// ends by requesting a quit the way the menu bar item does, so the
+// application is expected to exit shortly after it returns nil.
+func SelfTestBackground(Window) error {
+	if failure := C.tvuSelfTestBackground(); failure != nil {
+		defer C.free(unsafe.Pointer(failure))
+		if message := C.GoString(failure); message != "no-tray" {
+			return errors.New(message)
+		}
+		return ErrNoTray
+	}
+	C.tvuRequestQuitAsync()
 	return nil
 }
 

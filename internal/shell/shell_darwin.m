@@ -47,6 +47,41 @@ static NSWindow *gWindow;
 static WKWebView *gWebView;
 static BOOL gForceClose;
 static BOOL gPageLoaded;
+static BOOL gBackground;
+static NSStatusItem *gStatusItem;
+
+// Bring the window back from the background (or just to the front).
+static void tvuShowWindow(void) {
+    if (gWindow == nil) {
+        return;
+    }
+    [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+    if (gWindow.isMiniaturized) {
+        [gWindow deminiaturize:nil];
+    }
+    [gWindow makeKeyAndOrderFront:nil];
+    [NSApp activateIgnoringOtherApps:YES];
+}
+
+// Hide the window and the Dock icon; the menu bar item stays.
+static void tvuHideWindow(void) {
+    [gWindow orderOut:nil];
+    [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
+}
+
+// Quit the way Cmd+Q does. When the application wants the user to confirm
+// first, the window must be visible for the question to be seen.
+static void tvuRequestQuit(void) {
+    if (gWindow == nil) {
+        return;
+    }
+    if (tvuGoCloseRequest()) {
+        gForceClose = YES;
+        [gWindow close];
+    } else {
+        tvuShowWindow();
+    }
+}
 
 @interface TVUDelegate : NSObject <NSApplicationDelegate, NSWindowDelegate, WKScriptMessageHandler, WKNavigationDelegate>
 @end
@@ -63,7 +98,30 @@ static BOOL gPageLoaded;
     if (gForceClose) {
         return YES;
     }
+    if (gBackground && gStatusItem != nil) {
+        // Closing the window only hides it: uploads and schedules go on, and
+        // the menu bar item brings the window back or quits.
+        tvuHideWindow();
+        return NO;
+    }
     return tvuGoCloseRequest() ? YES : NO;
+}
+
+- (void)showWindowAction:(id)sender {
+    tvuShowWindow();
+}
+
+- (void)quitAction:(id)sender {
+    tvuRequestQuit();
+}
+
+- (BOOL)applicationShouldHandleReopen:(NSApplication *)sender hasVisibleWindows:(BOOL)visible {
+    // Opening the application again (Finder, Spotlight) while it runs in the
+    // background shows its window.
+    if (!visible) {
+        tvuShowWindow();
+    }
+    return NO;
 }
 
 - (void)windowWillClose:(NSNotification *)notification {
@@ -83,9 +141,9 @@ static BOOL gPageLoaded;
 }
 
 - (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication *)sender {
-    // Cmd+Q and the Dock's Quit take the same path as the close button, so
-    // the application can ask before abandoning an upload.
-    [gWindow performClose:nil];
+    // Cmd+Q and the Dock's Quit let the application ask before abandoning an
+    // upload; it closes the window itself when quitting is fine.
+    tvuRequestQuit();
     return NSTerminateCancel;
 }
 
@@ -169,8 +227,55 @@ static void tvuBuildMenu(NSString *appName) {
     [NSApp setMainMenu:bar];
 }
 
-void tvuRun(const char *title, int width, int height, int minWidth, int minHeight, const char *html, int debug) {
+// A tray-and-arrow glyph in the menu bar's template style (the system colours
+// it for light, dark and highlighted states).
+static NSImage *tvuStatusImage(void) {
+    NSImage *image = [NSImage imageWithSize:NSMakeSize(18, 18)
+                                    flipped:NO
+                             drawingHandler:^BOOL(NSRect rect) {
+        NSBezierPath *path = [NSBezierPath bezierPath];
+        path.lineWidth = 1.6;
+        path.lineCapStyle = NSLineCapStyleRound;
+        path.lineJoinStyle = NSLineJoinStyleRound;
+        [path moveToPoint:NSMakePoint(3, 8)];
+        [path lineToPoint:NSMakePoint(3, 3.5)];
+        [path lineToPoint:NSMakePoint(15, 3.5)];
+        [path lineToPoint:NSMakePoint(15, 8)];
+        [path moveToPoint:NSMakePoint(9, 5.5)];
+        [path lineToPoint:NSMakePoint(9, 14.5)];
+        [path moveToPoint:NSMakePoint(5.5, 11)];
+        [path lineToPoint:NSMakePoint(9, 14.5)];
+        [path lineToPoint:NSMakePoint(12.5, 11)];
+        [[NSColor blackColor] setStroke];
+        [path stroke];
+        return YES;
+    }];
+    image.template = YES;
+    return image;
+}
+
+static void tvuInstallStatusItem(NSString *appName) {
+    gStatusItem = [[NSStatusBar systemStatusBar] statusItemWithLength:NSSquareStatusItemLength];
+    if (gStatusItem == nil || gStatusItem.button == nil) {
+        gStatusItem = nil;
+        return;
+    }
+    gStatusItem.button.image = tvuStatusImage();
+    gStatusItem.button.toolTip = appName;
+    NSMenu *menu = [[NSMenu alloc] init];
+    NSMenuItem *show = [menu addItemWithTitle:@"显示窗口" action:@selector(showWindowAction:) keyEquivalent:@""];
+    show.target = gDelegate;
+    [menu addItem:[NSMenuItem separatorItem]];
+    NSMenuItem *quit = [menu addItemWithTitle:[@"退出 " stringByAppendingString:appName]
+                                       action:@selector(quitAction:)
+                                keyEquivalent:@""];
+    quit.target = gDelegate;
+    gStatusItem.menu = menu;
+}
+
+void tvuRun(const char *title, int width, int height, int minWidth, int minHeight, const char *html, int debug, int background) {
     @autoreleasepool {
+        gBackground = background != 0;
         tvuEnsureApplication();
         NSString *windowTitle = [NSString stringWithUTF8String:title];
         tvuBuildMenu(windowTitle);
@@ -213,9 +318,16 @@ void tvuRun(const char *title, int width, int height, int minWidth, int minHeigh
 
         [gWindow makeKeyAndOrderFront:nil];
         [NSApp activateIgnoringOtherApps:YES];
+        if (gBackground) {
+            tvuInstallStatusItem(windowTitle);
+        }
         tvuGoReady();
         [NSApp run];
 
+        if (gStatusItem != nil) {
+            [[NSStatusBar systemStatusBar] removeStatusItem:gStatusItem];
+            gStatusItem = nil;
+        }
         gWebView = nil;
         gWindow = nil;
     }
@@ -235,6 +347,51 @@ void tvuClose(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
         gForceClose = YES;
         [gWindow close];
+    });
+}
+
+// Exercises the background behaviour on the main thread. Returns NULL when it
+// works, otherwise a malloc'd description of what does not.
+char *tvuSelfTestBackground(void) {
+    __block NSString *failure = nil;
+    void (^check)(void) = ^{
+        if (!gBackground) {
+            failure = @"the window does not run in the background";
+            return;
+        }
+        if (gStatusItem == nil) {
+            failure = @"no-tray";
+            return;
+        }
+        [gWindow performClose:nil];
+        if (gWindow.isVisible) {
+            failure = @"closing the window did not hide it";
+            return;
+        }
+        if (NSApp.activationPolicy != NSApplicationActivationPolicyAccessory) {
+            failure = @"the Dock icon stayed while the window was hidden";
+            return;
+        }
+        tvuShowWindow();
+        if (!gWindow.isVisible) {
+            failure = @"showing the window from the menu bar item did not work";
+            return;
+        }
+        if (NSApp.activationPolicy != NSApplicationActivationPolicyRegular) {
+            failure = @"the Dock icon did not return with the window";
+        }
+    };
+    if ([NSThread isMainThread]) {
+        check();
+    } else {
+        dispatch_sync(dispatch_get_main_queue(), check);
+    }
+    return failure == nil ? NULL : strdup(failure.UTF8String);
+}
+
+void tvuRequestQuitAsync(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        tvuRequestQuit();
     });
 }
 
