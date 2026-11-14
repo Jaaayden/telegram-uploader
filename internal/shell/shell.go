@@ -19,6 +19,10 @@ import (
 // ErrUnsupported is returned on platforms without a window implementation.
 var ErrUnsupported = errors.New("shell: this platform has no window support")
 
+// ErrNoTray is returned by SelfTestBackground when the session has nowhere to
+// put the icon, so the application runs without background mode.
+var ErrNoTray = errors.New("shell: no notification area available")
+
 // Options describes the single application window.
 type Options struct {
 	Title               string
@@ -36,8 +40,17 @@ type Options struct {
 	// OnFileDrop receives the paths of files and folders dragged onto the
 	// window. It is called on its own goroutine.
 	OnFileDrop func(paths []string)
-	// OnCloseRequest runs on the UI thread when the user closes the window or
-	// quits. Returning false keeps the window open.
+	// RunInBackground keeps the process alive when the window is closed: the
+	// window is hidden and an icon in the menu bar (macOS) or the notification
+	// area (Windows) offers "show window" and "quit". Only quitting (Cmd+Q, the
+	// icon's menu) asks OnCloseRequest, so a running upload is not abandoned
+	// by merely closing the window. Without a working icon the window closes
+	// as before, so a hidden window can never be left without a way back.
+	RunInBackground bool
+	// OnCloseRequest runs on the UI thread when the user quits (or closes the
+	// window, unless RunInBackground is set). Returning false keeps the
+	// application running; the window is brought forward so the question the
+	// application asks is visible.
 	OnCloseRequest func() bool
 	// OnReady runs once the window exists, before the event loop starts.
 	OnReady func(Window)

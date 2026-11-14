@@ -145,6 +145,10 @@ type windowsWindow struct {
 	minSize    point
 	embedded   bool
 	forceClose bool
+	// trayIcon is the icon shown in the notification area; trayAdded is set
+	// while the shell has accepted it.
+	trayIcon  uintptr
+	trayAdded bool
 	// guard keeps a refused WebView2 call from ending the process.
 	guard callGuard
 	// dead is set when the WebView2 browser process is gone: nothing can be
@@ -237,7 +241,21 @@ func windowProc(hwnd, msg, wParam, lParam uintptr) uintptr {
 		result, _, _ := procDefWindowProcW.Call(hwnd, msg, wParam, lParam)
 		return result
 	}
+	// Messages registered by name have no constant values.
+	switch {
+	case msg == uintptr(showRequestMessage()) && msg != 0:
+		w.showFromBackground()
+		return 0
+	case msg == uintptr(taskbarCreated()) && msg != 0:
+		// Explorer restarted and lost the icon.
+		w.addTray()
+		return 0
+	}
 	switch msg {
+	case wmTray:
+		w.handleTray(lParam)
+	case wmCommand:
+		w.handleCommand(wParam & 0xffff)
 	case wmMove, wmMoving:
 		if w.embedded && !w.dead {
 			_ = w.chromium.NotifyParentWindowPositionChanged()
@@ -257,6 +275,11 @@ func windowProc(hwnd, msg, wParam, lParam uintptr) uintptr {
 			info.minTrackSize = w.minSize
 		}
 	case wmClose:
+		if !w.forceClose && w.options.RunInBackground && w.trayAdded {
+			// The icon is the way back, so closing the window only hides it.
+			w.hideToBackground()
+			return 0
+		}
 		// Ask before abandoning an upload, unless Go already decided to close.
 		// A dead page cannot show the question, so it must not block closing.
 		if !w.forceClose && !w.dead && w.options.OnCloseRequest != nil && !w.options.OnCloseRequest() {
@@ -265,6 +288,7 @@ func windowProc(hwnd, msg, wParam, lParam uintptr) uintptr {
 		w.chromium.ShuttingDown()
 		_, _, _ = procDestroyWindow.Call(hwnd)
 	case wmDestroy:
+		w.removeTray()
 		_, _, _ = procPostQuitMessage.Call(0)
 	default:
 		result, _, _ := procDefWindowProcW.Call(hwnd, msg, wParam, lParam)
@@ -352,7 +376,7 @@ func Run(options Options) error {
 
 	largeIcon, smallIcon := executableIcons()
 	cursor, _, _ := procLoadCursorW.Call(0, idcArrow)
-	className, _ := windows.UTF16PtrFromString("TelegramVideoUploaderWindow")
+	className, _ := windows.UTF16PtrFromString(windowClassName)
 	class := windowClass{
 		windowProc: windowProcCallback(),
 		instance:   instance,
@@ -390,6 +414,9 @@ func Run(options Options) error {
 	if smallIcon != 0 {
 		_, _, _ = procSendMessageW.Call(hwnd, wmSetIcon, iconSmall, smallIcon)
 	}
+	w.trayIcon = smallIcon
+	w.addTray()
+	defer w.removeTray()
 
 	// Show the window before embedding: a WebView2 created inside a hidden
 	// parent considers itself invisible and suspends the page's timers.

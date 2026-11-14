@@ -19,3 +19,10 @@ func PickFiles(string) ([]string, error) { return nil, ErrUnsupported }
 
 // ShowError prints the message; there is no window system to show it in.
 func ShowError(title, message string) { fmt.Fprintln(os.Stderr, title+": "+message) }
+
+// AcquireSingleInstance reports whether another instance already runs. There
+// is no such check on this platform.
+func AcquireSingleInstance(string) bool { return false }
+
+// SelfTestBackground is unavailable on this platform.
+func SelfTestBackground(Window) error { return ErrUnsupported }

@@ -29,7 +29,12 @@ import (
 	"github.com/Jaaayden/telegram-uploader/internal/webui"
 )
 
-const windowTitle = "Telegram 视频顺序上传器"
+const (
+	windowTitle = "Telegram 视频顺序上传器"
+	// singleInstanceName identifies the running application for a second
+	// launch, which shows the first one's window instead of starting again.
+	singleInstanceName = "TelegramVideoUploader"
+)
 
 type options struct {
 	demo    bool
@@ -62,6 +67,12 @@ func run(opts options) int {
 	}
 	if opts.smoke {
 		opts.demo = true
+	}
+	// Closing the window leaves the application running in the background, so
+	// a second launch must not start a second instance with the same Bot. The
+	// demo, the self-test and the development server are not the real thing.
+	if !opts.demo && opts.devHTTP == "" && shell.AcquireSingleInstance(singleInstanceName) {
+		return 0
 	}
 	if opts.demo {
 		// Never touch the real queue, settings or keychain in demo mode.
@@ -172,6 +183,9 @@ func run(opts options) int {
 		HTML:      webui.Page(),
 		DataDir:   filepath.Join(paths.Root, "webview"),
 		Debug:     opts.debug,
+		// Closing the window keeps uploads and schedules running; the menu bar
+		// or notification area icon shows the window again or quits.
+		RunInBackground: true,
 		OnMessage: func(raw string) {
 			var request struct {
 				ID     int64           `json:"id"`
@@ -384,7 +398,25 @@ func (s *smokeCheck) handle(method string, params json.RawMessage) bool {
 		} else {
 			fmt.Fprintln(os.Stderr, "SMOKE FAIL: the page loaded but rendered no queue rows")
 		}
-		if window := s.window.Load(); window != nil {
+		window := s.window.Load()
+		if window == nil {
+			return
+		}
+		if !s.passed.Load() {
+			(*window).Close()
+			return
+		}
+		// The page works; now check closing to the background and quitting from
+		// the icon. A successful run ends in that quit.
+		switch err := shell.SelfTestBackground(*window); {
+		case err == nil:
+			fmt.Println("SMOKE OK: closing hides the window, the icon shows it again and quits")
+		case errors.Is(err, shell.ErrNoTray):
+			fmt.Println("SMOKE NOTE: this session has no notification area; background mode skipped")
+			(*window).Close()
+		default:
+			s.passed.Store(false)
+			fmt.Fprintln(os.Stderr, "SMOKE FAIL: background mode:", err)
 			(*window).Close()
 		}
 	})
