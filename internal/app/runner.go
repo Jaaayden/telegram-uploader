@@ -127,6 +127,8 @@ func (c *Controller) runQueue(ctx context.Context, cancel context.CancelFunc) {
 	c.mu.RLock()
 	runDone := c.runDone
 	c.mu.RUnlock()
+	var stats uploadStats
+	runBegan := time.Now()
 	defer func() {
 		c.mu.Lock()
 		c.running = false
@@ -155,7 +157,16 @@ func (c *Controller) runQueue(ctx context.Context, cancel context.CancelFunc) {
 			}
 			c.mu.Unlock()
 		}
-		_ = diagnostics.Logf("queue_stop")
+		stopped := time.Now()
+		_ = diagnostics.Logf(
+			"queue_stop finished_at=%q run_elapsed=%s sent=%d sent_bytes=%d upload_time=%s avg_speed=%s",
+			formatLocalTime(stopped),
+			formatElapsed(stopped.Sub(runBegan)),
+			stats.jobs,
+			stats.bytes,
+			formatElapsed(stats.elapsed),
+			formatRate(transferRate(stats.bytes, stats.elapsed)),
+		)
 	}()
 
 	for {
@@ -168,8 +179,19 @@ func (c *Controller) runQueue(ctx context.Context, cancel context.CancelFunc) {
 		}
 
 		jobCtx, jobCancel := context.WithCancel(ctx)
-		_ = diagnostics.Logf("job_start id=%s position=%d size=%d", job.ID, job.Position, job.Size)
+		// Bytes a previous attempt already got to Telegram are not sent again,
+		// so they do not count towards this run's speed.
+		var resumedBytes int64
+		if token := resumeToken(&job); token.Usable(job.Size) {
+			resumedBytes = token.ResumedBytes()
+		}
+		_ = diagnostics.Logf(
+			"job_start id=%s name=%q position=%d size=%d resumed_bytes=%d started_at=%q",
+			job.ID, job.Name, job.Position, job.Size, resumedBytes, formatLocalTime(time.Now()),
+		)
+		jobBegan := time.Now()
 		messageID, err := c.uploadJobWithRetry(jobCtx, job, channel, jobCancel)
+		jobElapsed := time.Since(jobBegan)
 		jobContextCancelled := jobCtx.Err() != nil
 
 		c.mu.Lock()
@@ -186,8 +208,9 @@ func (c *Controller) runQueue(ctx context.Context, cancel context.CancelFunc) {
 
 		if err != nil {
 			_ = diagnostics.Logf(
-				"job_attempt_end id=%s success=false error_type=%T cancelled=%t outcome_unknown=%t",
+				"job_attempt_end id=%s success=false elapsed=%s error_type=%T cancelled=%t outcome_unknown=%t",
 				job.ID,
+				formatElapsed(jobElapsed),
 				err,
 				errors.Is(err, context.Canceled),
 				errors.Is(err, tgtransport.ErrSendOutcomeUnknown),
@@ -276,7 +299,19 @@ func (c *Controller) runQueue(ctx context.Context, cancel context.CancelFunc) {
 		}
 
 		completed := time.Now()
-		_ = diagnostics.Logf("job_sent id=%s message_id=%d", job.ID, messageID)
+		sentBytes := max(job.Size-resumedBytes, 0)
+		stats.add(sentBytes, jobElapsed)
+		_ = diagnostics.Logf(
+			"job_sent id=%s name=%q message_id=%d size=%d sent_bytes=%d finished_at=%q elapsed=%s avg_speed=%s",
+			job.ID,
+			job.Name,
+			messageID,
+			job.Size,
+			sentBytes,
+			formatLocalTime(completed),
+			formatElapsed(jobElapsed),
+			formatRate(transferRate(sentBytes, jobElapsed)),
+		)
 		c.mu.Lock()
 		current := findJobIndexLocked(c.jobs, job.ID)
 		if current < 0 {
