@@ -62,9 +62,12 @@ window.addEventListener('error', function (event) {
     <div class="toolbar">
       <div id="filters" class="tabs" role="tablist"></div>
       <div class="toolbar-right">
+        <button id="selectAllBtn" class="btn ghost" type="button" data-act="toggle-select-all">全选</button>
+        <button id="resetBtn" class="btn ghost" type="button" data-act="reset-dialog">重置任务 <span id="resetCount" class="count" hidden></span></button>
+        <button id="moveOversizeBtn" class="btn ghost" type="button" data-act="move-oversize" hidden>移动超限 <span id="oversizeCount" class="count"></span></button>
         <div class="popover-anchor">
-          <button id="moreBtn" class="btn ghost" type="button" title="更多队列操作">更多</button>
-          <div id="moreMenu" class="popover menu right" hidden></div>
+          <button id="cleanBtn" class="btn ghost" type="button" title="清理队列条目">清理 ▾</button>
+          <div id="cleanMenu" class="popover menu right" hidden></div>
         </div>
         <div class="popover-anchor">
           <button id="addBtn" class="btn primary" type="button" title="也可以把视频或文件夹直接拖进窗口">
@@ -82,9 +85,18 @@ window.addEventListener('error', function (event) {
 
     <div id="selectionBar" class="selection" hidden>
       <span id="selectionText"></span>
-      <button class="btn small" data-act="reset-selected" type="button">重置为待上传</button>
-      <button class="btn small danger" data-act="remove-selected" type="button">从队列删除</button>
-      <button class="btn small ghost" data-act="select-none" type="button">取消选择</button>
+      <div class="selection-actions">
+        <button class="btn small" data-act="edit-captions" type="button">编辑 Caption</button>
+        <div class="selection-group" role="group" aria-label="调整顺序">
+          <button class="btn small" data-act="move-up" type="button" title="上移 (Alt+↑)">上移</button>
+          <button class="btn small" data-act="move-down" type="button" title="下移 (Alt+↓)">下移</button>
+          <button class="btn small" data-act="move-top" type="button">置顶</button>
+          <button class="btn small" data-act="move-bottom" type="button">置底</button>
+        </div>
+        <button class="btn small" data-act="reset-selected" type="button">重置为待上传</button>
+        <button class="btn small danger" data-act="remove-selected" type="button">从队列删除</button>
+        <button class="btn small ghost" data-act="select-none" type="button">取消选择</button>
+      </div>
     </div>
 
     <div id="listWrap" class="list-wrap">
@@ -103,6 +115,7 @@ window.addEventListener('error', function (event) {
       </div>
     </div>
     <div class="transport-right">
+      <button id="finishCurrentBtn" class="btn ghost" type="button" data-act="pause-after" hidden>传完当前后暂停</button>
       <button id="scheduleBtn" class="btn ghost" type="button">
         <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 2a8 8 0 1 1 0 16 8 8 0 0 1 0-16Zm0 2a6 6 0 1 0 0 12 6 6 0 0 0 0-12Zm1 2v3.600l2.500 2.500-1.400 1.400L9 10.400V6h2Z"/></svg>
         <span id="scheduleText">定时开始</span>

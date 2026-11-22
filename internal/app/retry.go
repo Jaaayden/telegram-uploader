@@ -188,12 +188,16 @@ func (c *Controller) transferJobWithRetry(
 		if gateway == nil {
 			err = tgtransport.ErrNotConnected
 		} else {
+			caption := ""
+			if !stage {
+				caption = effectiveSingleCaption(job)
+			}
 			request := tgtransport.UploadRequest{
 				Channel:  channel,
 				Path:     job.Path,
 				File:     file,
 				Name:     job.Name,
-				Caption:  captionFromFilename(job.Name),
+				Caption:  caption,
 				RandomID: job.RandomID,
 				Metadata: metadata,
 				Resume:   resume,

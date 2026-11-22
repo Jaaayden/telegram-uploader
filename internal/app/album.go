@@ -87,11 +87,16 @@ func (c *Controller) runSendAlbum(
 		batchIDs := make([]string, len(members))
 		items := make([]tgtransport.AlbumItem, len(members))
 		note := albumSendingNote(len(members))
+		albumCaption := effectiveAlbumCaption(members)
 		for i, member := range members {
 			batchIDs[i] = member.ID
+			caption := ""
+			if i == 0 {
+				caption = albumCaption
+			}
 			items[i] = tgtransport.AlbumItem{
 				Media:    *cloneStagedMedia(member.Staged),
-				Caption:  captionFromFilename(member.Name),
+				Caption:  caption,
 				RandomID: member.RandomID,
 			}
 			if idx := findJobIndexLocked(c.jobs, member.ID); idx >= 0 {
