@@ -514,6 +514,36 @@ func (s *Service) ResetJobs(mode string, ids []string) (string, error) {
 	return fmt.Sprintf("已恢复 %d 个任务，可以直接开始或继续上传", count), nil
 }
 
+// ReorderJobs changes the order of movable entries in the queue.
+func (s *Service) ReorderJobs(ids []string, action string, targetID string) error {
+	s.mu.Lock()
+	moving := s.moveActive
+	s.mu.Unlock()
+	if moving {
+		return errors.New("文件移动进行中，不能调整队列顺序")
+	}
+	_, err := s.controller.ReorderJobs(ids, coreapp.ReorderAction(action), targetID)
+	return err
+}
+
+// SetCaptions updates custom captions for editable entries (or restores defaults).
+func (s *Service) SetCaptions(edits []coreapp.CaptionEdit) (string, error) {
+	s.mu.Lock()
+	moving := s.moveActive
+	s.mu.Unlock()
+	if moving {
+		return "", errors.New("文件移动进行中，不能修改 Caption")
+	}
+	updated, err := s.controller.SetCaptions(edits)
+	if err != nil {
+		return "", err
+	}
+	if updated == 0 {
+		return "Caption 没有变化", nil
+	}
+	return "已更新 Caption", nil
+}
+
 // MoveOversize lets the user choose a destination and moves every oversize
 // file there in the background. Progress is reported through the state.
 func (s *Service) MoveOversize() error {

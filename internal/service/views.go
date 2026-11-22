@@ -32,6 +32,10 @@ type JobView struct {
 	// Staged means an album member has already been uploaded with uploadMedia
 	// and is waiting for its group siblings before SendAlbum posts them.
 	Staged bool `json:"staged,omitempty"`
+	// CustomCaption and CaptionCustom carry manual caption overrides (including
+	// an explicit empty caption when CaptionCustom is true and CustomCaption is "").
+	CustomCaption string `json:"customCaption,omitempty"`
+	CaptionCustom bool   `json:"captionCustom,omitempty"`
 }
 
 // JobsDelta carries only what changed since the previous delta. Order is nil
@@ -78,19 +82,21 @@ func jobView(job model.Job, removing bool) JobView {
 		note = job.Note
 	}
 	return JobView{
-		Note:      note,
-		ID:        job.ID,
-		Name:      job.Name,
-		Path:      job.Path,
-		Size:      job.Size,
-		State:     string(job.State),
-		Uploaded:  job.Uploaded,
-		Error:     job.Error,
-		MessageID: job.MessageID,
-		Truncated: job.Metadata.TruncatedMediaData,
-		Removing:  removing,
-		GroupID:   job.GroupID,
-		Staged:    job.Staged != nil && (job.State == model.JobQueued || job.State == model.JobInterrupted),
+		Note:          note,
+		ID:            job.ID,
+		Name:          job.Name,
+		Path:          job.Path,
+		Size:          job.Size,
+		State:         string(job.State),
+		Uploaded:      job.Uploaded,
+		Error:         job.Error,
+		MessageID:     job.MessageID,
+		Truncated:     job.Metadata.TruncatedMediaData,
+		Removing:      removing,
+		GroupID:       job.GroupID,
+		Staged:        job.Staged != nil && (job.State == model.JobQueued || job.State == model.JobInterrupted),
+		CustomCaption: job.CustomCaption,
+		CaptionCustom: job.CaptionCustom,
 	}
 }
 

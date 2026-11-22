@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 
+	coreapp "github.com/Jaaayden/telegram-uploader/internal/app"
 	"github.com/Jaaayden/telegram-uploader/internal/buildinfo"
 )
 
@@ -160,6 +161,24 @@ func (s *Service) Handle(method string, params json.RawMessage) (any, error) {
 			return nil, err
 		}
 		return message(s.ResetJobs(input.Mode, input.IDs))
+	case "reorderJobs":
+		input, err := decode[struct {
+			IDs      []string `json:"ids"`
+			Action   string   `json:"action"`
+			TargetID string   `json:"targetId"`
+		}](params)
+		if err != nil {
+			return nil, err
+		}
+		return nil, s.ReorderJobs(input.IDs, input.Action, input.TargetID)
+	case "setCaptions":
+		input, err := decode[struct {
+			Edits []coreapp.CaptionEdit `json:"edits"`
+		}](params)
+		if err != nil {
+			return nil, err
+		}
+		return message(s.SetCaptions(input.Edits))
 	case "moveOversize":
 		return nil, s.MoveOversize()
 	case "cancelMove":

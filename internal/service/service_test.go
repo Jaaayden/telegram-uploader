@@ -1155,3 +1155,77 @@ func TestAddCandidatesMergeAndJobViews(t *testing.T) {
 		}
 	})
 }
+
+func TestReorderJobsAndSetCaptionsRPC(t *testing.T) {
+	h := newHarness(t, nil)
+	jobs := h.seed(3)
+	h.connect()
+	h.waitForSnapshot(3)
+
+	// Reorder last job to top via JSON RPC.
+	if _, err := h.call("reorderJobs", map[string]any{
+		"ids":    []string{jobs[2].ID},
+		"action": "top",
+	}); err != nil {
+		t.Fatalf("Handle(reorderJobs) error = %v", err)
+	}
+	h.eventually("reordered snapshot", func() bool {
+		h.service.mu.Lock()
+		defer h.service.mu.Unlock()
+		return len(h.service.snapshot.Jobs) == 3 && h.service.snapshot.Jobs[0].ID == jobs[2].ID
+	})
+
+	initRaw, err := h.call("init", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	order := initRaw.(InitView).Jobs.Order
+	if len(order) != 3 || order[0] != jobs[2].ID {
+		t.Fatalf("init order = %v, want first %s", order, jobs[2].ID)
+	}
+
+	// Set custom captions via JSON RPC (and verify over-limit validation error).
+	tooLong := make([]byte, model.MaxCaptionUTF16+1)
+	for i := range tooLong {
+		tooLong[i] = 'a'
+	}
+	if _, err := h.call("setCaptions", map[string]any{
+		"edits": []map[string]any{
+			{"id": jobs[2].ID, "custom": true, "caption": string(tooLong)},
+		},
+	}); err == nil {
+		t.Fatal("expected error for over-limit caption")
+	}
+
+	res, err := h.call("setCaptions", map[string]any{
+		"edits": []map[string]any{
+			{"id": jobs[2].ID, "custom": true, "caption": "新标题"},
+			{"id": jobs[0].ID, "custom": true, "caption": ""},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Handle(setCaptions) error = %v", err)
+	}
+	if res.(map[string]string)["message"] != "已更新 Caption" {
+		t.Fatalf("message = %v", res)
+	}
+	h.eventually("caption views updated", func() bool {
+		h.service.mu.Lock()
+		defer h.service.mu.Unlock()
+		return h.service.snapshot.Jobs[0].CaptionCustom && h.service.snapshot.Jobs[1].CaptionCustom
+	})
+	initAfter, err := h.call("init", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	viewsByID := make(map[string]JobView)
+	for _, v := range initAfter.(InitView).Jobs.Upsert {
+		viewsByID[v.ID] = v
+	}
+	if !viewsByID[jobs[2].ID].CaptionCustom || viewsByID[jobs[2].ID].CustomCaption != "新标题" {
+		t.Fatalf("job 2 view = %+v", viewsByID[jobs[2].ID])
+	}
+	if !viewsByID[jobs[0].ID].CaptionCustom || viewsByID[jobs[0].ID].CustomCaption != "" {
+		t.Fatalf("job 0 view = %+v", viewsByID[jobs[0].ID])
+	}
+}

@@ -167,7 +167,7 @@ func TestAlbumStagesAndSendsInOrder(t *testing.T) {
 	if len(sends) != 1 {
 		t.Fatalf("SendAlbum calls = %d, want 1", len(sends))
 	}
-	wantCaptions := []string{"01-intro", "02-middle", "03-outro"}
+	wantCaptions := []string{"01-intro\n02-middle\n03-outro", "", ""}
 	for i, item := range sends[0].items {
 		if item.Caption != wantCaptions[i] {
 			t.Errorf("item %d caption = %q, want %q", i, item.Caption, wantCaptions[i])

@@ -66,7 +66,15 @@
   let anchorIndex = -1;
   const rows = new Map(); // id -> row element currently in the DOM
   const groupInfo = new Map(); // id -> { seq, index, total } for groups with >= 2 items
+  const groupMembers = new Map(); // groupId -> [job, ...] in queue order
+  const pinnedGroups = new Set();
   let groupCount = 0;
+  let dragging = null;
+  let dropLine = null;
+
+  const MAX_CAPTION = 1024;
+  const PINNED_STATES = new Set(['uploading', 'sending', 'confirming', 'sent', 'moving', 'moved']);
+  const EDITABLE_STATES = new Set(['queued', 'interrupted', 'failed', 'cancelled', 'skipped']);
 
   const FILTERS = [
     ['all', '全部', () => true],
@@ -180,14 +188,43 @@
     toast('info', '已复制');
   }
 
+  function defaultNameCaption(name) {
+    return name && name.toLowerCase().endsWith('.mp4') ? name.slice(0, -4) : (name || '');
+  }
+  function utf16Truncate(s, maxUnits = MAX_CAPTION) {
+    if (!s || s.length <= maxUnits) return s || '';
+    const limit = maxUnits - 1;
+    let out = '', units = 0;
+    for (const ch of s) {
+      if (units + ch.length > limit) break;
+      out += ch;
+      units += ch.length;
+    }
+    return out + '…';
+  }
+  function isJobMovable(job) {
+    if (!job || PINNED_STATES.has(job.state) || job.removing) return false;
+    if (S && S.queue && S.queue.activeId === job.id) return false;
+    if (job.groupId && pinnedGroups.has(job.groupId)) return false;
+    return true;
+  }
+  function isJobCaptionEditable(job) {
+    if (!job || !EDITABLE_STATES.has(job.state) || job.removing) return false;
+    if (S && S.queue && S.queue.activeId === job.id) return false;
+    if (job.groupId && pinnedGroups.has(job.groupId)) return false;
+    return true;
+  }
+
   // ---------- job presentation ----------
   function describe(job) {
     if (job.removing) return { tone: 'muted', text: '正在取消并删除…', actions: [] };
     const warn = job.truncated ? '源文件尾部不完整，原样上传 · ' : '';
+    const canCap = isJobCaptionEditable(job);
+    const withCap = (list) => (canCap ? [['edit-caption', 'Caption'], ...list] : list);
     switch (job.state) {
       case 'queued':
-        if (job.staged) return { tone: 'accent', text: '已上传，等待同组合并发送', bar: 1, actions: [['cancel', '取消']] };
-        return { tone: '', text: warn + '等待上传', actions: [['cancel', '取消']] };
+        if (job.staged) return { tone: 'accent', text: '已上传，等待同组合并发送', bar: 1, actions: withCap([['cancel', '取消']]) };
+        return { tone: '', text: warn + '等待上传', actions: withCap([['cancel', '取消']]) };
       case 'oversize': return { tone: 'warn', text: '超过 Bot 的上传上限，不会上传', actions: [] };
       case 'uploading': {
         const percent = job.size > 0 ? Math.floor((job.uploaded / job.size) * 100) : 0;
@@ -200,18 +237,18 @@
         actions: [['mark-sent', '已送达'], ['retry-confirm', '重新上传'], ['skip', '跳过']],
       };
       case 'sent': return { tone: 'success', text: '已发送', actions: [] };
-      case 'cancelled': return { tone: 'muted', text: '已取消', actions: [['retry', '重试']] };
-      case 'failed': return { tone: 'danger', text: '失败' + (job.error ? '：' + job.error : ''), actions: [['retry', '重试'], ['skip', '跳过']] };
-      case 'skipped': return { tone: 'muted', text: '已跳过', actions: [['retry', '重试']] };
+      case 'cancelled': return { tone: 'muted', text: '已取消', actions: withCap([['retry', '重试']]) };
+      case 'failed': return { tone: 'danger', text: '失败' + (job.error ? '：' + job.error : ''), actions: withCap([['retry', '重试'], ['skip', '跳过']]) };
+      case 'skipped': return { tone: 'muted', text: '已跳过', actions: withCap([['retry', '重试']]) };
       case 'moving': return { tone: 'accent', text: '正在移动…', actions: [] };
       case 'moved': return { tone: 'success', text: '已移动到超限文件夹', actions: [] };
       case 'interrupted': {
         if (job.staged) {
-          return { tone: 'warn', text: '已上传，继续时将随同组合并发送', bar: 1, actions: [['cancel', '取消']] };
+          return { tone: 'warn', text: '已上传，继续时将随同组合并发送', bar: 1, actions: withCap([['cancel', '取消']]) };
         }
         const percent = job.size > 0 ? Math.floor((job.uploaded / job.size) * 100) : 0;
         return {
-          tone: 'warn', actions: [['cancel', '取消']], bar: percent > 0 ? job.uploaded / job.size : null,
+          tone: 'warn', actions: withCap([['cancel', '取消']]), bar: percent > 0 ? job.uploaded / job.size : null,
           text: percent > 0 ? `已暂停在 ${percent}%，继续时接着传` : '已中断，继续时重新上传',
         };
       }
@@ -245,6 +282,8 @@
     counts.resettable = { cancelled: 0, failed: 0, skipped: 0, all: 0, selected: 0 };
     const match = FILTERS.find(([key]) => key === filter)[2];
     const groups = new Map();
+    groupMembers.clear();
+    pinnedGroups.clear();
     view = [];
     for (const id of order) {
       const job = jobs.get(id);
@@ -253,6 +292,12 @@
         let list = groups.get(job.groupId);
         if (!list) { list = []; groups.set(job.groupId, list); }
         list.push(id);
+        let mlist = groupMembers.get(job.groupId);
+        if (!mlist) { mlist = []; groupMembers.set(job.groupId, mlist); }
+        mlist.push(job);
+        if (PINNED_STATES.has(job.state) || job.removing || (S && S.queue && S.queue.activeId === job.id)) {
+          pinnedGroups.add(job.groupId);
+        }
       }
       for (const [key, , test] of FILTERS) if (test(job)) counts[key]++;
       if (job.state === 'queued' || job.state === 'interrupted') counts.runnable++;
@@ -359,14 +404,39 @@
       tab.classList.toggle('alert', key === 'attention' && counts.attention > 0);
       tab.lastChild.textContent = counts[key] || (key === 'all' ? '0' : '');
     }
+    const busy = S.move.active;
+    const allSelected = view.length > 0 && view.every((id) => selected.has(id));
+    $('selectAllBtn').textContent = allSelected ? '取消全选' : '全选';
+    $('selectAllBtn').disabled = view.length === 0 || busy;
+
+    $('resetBtn').disabled = counts.resettable.all === 0 || busy;
+    $('resetCount').hidden = counts.resettable.all === 0;
+    $('resetCount').textContent = String(counts.resettable.all);
+
+    $('moveOversizeBtn').hidden = counts.oversize === 0;
+    $('moveOversizeBtn').disabled = S.queue.running || busy || counts.oversize === 0;
+    $('oversizeCount').textContent = String(counts.oversize);
+
+    $('cleanBtn').disabled = order.length === 0 || busy;
+
     const bar = $('selectionBar');
     bar.hidden = selected.size === 0;
     if (selected.size) {
       $('selectionText').textContent = `已选择 ${selected.size} 项`;
-      bar.querySelector('[data-act="reset-selected"]').disabled = counts.resettable.selected === 0;
-      for (const button of bar.querySelectorAll('button')) if (button.dataset.act !== 'select-none') button.disabled ||= S.move.active;
+      let selMovable = 0, selEditable = 0;
+      for (const id of selected) {
+        const j = jobs.get(id);
+        if (isJobMovable(j)) selMovable++;
+        if (isJobCaptionEditable(j)) selEditable++;
+      }
+      bar.querySelector('[data-act="edit-captions"]').disabled = busy || selEditable === 0;
+      for (const act of ['move-up', 'move-down', 'move-top', 'move-bottom']) {
+        bar.querySelector(`[data-act="${act}"]`).disabled = busy || selMovable === 0;
+      }
+      bar.querySelector('[data-act="reset-selected"]').disabled = busy || counts.resettable.selected === 0;
+      bar.querySelector('[data-act="remove-selected"]').disabled = busy;
     }
-    $('addBtn').disabled = S.scanning || S.move.active;
+    $('addBtn').disabled = S.scanning || busy;
     $('addBtnText').textContent = S.scanning ? '正在扫描…' : '添加视频';
   }
 
@@ -399,18 +469,20 @@
 
   function buildRow() {
     const check = el('input', { type: 'checkbox', tabIndex: -1 });
+    const grip = el('button', { class: 'row-grip', type: 'button', title: '拖动调整顺序', 'aria-label': '拖动调整顺序', text: '⋮⋮', tabIndex: -1 });
     const index = el('div', { class: 'row-index' });
     const name = el('div', { class: 'row-name' });
     const group = el('span', { class: 'row-group', hidden: true });
+    const caption = el('span', { class: 'row-caption', hidden: true });
     const status = el('span', { class: 'row-status' });
     const size = el('span', { class: 'row-size' });
     const fill = el('i');
     const bar = el('div', { class: 'row-bar' }, fill);
     const actions = el('div', { class: 'row-actions' });
     const node = el('div', { class: 'row-item' },
-      el('label', { class: 'row-check' }, check), index,
-      el('div', { class: 'row-body' }, name, el('div', { class: 'row-meta' }, group, size, bar, status)), actions);
-    node.parts = { check, index, name, group, status, size, bar, fill, actions };
+      el('label', { class: 'row-check' }, check), grip, index,
+      el('div', { class: 'row-body' }, name, el('div', { class: 'row-meta' }, group, caption, size, bar, status)), actions);
+    node.parts = { check, grip, index, name, group, caption, status, size, bar, fill, actions };
     return node;
   }
 
@@ -423,6 +495,8 @@
     const inGroup = !!g;
     const groupStart = inGroup && (!prevJob || prevJob.groupId !== job.groupId);
     const groupEnd = inGroup && (!nextJob || nextJob.groupId !== job.groupId);
+    const movable = isJobMovable(job) && !S.move.active;
+    const isDragging = !!(dragging && dragging.moved && dragging.idSet.has(job.id));
     node.dataset.id = job.id;
     node.style.transform = `translateY(${position * ROW}px)`;
     node.className = 'row-item'
@@ -430,13 +504,25 @@
       + (selected.has(job.id) ? ' selected' : '')
       + (inGroup ? ' in-group' : '')
       + (groupStart ? ' group-start' : '')
-      + (groupEnd ? ' group-end' : '');
+      + (groupEnd ? ' group-end' : '')
+      + (isDragging ? ' dragging' : '');
     parts.check.checked = selected.has(job.id);
     parts.check.disabled = S.move.active;
+    parts.grip.disabled = !movable;
+    parts.grip.classList.toggle('off', !movable);
+    parts.grip.title = movable ? '按住拖动调整顺序' : '当前状态不能调整顺序';
     parts.index.textContent = order.length === view.length ? position + 1 : order.indexOf(job.id) + 1;
     if (parts.name.textContent !== job.name) { parts.name.textContent = job.name; parts.name.title = job.path; }
     parts.group.hidden = !g;
     if (g) parts.group.textContent = groupCount > 1 ? `合并 #${g.seq} · ${g.index}/${g.total}` : `合并 ${g.index}/${g.total}`;
+    const showCaption = !!job.captionCustom && (!g || g.index === 1);
+    parts.caption.hidden = !showCaption;
+    if (showCaption) {
+      const cap = job.customCaption || '';
+      parts.caption.textContent = cap ? 'Caption: ' + cap.replace(/\s+/g, ' ') : '无 Caption';
+      parts.caption.title = cap ? '自定义 Caption：\n' + cap : '已设为不带 Caption（留空）';
+      parts.caption.classList.toggle('empty-cap', !cap);
+    }
     parts.size.textContent = bytes(job.size);
     parts.status.textContent = info.text;
     parts.status.title = info.text;
@@ -446,7 +532,7 @@
     if (node.dataset.actions !== signature) {
       node.dataset.actions = signature;
       parts.actions.replaceChildren(...info.actions.map(([act, label]) =>
-        el('button', { class: 'btn small' + (act === 'cancel' || act === 'skip' ? ' ghost' : ''), type: 'button', text: label, 'data-act': act })));
+        el('button', { class: 'btn small' + (act === 'cancel' || act === 'skip' || act === 'edit-caption' ? ' ghost' : ''), type: 'button', text: label, 'data-act': act })));
     }
   }
 
@@ -495,6 +581,8 @@
       start.classList.add('primary');
     }
     $('cancelAllBtn').hidden = !q.running;
+    $('finishCurrentBtn').hidden = !(q.running && !q.pauseRequested);
+    $('finishCurrentBtn').disabled = busy;
     $('totalBar').style.width = (q.totalBytes > 0 ? Math.min(100, (q.doneBytes / q.totalBytes) * 100) : 0).toFixed(2) + '%';
     $('summary').textContent = order.length
       ? `${bytes(q.doneBytes)} / ${bytes(q.totalBytes)} · 已完成 ${counts.completed} / ${order.length}`
@@ -685,7 +773,7 @@
     const result = await openModal((box, close) => {
       const count = el('span', { class: 'hint spacer' });
       const add = el('button', { class: 'btn primary', text: '加入队列' });
-      const list = el('div', { class: 'cand-list' });
+      const list = el('div', { class: 'cand-list' + (items.length >= 5 ? ' many' : '') });
       const boxes = [];
       let modeHint = null;
       const selectable = (item) => (item.duplicate ? replace && item.replaceable : true);
@@ -717,7 +805,7 @@
             const single = rem === 1 ? 1 : 0;
             let summary = `${uploadable} 个视频将按顺序合并为 ${fullGroups} 条消息`;
             if (single) summary += '，最后 1 个单独发送';
-            summary += `（每条最多 ${MAX_ALBUM} 个，仍保留各自的文件名 Caption）`;
+            summary += `（每条最多 ${MAX_ALBUM} 个，默认 Caption 为同组文件名列表，加入队列后可自定义）`;
             if (oversize > 0) summary += `；另有 ${oversize} 个超限视频不参与合并`;
             modeHint.textContent = summary + '。';
           }
@@ -786,7 +874,7 @@
       add.onclick = () => close({ indexes: picked.flatMap((value, index) => (value ? [index] : [])), replace, merge });
       box.append(
         el('div', { class: 'modal-head', text: '选择要加入队列的视频' }),
-        el('div', { class: 'modal-body plain' },
+        el('div', { class: 'modal-body plain cand-modal' },
           el('div', { class: 'hint', text: scan.source + (ignored ? ' · ' + ignored : ''), title: scan.source }),
           duplicateBox,
           modeBox,
@@ -877,6 +965,246 @@
     if (ok && await run('removeJobs', { ids })) { selected.clear(); recompute(); }
   }
 
+  async function reorderSelected(action) {
+    const ids = order.filter((id) => selected.has(id) && isJobMovable(jobs.get(id)));
+    if (!ids.length) return;
+    await run('reorderJobs', { ids, action, targetId: '' });
+  }
+
+  function buildCaptionTargets(ids) {
+    const idSet = new Set(ids);
+    const seenGroups = new Set();
+    const targets = [];
+    for (const id of order) {
+      if (!idSet.has(id)) continue;
+      const job = jobs.get(id);
+      if (!job || !isJobCaptionEditable(job)) continue;
+      const members = job.groupId ? (groupMembers.get(job.groupId) || [job]) : [job];
+      if (job.groupId && members.length >= 2) {
+        if (seenGroups.has(job.groupId)) continue;
+        seenGroups.add(job.groupId);
+        const activeMembers = members.filter((m) => m.state === 'queued' || m.state === 'interrupted');
+        const basis = activeMembers.length ? activeMembers : members;
+        const defaultCaption = utf16Truncate(basis.map((m) => defaultNameCaption(m.name)).filter(Boolean).join('\n'), MAX_CAPTION);
+        const customMember = members.find((m) => m.captionCustom);
+        targets.push({
+          editId: members[0].id,
+          title: `合并组（${members.length} 个视频）`,
+          subtitle: members.map((m) => m.name).slice(0, 3).join(' / ') + (members.length > 3 ? ` 等 ${members.length} 个` : ''),
+          defaultCaption,
+          initialCustom: !!customMember,
+          currentCaption: customMember ? (customMember.customCaption || '') : defaultCaption,
+          isGroup: true,
+        });
+      } else {
+        const defaultCaption = utf16Truncate(defaultNameCaption(job.name), MAX_CAPTION);
+        targets.push({
+          editId: job.id,
+          title: job.name,
+          subtitle: '',
+          defaultCaption,
+          initialCustom: !!job.captionCustom,
+          currentCaption: job.captionCustom ? (job.customCaption || '') : defaultCaption,
+          isGroup: false,
+        });
+      }
+    }
+    return targets;
+  }
+
+  async function captionDialog(ids) {
+    const targets = buildCaptionTargets(ids);
+    if (!targets.length) {
+      toast('info', '所选任务当前不能修改 Caption（上传中、待确认或已完成）');
+      return;
+    }
+
+    if (targets.length === 1) {
+      const target = targets[0];
+      const result = await openModal((box, close) => {
+        const area = el('textarea', {
+          class: 'input caption-input', rows: 5, value: target.currentCaption,
+          placeholder: '留空表示发送时不带 Caption', autofocus: true,
+        });
+        const counter = el('div', { class: 'caption-counter' });
+        const save = el('button', { class: 'btn primary', type: 'button', text: '保存' });
+        const sync = () => {
+          const len = area.value.length;
+          counter.textContent = `${len} / ${MAX_CAPTION}`;
+          counter.classList.toggle('over', len > MAX_CAPTION);
+          save.disabled = len > MAX_CAPTION;
+        };
+        area.addEventListener('input', sync);
+        save.onclick = () => close({ edits: [{ id: target.editId, custom: true, caption: area.value }] });
+        const note = target.isGroup
+          ? '合并发送时，这条 Caption 会显示在频道聊天里这条媒体组气泡的正下方；留空表示不带 Caption。'
+          : '留空表示不带 Caption；点击“恢复默认”会重新使用文件名。';
+        box.append(
+          el('div', { class: 'modal-head', text: '编辑 Caption' }),
+          el('div', { class: 'modal-body plain caption-modal' },
+            el('div', { class: 'strong', text: target.title }),
+            target.subtitle ? el('div', { class: 'hint', text: target.subtitle }) : null,
+            el('p', { class: 'hint', text: note }),
+            area,
+            el('div', { class: 'caption-bar' },
+              el('span', { class: 'hint', text: '留空即无 Caption' }),
+              counter)),
+          el('div', { class: 'modal-foot' },
+            el('button', { class: 'btn ghost spacer', type: 'button', text: '恢复默认', onclick: () => close({ edits: [{ id: target.editId, custom: false, caption: '' }] }) }),
+            el('button', { class: 'btn', type: 'button', text: '取消', onclick: () => close(null) }),
+            save));
+        sync();
+      });
+      if (result) await run('setCaptions', { edits: result.edits });
+      return;
+    }
+
+    const result = await openModal((box, close) => {
+      let mode = 'template';
+      const modes = el('div', { class: 'segmented' });
+      const tplPane = el('div', { class: 'cap-pane' });
+      const trPane = el('div', { class: 'cap-pane', hidden: true });
+      const indPane = el('div', { class: 'cap-pane', hidden: true });
+      const applyBtn = el('button', { class: 'btn primary', type: 'button', text: `应用到 ${targets.length} 条消息` });
+
+      const tplArea = el('textarea', {
+        class: 'input caption-input', rows: 3, autofocus: true,
+        placeholder: '输入统一的 Caption，支持 {name}、{index}、{total}；留空表示全部不带 Caption',
+      });
+      const insertToken = (token) => {
+        const start = tplArea.selectionStart ?? tplArea.value.length;
+        const end = tplArea.selectionEnd ?? tplArea.value.length;
+        tplArea.value = tplArea.value.slice(0, start) + token + tplArea.value.slice(end);
+        tplArea.focus();
+        tplArea.selectionStart = tplArea.selectionEnd = start + token.length;
+        sync();
+      };
+      const tplPreview = el('div', { class: 'cap-preview' });
+      tplPane.append(
+        tplArea,
+        el('div', { class: 'quick' },
+          el('button', { class: 'btn small', type: 'button', text: '插入 {name}（默认名）', onclick: () => insertToken('{name}') }),
+          el('button', { class: 'btn small', type: 'button', text: '插入 {index}（序号）', onclick: () => insertToken('{index}') }),
+          el('button', { class: 'btn small', type: 'button', text: '插入 {total}（总数）', onclick: () => insertToken('{total}') }),
+          el('button', { class: 'btn small ghost', type: 'button', text: '清空（无 Caption）', onclick: () => { tplArea.value = ''; sync(); } })),
+        tplPreview);
+
+      const prefixIn = el('input', { class: 'input', placeholder: '例如：【合集】 ' });
+      const suffixIn = el('input', { class: 'input', placeholder: '例如： #归档' });
+      const findIn = el('input', { class: 'input', placeholder: '要查找替换的文字' });
+      const replaceIn = el('input', { class: 'input', placeholder: '替换为（留空即删除）' });
+      const trPreview = el('div', { class: 'cap-preview' });
+      trPane.append(
+        el('div', { class: 'field-row' },
+          el('label', { class: 'field' }, el('span', { text: '添加前缀' }), prefixIn),
+          el('label', { class: 'field' }, el('span', { text: '添加后缀' }), suffixIn)),
+        el('div', { class: 'field-row' },
+          el('label', { class: 'field' }, el('span', { text: '查找文本' }), findIn),
+          el('label', { class: 'field' }, el('span', { text: '替换为' }), replaceIn)),
+        trPreview);
+
+      const indList = el('div', { class: 'cap-batch-list' });
+      const indRows = targets.map((t, idx) => {
+        const state = { useDefault: !t.initialCustom };
+        const area = el('textarea', { class: 'input caption-mini', rows: 2, value: t.currentCaption, placeholder: '留空表示不带 Caption' });
+        const countEl = el('span', { class: 'caption-counter' });
+        const resetBtn = el('button', {
+          class: 'btn small ghost', type: 'button', text: '恢复默认',
+          onclick: () => { state.useDefault = true; area.value = t.defaultCaption; sync(); },
+        });
+        area.addEventListener('input', () => { state.useDefault = false; sync(); });
+        indList.append(el('div', { class: 'cap-row' },
+          el('div', { class: 'cap-row-head' },
+            el('span', { class: 'strong', text: `${idx + 1}. ${t.title}`, title: t.subtitle || t.title }),
+            countEl, resetBtn),
+          area));
+        state.area = area;
+        state.countEl = countEl;
+        return state;
+      });
+      indPane.append(indList);
+
+      const computeEdits = () => {
+        if (mode === 'template') {
+          const tpl = tplArea.value;
+          return targets.map((t, i) => ({
+            id: t.editId,
+            custom: true,
+            caption: tpl.replace(/\{name\}/g, t.defaultCaption).replace(/\{index\}/g, String(i + 1)).replace(/\{total\}/g, String(targets.length)),
+          }));
+        }
+        if (mode === 'transform') {
+          const pre = prefixIn.value, suf = suffixIn.value, find = findIn.value, rep = replaceIn.value;
+          return targets.map((t) => {
+            let text = t.currentCaption;
+            if (find) text = text.split(find).join(rep);
+            return { id: t.editId, custom: true, caption: pre + text + suf };
+          });
+        }
+        return targets.map((t, i) => (indRows[i].useDefault
+          ? { id: t.editId, custom: false, caption: '' }
+          : { id: t.editId, custom: true, caption: indRows[i].area.value }));
+      };
+
+      const paintPreview = (container, edits) => {
+        container.replaceChildren(...edits.map((ed, i) => {
+          const len = ed.caption.length;
+          const over = len > MAX_CAPTION;
+          return el('div', { class: 'cap-prev-item' + (over ? ' over' : '') },
+            el('div', { class: 'cap-prev-head' },
+              el('span', { class: 'strong', text: `${i + 1}. ${targets[i].title}` }),
+              el('span', { class: 'caption-counter' + (over ? ' over' : ''), text: `${len} / ${MAX_CAPTION}` })),
+            el('div', { class: 'cap-prev-text' + (!ed.caption ? ' empty-cap' : ''), text: ed.caption || '（留空，无 Caption）' }));
+        }));
+      };
+
+      const sync = () => {
+        const edits = computeEdits();
+        let anyOver = false;
+        for (const ed of edits) if (ed.custom && ed.caption.length > MAX_CAPTION) anyOver = true;
+        applyBtn.disabled = anyOver;
+        if (mode === 'template') paintPreview(tplPreview, edits);
+        else if (mode === 'transform') paintPreview(trPreview, edits);
+        else {
+          indRows.forEach((row) => {
+            const len = row.area.value.length;
+            row.countEl.textContent = `${len} / ${MAX_CAPTION}`;
+            row.countEl.classList.toggle('over', len > MAX_CAPTION);
+          });
+        }
+      };
+
+      [tplArea, prefixIn, suffixIn, findIn, replaceIn].forEach((input) => input.addEventListener('input', sync));
+      const modeDefs = [['template', '统一设置'], ['transform', '前后缀 / 替换'], ['individual', '逐条编辑']];
+      const switchMode = (next) => {
+        mode = next;
+        modeDefs.forEach(([key], idx) => modes.children[idx].classList.toggle('active', key === mode));
+        tplPane.hidden = mode !== 'template';
+        trPane.hidden = mode !== 'transform';
+        indPane.hidden = mode !== 'individual';
+        sync();
+      };
+      modes.append(...modeDefs.map(([key, label]) => el('button', { type: 'button', text: label, onclick: () => switchMode(key) })));
+      applyBtn.onclick = () => close({ edits: computeEdits() });
+
+      box.append(
+        el('div', { class: 'modal-head', text: `批量编辑 Caption（${targets.length} 条消息）` }),
+        el('div', { class: 'modal-body plain caption-modal' },
+          el('p', { class: 'hint', text: '支持统一模板、批量添加前后缀/查找替换，或逐条修改；合并发送的视频组会作为一个整体设置。' }),
+          modes,
+          tplPane, trPane, indPane),
+        el('div', { class: 'modal-foot' },
+          el('button', {
+            class: 'btn ghost spacer', type: 'button', text: '全部恢复默认',
+            onclick: () => close({ edits: targets.map((t) => ({ id: t.editId, custom: false, caption: '' })) }),
+          }),
+          el('button', { class: 'btn', type: 'button', text: '取消', onclick: () => close(null) }),
+          applyBtn));
+      switchMode('template');
+    }, { wide: true });
+    if (result) await run('setCaptions', { edits: result.edits });
+  }
+
   const actions = {
     settings: () => openSettings(),
     bind: bindChannel,
@@ -884,6 +1212,23 @@
     add: () => setTimeout(() => { $('addMenu').hidden = false; }),
     'add-files': () => { $('addMenu').hidden = true; pickAndAdd('addFiles'); },
     'add-folder': () => { $('addMenu').hidden = true; pickAndAdd('addFolder'); },
+    'toggle-select-all': () => {
+      const allSelected = view.length > 0 && view.every((id) => selected.has(id));
+      if (allSelected) {
+        for (const id of view) selected.delete(id);
+      } else {
+        for (const id of view) selected.add(id);
+      }
+      recompute();
+    },
+    'reset-dialog': resetDialog,
+    'move-oversize': () => run('moveOversize'),
+    'pause-after': () => run('pause', { finishCurrent: true }),
+    'edit-captions': () => captionDialog(order.filter((id) => selected.has(id))),
+    'move-up': () => reorderSelected('up'),
+    'move-down': () => reorderSelected('down'),
+    'move-top': () => reorderSelected('top'),
+    'move-bottom': () => reorderSelected('bottom'),
     'cancel-move': () => run('cancelMove'),
     start: () => run('start').then((ok) => { if (!ok && S.connection.status !== 'connected') openSettings(); }),
     pause: () => run('pause'),
@@ -901,6 +1246,7 @@
 
   async function rowAction(act, id) {
     switch (act) {
+      case 'edit-caption': return captionDialog([id]);
       case 'cancel': return run('cancelJob', { id });
       case 'retry': return run('retryJob', { id });
       case 'skip': return run('skipJob', { id });
@@ -913,18 +1259,13 @@
     }
   }
 
-  function buildMoreMenu() {
-    const menu = $('moreMenu');
+  function buildCleanMenu() {
+    const menu = $('cleanMenu');
     const item = (label, count, handler, danger) => el('button', {
       class: 'menu-item' + (danger ? ' danger' : ''), type: 'button', disabled: !count || S.move.active,
       onclick: () => { menu.hidden = true; handler(); },
     }, el('span', { text: label }), typeof count === 'number' ? el('span', { class: 'count', text: String(count) }) : null);
     menu.replaceChildren(
-      item('全选', order.length, () => { for (const id of view) selected.add(id); recompute(); }),
-      item('传完当前视频后暂停', S.queue.running && !S.queue.pauseRequested, () => run('pause', { finishCurrent: true })),
-      item('重置任务…', counts.resettable.all, resetDialog),
-      item('移动超限文件…', S.queue.running ? 0 : counts.oversize, () => run('moveOversize')),
-      el('div', { class: 'menu-sep' }),
       item('删除已完成', counts.completed, async () => {
         if (await confirmBox({ title: `删除 ${counts.completed} 个已完成的条目？`, body: '频道里的消息和磁盘上的文件都不会被删除。', ok: '删除', danger: true })) run('removeCompleted');
       }),
@@ -1001,7 +1342,7 @@
         else if (actions[button.dataset.act]) actions[button.dataset.act]();
       }
       // Clicking elsewhere closes open popovers.
-      for (const [popover, anchor] of [['limitPopover', 'limitChip'], ['moreMenu', 'moreBtn'], ['addMenu', 'addBtn']]) {
+      for (const [popover, anchor] of [['limitPopover', 'limitChip'], ['cleanMenu', 'cleanBtn'], ['addMenu', 'addBtn']]) {
         if (!$(popover).hidden && !event.target.closest('#' + popover) && !event.target.closest('#' + anchor)) $(popover).hidden = true;
       }
     });
@@ -1011,7 +1352,7 @@
     $('scrim').onclick = closeSettings;
     $('updateBadge').onclick = () => openSettings('secUpdate');
     $('limitChip').onclick = () => { buildLimitMenu(); $('limitPopover').hidden = !$('limitPopover').hidden; };
-    $('moreBtn').onclick = () => { buildMoreMenu(); $('moreMenu').hidden = !$('moreMenu').hidden; };
+    $('cleanBtn').onclick = () => { buildCleanMenu(); $('cleanMenu').hidden = !$('cleanMenu').hidden; };
     $('addBtn').onclick = () => { $('addMenu').hidden = !$('addMenu').hidden; };
     $('scheduleBtn').onclick = scheduleDialog;
     $('bindBtn').onclick = bindChannel;
@@ -1056,11 +1397,13 @@
     });
 
     const list = $('list');
+    dropLine = el('div', { id: 'dropLine', class: 'drop-line', hidden: true });
+    $('listSpacer').append(dropLine);
     list.addEventListener('scroll', () => renderAll(), { passive: true });
     new ResizeObserver(() => renderAll()).observe(list);
     list.addEventListener('click', (event) => {
       const row = event.target.closest('.row-item');
-      if (!row || event.target.closest('[data-act]') || S.move.active) return;
+      if (!row || event.target.closest('[data-act]') || event.target.closest('.row-grip') || S.move.active) return;
       const id = row.dataset.id;
       const index = view.indexOf(id);
       const onCheck = !!event.target.closest('.row-check');
@@ -1082,14 +1425,100 @@
     list.addEventListener('dblclick', (event) => {
       const row = event.target.closest('.row-item');
       const job = row && jobs.get(row.dataset.id);
-      if (job && !event.target.closest('[data-act]')) copyText(job.path);
+      if (job && !event.target.closest('[data-act]') && !event.target.closest('.row-grip')) copyText(job.path);
+    });
+
+    const stopDrag = (commit) => {
+      if (!dragging) return;
+      const info = dragging;
+      dragging = null;
+      if (info.raf) cancelAnimationFrame(info.raf);
+      if (dropLine) dropLine.hidden = true;
+      window.removeEventListener('pointermove', onDragMove);
+      window.removeEventListener('pointerup', onDragEnd);
+      window.removeEventListener('pointercancel', onDragEnd);
+      document.body.classList.remove('reordering');
+      renderAll();
+      if (commit && info.moved && info.targetId) {
+        run('reorderJobs', { ids: info.ids, action: info.after ? 'after' : 'before', targetId: info.targetId });
+      }
+    };
+    const updateDragTarget = (clientY) => {
+      if (!dragging || !view.length) return;
+      const rect = list.getBoundingClientRect();
+      const yInSpacer = Math.max(0, Math.min(view.length * ROW - 1, clientY - rect.top + list.scrollTop));
+      const idx = Math.max(0, Math.min(view.length - 1, Math.floor(yInSpacer / ROW)));
+      const after = (yInSpacer - idx * ROW) >= ROW / 2;
+      dragging.targetId = view[idx];
+      dragging.after = after;
+      dropLine.style.top = ((after ? idx + 1 : idx) * ROW) + 'px';
+      dropLine.hidden = false;
+    };
+    const dragScrollStep = () => {
+      if (!dragging) return;
+      const rect = list.getBoundingClientRect();
+      let delta = 0;
+      if (dragging.lastY < rect.top + 44) delta = -Math.max(4, Math.round((rect.top + 44 - dragging.lastY) / 3));
+      else if (dragging.lastY > rect.bottom - 44) delta = Math.max(4, Math.round((dragging.lastY - (rect.bottom - 44)) / 3));
+      if (delta !== 0) {
+        list.scrollTop += delta;
+        updateDragTarget(dragging.lastY);
+        dragging.raf = requestAnimationFrame(dragScrollStep);
+      } else {
+        dragging.raf = 0;
+      }
+    };
+    const onDragMove = (event) => {
+      if (!dragging || event.pointerId !== dragging.pointerId) return;
+      dragging.lastY = event.clientY;
+      if (!dragging.moved && Math.abs(event.clientY - dragging.startY) >= 4) {
+        dragging.moved = true;
+        document.body.classList.add('reordering');
+        renderAll();
+      }
+      if (!dragging.moved) return;
+      updateDragTarget(event.clientY);
+      if (!dragging.raf) dragging.raf = requestAnimationFrame(dragScrollStep);
+    };
+    const onDragEnd = (event) => {
+      if (!dragging || event.pointerId !== dragging.pointerId) return;
+      stopDrag(event.type === 'pointerup');
+    };
+    list.addEventListener('pointerdown', (event) => {
+      if (event.button !== 0 || S.move.active) return;
+      const grip = event.target.closest('.row-grip');
+      if (!grip || grip.disabled) return;
+      const row = grip.closest('.row-item');
+      const dragId = row && row.dataset.id;
+      const job = dragId && jobs.get(dragId);
+      if (!job || !isJobMovable(job) || view.length < 2) return;
+      const ids = selected.has(dragId)
+        ? order.filter((id) => selected.has(id) && isJobMovable(jobs.get(id)))
+        : [dragId];
+      if (!ids.length) return;
+      event.preventDefault();
+      dragging = {
+        pointerId: event.pointerId,
+        ids,
+        idSet: new Set(ids),
+        startY: event.clientY,
+        lastY: event.clientY,
+        moved: false,
+        targetId: null,
+        after: false,
+        raf: 0,
+      };
+      window.addEventListener('pointermove', onDragMove);
+      window.addEventListener('pointerup', onDragEnd);
+      window.addEventListener('pointercancel', onDragEnd);
     });
 
     document.addEventListener('keydown', (event) => {
       const typing = /^(INPUT|TEXTAREA|SELECT)$/.test(event.target.tagName);
       if (event.key === 'Escape') {
+        if (dragging) { stopDrag(false); return; }
         if ($('modalRoot').children.length) return;
-        if (!$('limitPopover').hidden || !$('moreMenu').hidden || !$('addMenu').hidden) { $('limitPopover').hidden = true; $('moreMenu').hidden = true; $('addMenu').hidden = true; }
+        if (!$('limitPopover').hidden || !$('cleanMenu').hidden || !$('addMenu').hidden) { $('limitPopover').hidden = true; $('cleanMenu').hidden = true; $('addMenu').hidden = true; }
         else if (!$('settings').hidden) closeSettings();
         else if (selected.size) { selected.clear(); recompute(); }
         return;
@@ -1102,6 +1531,9 @@
       } else if ((event.key === 'Delete' || event.key === 'Backspace') && selected.size) {
         event.preventDefault();
         removeSelected();
+      } else if (event.altKey && (event.key === 'ArrowUp' || event.key === 'ArrowDown') && selected.size && !S.move.active) {
+        event.preventDefault();
+        reorderSelected(event.key === 'ArrowUp' ? 'up' : 'down');
       }
     });
     // The page is an application, not a document: no browser context menu

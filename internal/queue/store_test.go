@@ -36,9 +36,11 @@ func TestStoreRoundTrip(t *testing.T) {
 			SupportsStreaming:  true,
 			TruncatedMediaData: true,
 		},
-		StartedAt:   &started,
-		CompletedAt: &completed,
-		GroupID:     "grp-1",
+		StartedAt:     &started,
+		CompletedAt:   &completed,
+		GroupID:       "grp-1",
+		CustomCaption: "custom caption",
+		CaptionCustom: true,
 		Staged: &model.StagedMedia{
 			DocumentID:    12345,
 			AccessHash:    67890,
@@ -264,6 +266,13 @@ func TestStoreLoadPreservesStagedAndRecoversAlbumSending(t *testing.T) {
 				FileReference: []byte{2},
 			},
 		},
+		{
+			ID:            "explicit-empty-caption",
+			State:         model.JobQueued,
+			RandomID:      22,
+			CustomCaption: "",
+			CaptionCustom: true,
+		},
 	}
 	if err := Store(path).Save(jobs, model.Channel{}, false); err != nil {
 		t.Fatalf("Save() error = %v", err)
@@ -281,6 +290,9 @@ func TestStoreLoadPreservesStagedAndRecoversAlbumSending(t *testing.T) {
 			t.Fatalf("album sending job %d not recovered to confirming: %+v", idx, got[idx])
 		}
 	}
+	if !got[3].CaptionCustom || got[3].CustomCaption != "" {
+		t.Fatalf("explicit empty custom caption not preserved: %+v", got[3])
+	}
 }
 
 func equalJobs(a, b []model.Job) bool {
@@ -293,7 +305,8 @@ func equalJobs(a, b []model.Job) bool {
 			a[i].State != b[i].State || a[i].Uploaded != b[i].Uploaded || a[i].RandomID != b[i].RandomID ||
 			a[i].MessageID != b[i].MessageID || a[i].ChannelID != b[i].ChannelID || a[i].Metadata != b[i].Metadata ||
 			a[i].Error != b[i].Error || !sameTime(a[i].StartedAt, b[i].StartedAt) || !sameTime(a[i].CompletedAt, b[i].CompletedAt) ||
-			a[i].GroupID != b[i].GroupID || !sameStaged(a[i].Staged, b[i].Staged) {
+			a[i].GroupID != b[i].GroupID || !sameStaged(a[i].Staged, b[i].Staged) ||
+			a[i].CustomCaption != b[i].CustomCaption || a[i].CaptionCustom != b[i].CaptionCustom {
 			return false
 		}
 	}

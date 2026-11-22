@@ -72,10 +72,20 @@ type Job struct {
 	// the channel but not posted yet. The album is posted when every runnable
 	// member of the group is staged. It is replaced, never modified in place.
 	Staged *StagedMedia `json:"staged,omitempty"`
+
+	// CustomCaption overrides the default filename-derived caption when
+	// CaptionCustom is true. CaptionCustom distinguishes an explicit empty
+	// caption from the default filename behavior.
+	CustomCaption string `json:"custom_caption,omitempty"`
+	CaptionCustom bool   `json:"caption_custom,omitempty"`
 }
 
 // MaxAlbumSize is the most items Telegram accepts in one media group.
 const MaxAlbumSize = 10
+
+// MaxCaptionUTF16 is Telegram's maximum caption length measured in UTF-16
+// code units.
+const MaxCaptionUTF16 = 1024
 
 // StagedMedia identifies a document uploaded with messages.uploadMedia: it is
 // on Telegram's servers but no message refers to it yet.
