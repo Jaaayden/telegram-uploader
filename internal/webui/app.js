@@ -773,7 +773,7 @@
     const result = await openModal((box, close) => {
       const count = el('span', { class: 'hint spacer' });
       const add = el('button', { class: 'btn primary', text: '加入队列' });
-      const list = el('div', { class: 'cand-list' });
+      const list = el('div', { class: 'cand-list' + (items.length >= 5 ? ' many' : '') });
       const boxes = [];
       let modeHint = null;
       const selectable = (item) => (item.duplicate ? replace && item.replaceable : true);
@@ -874,7 +874,7 @@
       add.onclick = () => close({ indexes: picked.flatMap((value, index) => (value ? [index] : [])), replace, merge });
       box.append(
         el('div', { class: 'modal-head', text: '选择要加入队列的视频' }),
-        el('div', { class: 'modal-body plain' },
+        el('div', { class: 'modal-body plain cand-modal' },
           el('div', { class: 'hint', text: scan.source + (ignored ? ' · ' + ignored : ''), title: scan.source }),
           duplicateBox,
           modeBox,
