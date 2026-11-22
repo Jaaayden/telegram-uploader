@@ -27,6 +27,11 @@ type JobView struct {
 	Truncated bool `json:"truncated,omitempty"`
 	// Removing marks an active job that is being cancelled for removal.
 	Removing bool `json:"removing,omitempty"`
+	// GroupID identifies videos posted together as one Telegram media group.
+	GroupID string `json:"groupId,omitempty"`
+	// Staged means an album member has already been uploaded with uploadMedia
+	// and is waiting for its group siblings before SendAlbum posts them.
+	Staged bool `json:"staged,omitempty"`
 }
 
 // JobsDelta carries only what changed since the previous delta. Order is nil
@@ -84,6 +89,8 @@ func jobView(job model.Job, removing bool) JobView {
 		MessageID: job.MessageID,
 		Truncated: job.Metadata.TruncatedMediaData,
 		Removing:  removing,
+		GroupID:   job.GroupID,
+		Staged:    job.Staged != nil && (job.State == model.JobQueued || job.State == model.JobInterrupted),
 	}
 }
 

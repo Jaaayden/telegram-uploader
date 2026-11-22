@@ -64,6 +64,25 @@ type Job struct {
 	UploadParts    int        `json:"upload_parts,omitempty"`
 	UploadPartSize int        `json:"upload_part_size,omitempty"`
 	UploadPartsAt  *time.Time `json:"upload_parts_at,omitempty"`
+
+	// GroupID ties videos that are posted together as one album (a Telegram
+	// media group). Empty means the video is posted as its own message.
+	GroupID string `json:"group_id,omitempty"`
+	// Staged is set once an album member's data is on Telegram, attached to
+	// the channel but not posted yet. The album is posted when every runnable
+	// member of the group is staged. It is replaced, never modified in place.
+	Staged *StagedMedia `json:"staged,omitempty"`
+}
+
+// MaxAlbumSize is the most items Telegram accepts in one media group.
+const MaxAlbumSize = 10
+
+// StagedMedia identifies a document uploaded with messages.uploadMedia: it is
+// on Telegram's servers but no message refers to it yet.
+type StagedMedia struct {
+	DocumentID    int64  `json:"document_id"`
+	AccessHash    int64  `json:"access_hash"`
+	FileReference []byte `json:"file_reference,omitempty"`
 }
 
 // Progress is emitted by long-running upload and move operations. The UI may

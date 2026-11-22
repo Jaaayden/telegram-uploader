@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -108,6 +109,7 @@ type Controller struct {
 	// newer Pause, Resume, Start, or CancelAll action.
 	pauseRevision uint64
 	activeID      string
+	activeBatch   []string
 	lastError     string
 
 	activeCancel    context.CancelFunc
@@ -224,7 +226,7 @@ func (c *Controller) Load() error {
 	}
 	defer c.opMu.Unlock()
 	c.mu.RLock()
-	running := c.running || c.activeID != "" || len(c.pendingRemoval) > 0
+	running := c.running || c.activeID != "" || len(c.activeBatch) > 0 || len(c.pendingRemoval) > 0
 	c.mu.RUnlock()
 	if running {
 		return errors.New("上传或活动任务清理进行中，不能重新载入队列")
@@ -374,6 +376,29 @@ func (c *Controller) notifyProgressLocked(update ProgressUpdate) {
 	case c.progressUpdates <- update:
 	default:
 	}
+}
+
+func (c *Controller) isActiveLocked(id string) bool {
+	if id == "" {
+		return false
+	}
+	if c.activeID == id {
+		return true
+	}
+	return slices.Contains(c.activeBatch, id)
+}
+
+func (c *Controller) activeIDSetLocked() map[string]struct{} {
+	set := make(map[string]struct{}, 1+len(c.activeBatch))
+	if c.activeID != "" {
+		set[c.activeID] = struct{}{}
+	}
+	for _, id := range c.activeBatch {
+		if id != "" {
+			set[id] = struct{}{}
+		}
+	}
+	return set
 }
 
 func (c *Controller) snapshotLocked() Snapshot {

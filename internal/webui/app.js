@@ -65,6 +65,8 @@
   let counts = {};
   let anchorIndex = -1;
   const rows = new Map(); // id -> row element currently in the DOM
+  const groupInfo = new Map(); // id -> { seq, index, total } for groups with >= 2 items
+  let groupCount = 0;
 
   const FILTERS = [
     ['all', '全部', () => true],
@@ -183,7 +185,9 @@
     if (job.removing) return { tone: 'muted', text: '正在取消并删除…', actions: [] };
     const warn = job.truncated ? '源文件尾部不完整，原样上传 · ' : '';
     switch (job.state) {
-      case 'queued': return { tone: '', text: warn + '等待上传', actions: [['cancel', '取消']] };
+      case 'queued':
+        if (job.staged) return { tone: 'accent', text: '已上传，等待同组合并发送', bar: 1, actions: [['cancel', '取消']] };
+        return { tone: '', text: warn + '等待上传', actions: [['cancel', '取消']] };
       case 'oversize': return { tone: 'warn', text: '超过 Bot 的上传上限，不会上传', actions: [] };
       case 'uploading': {
         const percent = job.size > 0 ? Math.floor((job.uploaded / job.size) * 100) : 0;
@@ -202,6 +206,9 @@
       case 'moving': return { tone: 'accent', text: '正在移动…', actions: [] };
       case 'moved': return { tone: 'success', text: '已移动到超限文件夹', actions: [] };
       case 'interrupted': {
+        if (job.staged) {
+          return { tone: 'warn', text: '已上传，继续时将随同组合并发送', bar: 1, actions: [['cancel', '取消']] };
+        }
         const percent = job.size > 0 ? Math.floor((job.uploaded / job.size) * 100) : 0;
         return {
           tone: 'warn', actions: [['cancel', '取消']], bar: percent > 0 ? job.uploaded / job.size : null,
@@ -237,10 +244,16 @@
     counts.runnable = 0; counts.oversize = 0; counts.completed = 0;
     counts.resettable = { cancelled: 0, failed: 0, skipped: 0, all: 0, selected: 0 };
     const match = FILTERS.find(([key]) => key === filter)[2];
+    const groups = new Map();
     view = [];
     for (const id of order) {
       const job = jobs.get(id);
       if (!job) continue;
+      if (job.groupId) {
+        let list = groups.get(job.groupId);
+        if (!list) { list = []; groups.set(job.groupId, list); }
+        list.push(id);
+      }
       for (const [key, , test] of FILTERS) if (test(job)) counts[key]++;
       if (job.state === 'queued' || job.state === 'interrupted') counts.runnable++;
       if (job.state === 'oversize') counts.oversize++;
@@ -253,6 +266,13 @@
         if (selected.has(id)) counts.resettable.selected++;
       }
       if (match(job)) view.push(id);
+    }
+    groupInfo.clear();
+    groupCount = 0;
+    for (const ids of groups.values()) {
+      if (ids.length < 2) continue;
+      groupCount++;
+      ids.forEach((id, index) => groupInfo.set(id, { seq: groupCount, index: index + 1, total: ids.length }));
     }
     renderAll();
   }
@@ -381,6 +401,7 @@
     const check = el('input', { type: 'checkbox', tabIndex: -1 });
     const index = el('div', { class: 'row-index' });
     const name = el('div', { class: 'row-name' });
+    const group = el('span', { class: 'row-group', hidden: true });
     const status = el('span', { class: 'row-status' });
     const size = el('span', { class: 'row-size' });
     const fill = el('i');
@@ -388,21 +409,34 @@
     const actions = el('div', { class: 'row-actions' });
     const node = el('div', { class: 'row-item' },
       el('label', { class: 'row-check' }, check), index,
-      el('div', { class: 'row-body' }, name, el('div', { class: 'row-meta' }, size, bar, status)), actions);
-    node.parts = { check, index, name, status, size, bar, fill, actions };
+      el('div', { class: 'row-body' }, name, el('div', { class: 'row-meta' }, group, size, bar, status)), actions);
+    node.parts = { check, index, name, group, status, size, bar, fill, actions };
     return node;
   }
 
   function paintRow(node, job, position) {
     const info = describe(job);
     const parts = node.parts;
+    const g = groupInfo.get(job.id);
+    const prevJob = position > 0 ? jobs.get(view[position - 1]) : null;
+    const nextJob = position >= 0 && position + 1 < view.length ? jobs.get(view[position + 1]) : null;
+    const inGroup = !!g;
+    const groupStart = inGroup && (!prevJob || prevJob.groupId !== job.groupId);
+    const groupEnd = inGroup && (!nextJob || nextJob.groupId !== job.groupId);
     node.dataset.id = job.id;
     node.style.transform = `translateY(${position * ROW}px)`;
-    node.className = 'row-item' + (info.tone ? ' tone-' + info.tone : '') + (selected.has(job.id) ? ' selected' : '');
+    node.className = 'row-item'
+      + (info.tone ? ' tone-' + info.tone : '')
+      + (selected.has(job.id) ? ' selected' : '')
+      + (inGroup ? ' in-group' : '')
+      + (groupStart ? ' group-start' : '')
+      + (groupEnd ? ' group-end' : '');
     parts.check.checked = selected.has(job.id);
     parts.check.disabled = S.move.active;
     parts.index.textContent = order.length === view.length ? position + 1 : order.indexOf(job.id) + 1;
     if (parts.name.textContent !== job.name) { parts.name.textContent = job.name; parts.name.title = job.path; }
+    parts.group.hidden = !g;
+    if (g) parts.group.textContent = groupCount > 1 ? `合并 #${g.seq} · ${g.index}/${g.total}` : `合并 ${g.index}/${g.total}`;
     parts.size.textContent = bytes(job.size);
     parts.status.textContent = info.text;
     parts.status.title = info.text;
@@ -642,7 +676,9 @@
     const replaceable = duplicates.filter((item) => item.replaceable).length;
     const similar = items.filter((item) => item.similar).length;
     const folders = new Set(items.map((item) => item.folder));
+    const MAX_ALBUM = 10;
     let replace = false;
+    let merge = false;
     // Probable copies start unchecked; exact duplicates follow the choice below.
     const picked = items.map((item) => !item.duplicate && !item.similar);
 
@@ -651,6 +687,7 @@
       const add = el('button', { class: 'btn primary', text: '加入队列' });
       const list = el('div', { class: 'cand-list' });
       const boxes = [];
+      let modeHint = null;
       const selectable = (item) => (item.duplicate ? replace && item.replaceable : true);
       const refresh = () => {
         const total = picked.filter(Boolean).length;
@@ -661,6 +698,30 @@
           boxes[index].checked = picked[index];
           boxes[index].closest('.cand').classList.toggle('off', !selectable(item));
         });
+        if (modeHint) {
+          const chosen = items.filter((item, index) => picked[index] && selectable(item));
+          const uploadable = chosen.filter((item) => !item.oversize).length;
+          const oversize = chosen.length - uploadable;
+          if (!merge) {
+            modeHint.textContent = uploadable > 0
+              ? `每个视频各发一条消息（共 ${uploadable} 条），Caption 为文件名。`
+              : '每个视频各发一条消息，Caption 为文件名。';
+          } else if (uploadable < 2) {
+            modeHint.textContent = uploadable === 1
+              ? '当前只选了 1 个可上传视频，会单独发成一条消息；超限的视频不会参与合并。'
+              : '至少选择 2 个不超过上限的视频才能合并发送。';
+          } else {
+            const groups = Math.floor(uploadable / MAX_ALBUM);
+            const rem = uploadable % MAX_ALBUM;
+            const fullGroups = groups + (rem >= 2 ? 1 : 0);
+            const single = rem === 1 ? 1 : 0;
+            let summary = `${uploadable} 个视频将按顺序合并为 ${fullGroups} 条消息`;
+            if (single) summary += '，最后 1 个单独发送';
+            summary += `（每条最多 ${MAX_ALBUM} 个，仍保留各自的文件名 Caption）`;
+            if (oversize > 0) summary += `；另有 ${oversize} 个超限视频不参与合并`;
+            modeHint.textContent = summary + '。';
+          }
+        }
       };
       items.forEach((item, index) => {
         const check = el('input', { type: 'checkbox', onchange: () => { picked[index] = check.checked; refresh(); } });
@@ -704,12 +765,31 @@
         queueMicrotask(() => setMode(false));
       }
 
-      add.onclick = () => close({ indexes: picked.flatMap((value, index) => (value ? [index] : [])), replace });
+      let modeBox = null;
+      if (items.length >= 2) {
+        const sendModes = el('div', { class: 'segmented' });
+        modeHint = el('div', { class: 'hint' });
+        const setSendMode = (value) => {
+          merge = value;
+          sendModes.children[0].classList.toggle('active', !merge);
+          sendModes.children[1].classList.toggle('active', merge);
+          refresh();
+        };
+        const singleBtn = el('button', { type: 'button', class: 'active', text: '单独发送', onclick: () => setSendMode(false) });
+        const mergeBtn = el('button', { type: 'button', text: `合并发送（最多 ${MAX_ALBUM} 个 / 条）`, onclick: () => setSendMode(true) });
+        sendModes.append(singleBtn, mergeBtn);
+        modeBox = el('div', { class: 'mode-box' },
+          el('div', { class: 'mode-head' }, el('b', { text: '发送方式' }), sendModes),
+          modeHint);
+      }
+
+      add.onclick = () => close({ indexes: picked.flatMap((value, index) => (value ? [index] : [])), replace, merge });
       box.append(
         el('div', { class: 'modal-head', text: '选择要加入队列的视频' }),
         el('div', { class: 'modal-body plain' },
           el('div', { class: 'hint', text: scan.source + (ignored ? ' · ' + ignored : ''), title: scan.source }),
           duplicateBox,
+          modeBox,
           similar ? el('div', { class: 'hint', text: `${similar} 个疑似重复的视频默认没有勾选，确认不是同一个再勾上。` }) : null,
           el('div', { class: 'quick' },
             el('button', { class: 'btn small', type: 'button', text: '全选', onclick: () => setAll(true) }),
@@ -719,7 +799,7 @@
           el('button', { class: 'btn', text: '取消', onclick: () => close(null) }), add));
       refresh();
     }, { wide: true });
-    if (result) await run('addCandidates', { token: scan.token, indexes: result.indexes, replaceDuplicates: result.replace });
+    if (result) await run('addCandidates', { token: scan.token, indexes: result.indexes, replaceDuplicates: result.replace, merge: !!result.merge });
     else call('discardScan', { token: scan.token }).catch(() => {});
   }
 

@@ -1,6 +1,7 @@
 package queue
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"os"
@@ -37,6 +38,12 @@ func TestStoreRoundTrip(t *testing.T) {
 		},
 		StartedAt:   &started,
 		CompletedAt: &completed,
+		GroupID:     "grp-1",
+		Staged: &model.StagedMedia{
+			DocumentID:    12345,
+			AccessHash:    67890,
+			FileReference: []byte{1, 2, 3},
+		},
 	}}
 	channel := model.Channel{ID: -100123, AccessHash: 456, Title: "Videos"}
 
@@ -214,6 +221,68 @@ func TestStoreSaveLeavesNoTemporaryFile(t *testing.T) {
 	}
 }
 
+func TestStoreLoadPreservesStagedAndRecoversAlbumSending(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "queue.json")
+	stagedRef := []byte{9, 8, 7}
+	jobs := []model.Job{
+		{
+			ID:       "staged-queued",
+			State:    model.JobQueued,
+			Uploaded: 500,
+			Size:     500,
+			RandomID: 10,
+			GroupID:  "grp-a",
+			Staged: &model.StagedMedia{
+				DocumentID:    11,
+				AccessHash:    22,
+				FileReference: stagedRef,
+			},
+		},
+		{
+			ID:       "album-send-1",
+			State:    model.JobSending,
+			Uploaded: 600,
+			Size:     600,
+			RandomID: 20,
+			GroupID:  "grp-b",
+			Staged: &model.StagedMedia{
+				DocumentID:    33,
+				AccessHash:    44,
+				FileReference: []byte{1},
+			},
+		},
+		{
+			ID:       "album-send-2",
+			State:    model.JobSending,
+			Uploaded: 700,
+			Size:     700,
+			RandomID: 21,
+			GroupID:  "grp-b",
+			Staged: &model.StagedMedia{
+				DocumentID:    55,
+				AccessHash:    66,
+				FileReference: []byte{2},
+			},
+		},
+	}
+	if err := Store(path).Save(jobs, model.Channel{}, false); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+	got, _, _, err := Store(path).Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if got[0].State != model.JobQueued || got[0].Uploaded != 500 || got[0].GroupID != "grp-a" ||
+		got[0].Staged == nil || got[0].Staged.DocumentID != 11 || !bytes.Equal(got[0].Staged.FileReference, stagedRef) {
+		t.Fatalf("staged queued job not preserved: %+v", got[0])
+	}
+	for _, idx := range []int{1, 2} {
+		if got[idx].State != model.JobConfirming || got[idx].GroupID != "grp-b" || got[idx].Staged == nil || got[idx].Error == "" {
+			t.Fatalf("album sending job %d not recovered to confirming: %+v", idx, got[idx])
+		}
+	}
+}
+
 func equalJobs(a, b []model.Job) bool {
 	if len(a) != len(b) {
 		return false
@@ -223,11 +292,21 @@ func equalJobs(a, b []model.Job) bool {
 			a[i].Name != b[i].Name || a[i].Size != b[i].Size || !a[i].ModTime.Equal(b[i].ModTime) ||
 			a[i].State != b[i].State || a[i].Uploaded != b[i].Uploaded || a[i].RandomID != b[i].RandomID ||
 			a[i].MessageID != b[i].MessageID || a[i].ChannelID != b[i].ChannelID || a[i].Metadata != b[i].Metadata ||
-			a[i].Error != b[i].Error || !sameTime(a[i].StartedAt, b[i].StartedAt) || !sameTime(a[i].CompletedAt, b[i].CompletedAt) {
+			a[i].Error != b[i].Error || !sameTime(a[i].StartedAt, b[i].StartedAt) || !sameTime(a[i].CompletedAt, b[i].CompletedAt) ||
+			a[i].GroupID != b[i].GroupID || !sameStaged(a[i].Staged, b[i].Staged) {
 			return false
 		}
 	}
 	return true
+}
+
+func sameStaged(a, b *model.StagedMedia) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return a.DocumentID == b.DocumentID &&
+		a.AccessHash == b.AccessHash &&
+		bytes.Equal(a.FileReference, b.FileReference)
 }
 
 func sameTime(a, b *time.Time) bool {

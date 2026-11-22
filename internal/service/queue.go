@@ -211,7 +211,9 @@ func (s *Service) ScanPaths(paths []string) (ScanView, error) {
 // AddCandidates queues the chosen files of a previous scan. A chosen file
 // that is already queued is skipped unless replaceDuplicates is set, in which
 // case its old entry is removed and the file is queued again from scratch.
-func (s *Service) AddCandidates(token string, indexes []int, replaceDuplicates bool) (string, error) {
+// When merge is true, newly queued videos are grouped into Telegram albums of
+// up to model.MaxAlbumSize items.
+func (s *Service) AddCandidates(token string, indexes []int, replaceDuplicates bool, merge bool) (string, error) {
 	s.mu.Lock()
 	result := s.scan
 	if result == nil || result.token != token {
@@ -269,17 +271,34 @@ func (s *Service) AddCandidates(token string, indexes []int, replaceDuplicates b
 			replaced = removal.Removed
 		}
 	}
-	added, err := s.controller.AddJobs(selected)
-	if err != nil {
-		return "", err
+	var addRes coreapp.AddResult
+	if merge {
+		var err error
+		addRes, err = s.controller.AddMergedJobs(selected)
+		if err != nil {
+			return "", err
+		}
+	} else {
+		added, err := s.controller.AddJobs(selected)
+		if err != nil {
+			return "", err
+		}
+		addRes.Added = added
 	}
 	s.scheduler.RetryDue()
 
-	parts := []string{fmt.Sprintf("已添加 %d 个视频", added)}
+	parts := []string{fmt.Sprintf("已添加 %d 个视频", addRes.Added)}
 	if replaced > 0 {
-		parts[0] = fmt.Sprintf("已添加 %d 个视频（其中 %d 个替换了队列里的旧条目）", added, replaced)
+		parts[0] = fmt.Sprintf("已添加 %d 个视频（其中 %d 个替换了队列里的旧条目）", addRes.Added, replaced)
 	}
-	if skipped := len(selected) - added; skipped > 0 {
+	if addRes.Groups > 0 {
+		groupNote := fmt.Sprintf("合并为 %d 条消息", addRes.Groups)
+		if addRes.Singles > 0 {
+			groupNote = fmt.Sprintf("合并为 %d 条消息，另 %d 个单独发送", addRes.Groups, addRes.Singles)
+		}
+		parts = append(parts, groupNote)
+	}
+	if skipped := len(selected) - addRes.Added; skipped > 0 {
 		parts = append(parts, fmt.Sprintf("%d 个仍在队列中处理，已跳过", skipped))
 	}
 	return strings.Join(parts, "；"), nil
@@ -350,7 +369,7 @@ func (s *Service) beginUploads(scheduled bool) error {
 		return err
 	}
 
-	message := "上传已开始，视频会按队列顺序逐个发送"
+	message := "上传已开始，视频会按队列顺序发送"
 	if scheduled {
 		message = "定时时间到，上传已自动开始"
 	}

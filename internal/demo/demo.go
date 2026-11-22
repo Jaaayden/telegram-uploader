@@ -36,11 +36,14 @@ var Channel = model.Channel{ID: 1000000001, AccessHash: 1, Title: "演示频道"
 
 // Client simulates uploads at a steady rate and honours the rate limiter.
 type Client struct {
-	limiter *tgtransport.RateLimiter
-	binding chan tgtransport.BindingEvent
-	mu      sync.Mutex
-	nextID  int
+	limiter   *tgtransport.RateLimiter
+	binding   chan tgtransport.BindingEvent
+	mu        sync.Mutex
+	nextID    int
+	nextDocID int64
 }
+
+var _ tgtransport.AlbumGateway = (*Client)(nil)
 
 // NewClient matches the signature the service uses to build its transport.
 func NewClient(config tgtransport.Config, _ tgtransport.Events) *Client {
@@ -82,12 +85,69 @@ func (c *Client) ValidateChannel(_ context.Context, channel model.Channel) (mode
 func (c *Client) SetUploadConcurrency(value int) int { return value }
 
 func (c *Client) UploadVideo(ctx context.Context, request tgtransport.UploadRequest, onProgress func(model.Progress)) (int, error) {
+	if err := c.simulateTransfer(ctx, request, onProgress); err != nil {
+		return 0, err
+	}
+	if request.BeforeSend != nil {
+		if err := request.BeforeSend(); err != nil {
+			return 0, err
+		}
+	}
+	c.mu.Lock()
+	c.nextID++
+	id := c.nextID
+	c.mu.Unlock()
+	return id, nil
+}
+
+func (c *Client) StageVideo(ctx context.Context, request tgtransport.UploadRequest, onProgress func(model.Progress)) (model.StagedMedia, error) {
+	if err := c.simulateTransfer(ctx, request, onProgress); err != nil {
+		return model.StagedMedia{}, err
+	}
+	c.mu.Lock()
+	c.nextDocID++
+	docID := 1000 + c.nextDocID
+	c.mu.Unlock()
+	return model.StagedMedia{
+		DocumentID:    docID,
+		AccessHash:    1,
+		FileReference: []byte("demo-ref"),
+	}, nil
+}
+
+func (c *Client) SendAlbum(ctx context.Context, _ model.Channel, items []tgtransport.AlbumItem) ([]int, error) {
+	if len(items) == 0 || len(items) > model.MaxAlbumSize {
+		return nil, fmt.Errorf("demo: invalid album size %d", len(items))
+	}
+	for _, item := range items {
+		if item.RandomID == 0 {
+			return nil, errors.New("demo: zero random_id")
+		}
+	}
+	timer := time.NewTimer(150 * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	c.mu.Lock()
+	ids := make([]int, len(items))
+	for i := range items {
+		c.nextID++
+		ids[i] = c.nextID
+	}
+	c.mu.Unlock()
+	return ids, nil
+}
+
+func (c *Client) simulateTransfer(ctx context.Context, request tgtransport.UploadRequest, onProgress func(model.Progress)) error {
 	if request.File == nil {
-		return 0, errors.New("demo: missing file")
+		return errors.New("demo: missing file")
 	}
 	info, err := request.File.Stat()
 	if err != nil {
-		return 0, err
+		return err
 	}
 	total := info.Size()
 	windowStart := time.Now()
@@ -109,12 +169,12 @@ func (c *Client) UploadVideo(ctx context.Context, request tgtransport.UploadRequ
 			chunk = min(chunk, max(limit/10, 1))
 		}
 		if err := c.limiter.Wait(ctx, int(chunk)); err != nil {
-			return 0, err
+			return err
 		}
 		select {
 		case <-time.After(tick):
 		case <-ctx.Done():
-			return 0, ctx.Err()
+			return ctx.Err()
 		}
 		done += chunk
 		if request.OnCheckpoint != nil {
@@ -133,16 +193,7 @@ func (c *Client) UploadVideo(ctx context.Context, request tgtransport.UploadRequ
 			onProgress(model.Progress{BytesDone: done, BytesTotal: total, BytesPerSecond: rate, At: now})
 		}
 	}
-	if request.BeforeSend != nil {
-		if err := request.BeforeSend(); err != nil {
-			return 0, err
-		}
-	}
-	c.mu.Lock()
-	c.nextID++
-	id := c.nextID
-	c.mu.Unlock()
-	return id, nil
+	return nil
 }
 
 // Secrets keeps credentials in memory so the demo never touches the system

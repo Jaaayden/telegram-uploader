@@ -194,15 +194,174 @@ func newUploadEngine(api uploader.Client, progress uploader.Progress, threads in
 }
 
 func (c *Client) UploadVideo(ctx context.Context, request UploadRequest, onProgress func(model.Progress)) (int, error) {
+	var messageID int
+	err := c.withUploadedVideo(ctx, request, onProgress, func(file *uploadedVideo) error {
+		if file.request.BeforeSend != nil {
+			if err := file.request.BeforeSend(); err != nil {
+				return err
+			}
+		}
+		// Cancellation can race with a durable BeforeSend callback. Re-check at
+		// the exact submission boundary so a completed local fsync never causes
+		// a deliberately cancelled job to enter messages.sendMedia.
+		if err := file.ctx.Err(); err != nil {
+			return err
+		}
+		submit := func() (tg.UpdatesClass, error) {
+			return message.NewSender(file.api).
+				WithUploader(file.engine).
+				To(file.peer()).
+				RandomID(file.request.RandomID).
+				Media(file.ctx, file.media)
+		}
+		updatesResult, err := submitUploaded(c, file, submit)
+		if err != nil {
+			var submitted *submitError
+			if !errors.As(err, &submitted) {
+				return err
+			}
+			return fmt.Errorf("%w：提交频道消息失败：%w", ErrSendOutcomeUnknown, submitted.err)
+		}
+		id, err := unpack.MessageID(updatesResult, nil)
+		if err != nil {
+			return fmt.Errorf("%w：消息已发送但无法读取消息 ID：%w", ErrSendOutcomeUnknown, err)
+		}
+		messageID = id
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	return messageID, nil
+}
+
+// StageVideo uploads a video and attaches it to the channel with
+// messages.uploadMedia, without posting it. The result goes into SendAlbum
+// later. No channel message exists until then, so every failure here is
+// safe to retry.
+func (c *Client) StageVideo(ctx context.Context, request UploadRequest, onProgress func(model.Progress)) (model.StagedMedia, error) {
+	var staged model.StagedMedia
+	err := c.withUploadedVideo(ctx, request, onProgress, func(file *uploadedVideo) error {
+		submit := func() (tg.MessageMediaClass, error) {
+			return message.NewSender(file.api).
+				WithUploader(file.engine).
+				To(file.peer()).
+				UploadMedia(file.ctx, file.media)
+		}
+		result, err := submitUploaded(c, file, submit)
+		if err != nil {
+			var submitted *submitError
+			if !errors.As(err, &submitted) {
+				return err
+			}
+			if ctxErr := file.ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
+			// messages.uploadMedia never creates a message: retrying is safe.
+			return fmt.Errorf("%w：Telegram 未能保存上传的视频：%w", ErrUploadData, submitted.err)
+		}
+		staged, err = stagedFromMedia(result)
+		if err != nil {
+			return fmt.Errorf("%w：%w", ErrUploadData, err)
+		}
+		return nil
+	})
+	if err != nil {
+		return model.StagedMedia{}, err
+	}
+	return staged, nil
+}
+
+func stagedFromMedia(media tg.MessageMediaClass) (model.StagedMedia, error) {
+	documentMedia, ok := media.(*tg.MessageMediaDocument)
+	if !ok {
+		return model.StagedMedia{}, fmt.Errorf("Telegram 返回了意外的媒体类型 %T", media)
+	}
+	document, ok := documentMedia.Document.(*tg.Document)
+	if !ok {
+		return model.StagedMedia{}, errors.New("Telegram 没有返回上传后的视频文件")
+	}
+	return model.StagedMedia{
+		DocumentID:    document.ID,
+		AccessHash:    document.AccessHash,
+		FileReference: append([]byte(nil), document.FileReference...),
+	}, nil
+}
+
+// submitError is an error returned by the final Telegram request itself
+// rather than by the preparation around it.
+type submitError struct{ err error }
+
+func (e *submitError) Error() string { return e.err.Error() }
+func (e *submitError) Unwrap() error { return e.err }
+
+// uploadedVideo is a video whose parts Telegram has confirmed. The final
+// request (sendMedia or uploadMedia) is up to the caller.
+type uploadedVideo struct {
+	ctx     context.Context
+	api     *tg.Client
+	engine  *uploader.Uploader
+	request UploadRequest
+	media   *message.VideoDocumentBuilder
+	// repair sends parts of an earlier session again under the same file ID;
+	// nil when this attempt did not continue an earlier one.
+	repair func() error
+}
+
+func (v *uploadedVideo) peer() tg.InputPeerClass {
+	return &tg.InputPeerChannel{ChannelID: v.request.Channel.ID, AccessHash: v.request.Channel.AccessHash}
+}
+
+// submit runs the final request. When Telegram answers that parts of an
+// earlier session are missing (which means nothing was created), it sends
+// them again under the same file ID and tries once more. An error that
+// remains after that and is not about missing parts comes from the request
+// itself; the caller decides what it means.
+func submitUploaded[T any](c *Client, v *uploadedVideo, request func() (T, error)) (T, error) {
+	var zero T
+	if err := c.reserveSendSlot(v.ctx); err != nil {
+		return zero, err
+	}
+	result, err := request()
+	if isMissingPartsError(err) && v.repair != nil {
+		if repairErr := v.repair(); repairErr != nil {
+			if ctxErr := v.ctx.Err(); ctxErr != nil {
+				// Stopped while restoring parts; no submission is in flight.
+				return zero, ctxErr
+			}
+			return zero, fmt.Errorf("%w：补传被 Telegram 清理的分片失败：%w", ErrUploadData, repairErr)
+		}
+		if err := c.reserveSendSlot(v.ctx); err != nil {
+			return zero, err
+		}
+		result, err = request()
+	}
+	if isMissingPartsError(err) {
+		// Still missing (or nothing to repair with): nothing was created.
+		// Forget the checkpoint so the retry uploads the whole file afresh.
+		if v.request.OnCheckpoint != nil {
+			v.request.OnCheckpoint(ResumeToken{})
+		}
+		return zero, fmt.Errorf("%w：Telegram 已清理之前上传的分片，需要重新上传：%w", ErrUploadData, err)
+	}
+	if err != nil {
+		return zero, &submitError{err: err}
+	}
+	return result, nil
+}
+
+// withUploadedVideo validates the request, transfers the file parts and hands
+// the confirmed upload to finish, all inside one admitted request.
+func (c *Client) withUploadedVideo(ctx context.Context, request UploadRequest, onProgress func(model.Progress), finish func(*uploadedVideo) error) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if request.RandomID == 0 {
-		return 0, errors.New("random_id 不能为空")
+		return errors.New("random_id 不能为空")
 	}
 	requestCtx, release, err := c.beginRequest(ctx)
 	if err != nil {
-		return 0, err
+		return err
 	}
 	defer release()
 	// Snapshot the profile at the request boundary. A setting change while this
@@ -211,15 +370,15 @@ func (c *Client) UploadVideo(ctx context.Context, request UploadRequest, onProgr
 	uploadConcurrency := c.currentUploadConcurrency()
 	api, err := c.connectedAPI()
 	if err != nil {
-		return 0, err
+		return err
 	}
 	uploadAPI, err := c.connectedUploadAPI()
 	if err != nil {
-		return 0, err
+		return err
 	}
 	validatedChannel, err := c.validateChannel(requestCtx, request.Channel)
 	if err != nil {
-		return 0, err
+		return err
 	}
 	request.Channel = validatedChannel
 	var info os.FileInfo
@@ -229,16 +388,16 @@ func (c *Client) UploadVideo(ctx context.Context, request UploadRequest, onProgr
 		info, err = os.Stat(request.Path)
 	}
 	if err != nil {
-		return 0, fmt.Errorf("读取视频文件失败：%w", err)
+		return fmt.Errorf("读取视频文件失败：%w", err)
 	}
 	if !info.Mode().IsRegular() {
-		return 0, errors.New("视频路径不是普通文件")
+		return errors.New("视频路径不是普通文件")
 	}
 	c.mu.RLock()
 	maxUploadBytes := c.identity.MaxUploadBytes
 	c.mu.RUnlock()
 	if maxUploadBytes > 0 && info.Size() > maxUploadBytes {
-		return 0, fmt.Errorf("视频大小 %d 字节超过当前 Bot 上传上限 %d 字节", info.Size(), maxUploadBytes)
+		return fmt.Errorf("视频大小 %d 字节超过当前 Bot 上传上限 %d 字节", info.Size(), maxUploadBytes)
 	}
 	request = prepareUploadRequest(request)
 
@@ -246,7 +405,7 @@ func (c *Client) UploadVideo(ctx context.Context, request UploadRequest, onProgr
 	case c.uploadSem <- struct{}{}:
 		defer func() { <-c.uploadSem }()
 	case <-requestCtx.Done():
-		return 0, requestCtx.Err()
+		return requestCtx.Err()
 	}
 
 	progress := newUploadProgressReporter(onProgress)
@@ -284,21 +443,10 @@ func (c *Client) UploadVideo(ctx context.Context, request UploadRequest, onProgr
 	}
 	progress.Close()
 	if err != nil {
-		return 0, fmt.Errorf("%w：上传视频数据失败：%w", ErrUploadData, err)
+		return fmt.Errorf("%w：上传视频数据失败：%w", ErrUploadData, err)
 	}
 	if err := requestCtx.Err(); err != nil {
-		return 0, err
-	}
-	if request.BeforeSend != nil {
-		if err := request.BeforeSend(); err != nil {
-			return 0, err
-		}
-	}
-	// Cancellation can race with a durable BeforeSend callback. Re-check at the
-	// exact submission boundary so a completed local fsync never causes a
-	// deliberately cancelled job to enter messages.sendMedia.
-	if err := requestCtx.Err(); err != nil {
-		return 0, err
+		return err
 	}
 
 	document := message.UploadedDocument(inputFile, styling.Plain(request.Caption)).
@@ -310,50 +458,14 @@ func (c *Client) UploadVideo(ctx context.Context, request UploadRequest, onProgr
 	if request.Metadata.SupportsStreaming {
 		video.SupportsStreaming()
 	}
-
-	submit := func() (tg.UpdatesClass, error) {
-		return message.NewSender(api).
-			WithUploader(uploadEngine).
-			To(&tg.InputPeerChannel{ChannelID: request.Channel.ID, AccessHash: request.Channel.AccessHash}).
-			RandomID(request.RandomID).
-			Media(requestCtx, video)
-	}
-	if err := c.reserveSendSlot(requestCtx); err != nil {
-		return 0, err
-	}
-	updatesResult, err := submit()
-	if isMissingPartsError(err) && repair != nil {
-		// Telegram dropped parts of the earlier session. That answer means no
-		// message was created, so send those parts again under the same file
-		// ID and submit once more: nothing already uploaded is wasted.
-		if repairErr := repair(); repairErr != nil {
-			if ctxErr := requestCtx.Err(); ctxErr != nil {
-				// Stopped while restoring parts; no submission is in flight.
-				return 0, ctxErr
-			}
-			return 0, fmt.Errorf("%w：补传被 Telegram 清理的分片失败：%w", ErrUploadData, repairErr)
-		}
-		if err := c.reserveSendSlot(requestCtx); err != nil {
-			return 0, err
-		}
-		updatesResult, err = submit()
-	}
-	if isMissingPartsError(err) {
-		// Still missing (or nothing to repair with): nothing was posted.
-		// Forget the checkpoint so the retry uploads the whole file afresh.
-		if request.OnCheckpoint != nil {
-			request.OnCheckpoint(ResumeToken{})
-		}
-		return 0, fmt.Errorf("%w：Telegram 已清理之前上传的分片，需要重新上传：%w", ErrUploadData, err)
-	}
-	if err != nil {
-		return 0, fmt.Errorf("%w：提交频道消息失败：%w", ErrSendOutcomeUnknown, err)
-	}
-	messageID, err := unpack.MessageID(updatesResult, nil)
-	if err != nil {
-		return 0, fmt.Errorf("%w：消息已发送但无法读取消息 ID：%w", ErrSendOutcomeUnknown, err)
-	}
-	return messageID, nil
+	return finish(&uploadedVideo{
+		ctx:     requestCtx,
+		api:     api,
+		engine:  uploadEngine,
+		request: request,
+		media:   video,
+		repair:  repair,
+	})
 }
 
 // uploadFileData transfers the file parts. With a rate limiter configured the

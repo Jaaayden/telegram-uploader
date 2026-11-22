@@ -128,6 +128,8 @@ func (c *Controller) runQueue(ctx context.Context, cancel context.CancelFunc) {
 	runDone := c.runDone
 	c.mu.RUnlock()
 	var stats uploadStats
+	stagedMetrics := make(map[string]stagedTransfer)
+	restaged := make(map[string]bool)
 	runBegan := time.Now()
 	defer func() {
 		c.mu.Lock()
@@ -137,6 +139,7 @@ func (c *Controller) runQueue(ctx context.Context, cancel context.CancelFunc) {
 		}
 		c.pauseRequested = false
 		c.activeID = ""
+		c.activeBatch = nil
 		c.activeCancel = nil
 		c.activeAttempt = 0
 		c.retryWaitActive = false
@@ -170,13 +173,21 @@ func (c *Controller) runQueue(ctx context.Context, cancel context.CancelFunc) {
 	}()
 
 	for {
-		job, channel, ok := c.nextJob()
-		if !ok {
+		_, supportsAlbum := c.currentGateway().(tgtransport.AlbumGateway)
+		work := c.nextWork(supportsAlbum)
+		switch work.kind {
+		case workNone:
 			return
+		case workSendAlbum:
+			if !c.runSendAlbum(ctx, work.groupID, work.channel, &stats, stagedMetrics, restaged) {
+				return
+			}
+			continue
 		}
 		if err := ctx.Err(); err != nil {
 			return
 		}
+		job, channel, stage := work.job, work.channel, work.kind == workStageAlbumMember
 
 		jobCtx, jobCancel := context.WithCancel(ctx)
 		// Bytes a previous attempt already got to Telegram are not sent again,
@@ -190,7 +201,16 @@ func (c *Controller) runQueue(ctx context.Context, cancel context.CancelFunc) {
 			job.ID, job.Name, job.Position, job.Size, resumedBytes, formatLocalTime(time.Now()),
 		)
 		jobBegan := time.Now()
-		messageID, err := c.uploadJobWithRetry(jobCtx, job, channel, jobCancel)
+		var (
+			messageID int
+			staged    model.StagedMedia
+			err       error
+		)
+		if stage {
+			staged, err = c.stageJobWithRetry(jobCtx, job, channel, jobCancel)
+		} else {
+			messageID, err = c.uploadJobWithRetry(jobCtx, job, channel, jobCancel)
+		}
 		jobElapsed := time.Since(jobBegan)
 		jobContextCancelled := jobCtx.Err() != nil
 
@@ -207,84 +227,38 @@ func (c *Controller) runQueue(ctx context.Context, cancel context.CancelFunc) {
 		jobCancel()
 
 		if err != nil {
+			if !c.handleTransferAttemptError(ctx, job, jobElapsed, err, cancelCurrent, cancelAll, jobContextCancelled) {
+				return
+			}
+			continue
+		}
+
+		sentBytes := max(job.Size-resumedBytes, 0)
+		if stage {
+			stagedMetrics[job.ID] = stagedTransfer{bytes: sentBytes, elapsed: jobElapsed}
 			_ = diagnostics.Logf(
-				"job_attempt_end id=%s success=false elapsed=%s error_type=%T cancelled=%t outcome_unknown=%t",
-				job.ID,
-				formatElapsed(jobElapsed),
-				err,
-				errors.Is(err, context.Canceled),
-				errors.Is(err, tgtransport.ErrSendOutcomeUnknown),
+				"job_staged id=%s name=%q size=%d sent_bytes=%d elapsed=%s",
+				job.ID, job.Name, job.Size, sentBytes, formatElapsed(jobElapsed),
 			)
-			if errors.Is(err, errQueueJobCancelled) || errors.Is(err, errQueueJobNotRunnable) {
-				c.finishActiveJob(job.ID)
+			c.mu.Lock()
+			current := findJobIndexLocked(c.jobs, job.ID)
+			if current < 0 {
+				c.mu.Unlock()
 				continue
 			}
-			if errors.Is(err, tgtransport.ErrSendOutcomeUnknown) {
-				c.mu.Lock()
-				if current := findJobIndexLocked(c.jobs, job.ID); current >= 0 {
-					c.jobs[current].State = model.JobConfirming
-					c.jobs[current].BytesPerSecond = 0
-					c.jobs[current].Error = "消息可能已经送达；请先检查频道，再选择“已发送”或“重试”"
-					c.lastError = c.jobs[current].Error
-				}
-				// An unknown outcome must stay visible for manual confirmation;
-				// never delete it merely because the user clicked Remove.
-				delete(c.pendingRemoval, job.ID)
-				c.queueRevision++
-				c.notifyLocked()
-				c.mu.Unlock()
-				if persistErr := c.persist(); persistErr != nil {
-					c.setPersistenceError(persistErr)
-				}
-				return
-			}
-			if errors.Is(err, errQueuePaused) {
-				jobContextCancelled = true
-			}
-			if errors.Is(err, errQueuePersistenceLost) {
+			c.jobs[current].State = model.JobQueued
+			c.jobs[current].Uploaded = c.jobs[current].Size
+			c.jobs[current].BytesPerSecond = 0
+			c.jobs[current].Staged = cloneStagedMedia(&staged)
+			c.jobs[current].Error = ""
+			c.jobs[current].Note = ""
+			clearResume(&c.jobs[current])
+			c.queueRevision++
+			c.notifyLocked()
+			c.mu.Unlock()
+			if err := c.persist(); err != nil {
 				c.clearPendingRemoval(job.ID)
-				_ = c.failJob(job.ID, err)
-				return
-			}
-			if jobContextCancelled || cancelCurrent || cancelAll || ctx.Err() != nil {
-				c.mu.Lock()
-				current := findJobIndexLocked(c.jobs, job.ID)
-				if current >= 0 {
-					if cancelCurrent || cancelAll {
-						c.jobs[current].State = model.JobCancelled
-						c.jobs[current].Error = ""
-					} else {
-						c.jobs[current].State = model.JobInterrupted
-						if c.paused || c.pauseRequested {
-							c.jobs[current].Error = "队列已暂停，可重新开始当前任务"
-						} else {
-							c.jobs[current].Error = "程序关闭或连接中断，可重新开始上传"
-						}
-					}
-					c.jobs[current].BytesPerSecond = 0
-					c.queueRevision++
-					c.notifyLocked()
-				}
-				c.mu.Unlock()
-				if persistErr := c.persist(); persistErr != nil {
-					c.clearPendingRemoval(job.ID)
-					c.setPersistenceError(persistErr)
-					c.finishActiveJob(job.ID)
-					return
-				} else if c.finishActiveJobUnlessPending(job.ID) {
-					if removeErr := c.removeAfterTerminalPersist(job.ID); removeErr != nil {
-						c.setPersistenceError(removeErr)
-					}
-					c.finishActiveJob(job.ID)
-				}
-				if ctx.Err() != nil {
-					return
-				}
-				continue
-			}
-			if persistErr := c.failJob(job.ID, err); persistErr != nil {
-				c.clearPendingRemoval(job.ID)
-				c.finishActiveJob(job.ID)
+				c.setPersistenceError(err)
 				return
 			}
 			if c.finishActiveJobUnlessPending(job.ID) {
@@ -299,7 +273,6 @@ func (c *Controller) runQueue(ctx context.Context, cancel context.CancelFunc) {
 		}
 
 		completed := time.Now()
-		sentBytes := max(job.Size-resumedBytes, 0)
 		stats.add(sentBytes, jobElapsed)
 		_ = diagnostics.Logf(
 			"job_sent id=%s name=%q message_id=%d size=%d sent_bytes=%d finished_at=%q elapsed=%s avg_speed=%s",
@@ -324,6 +297,7 @@ func (c *Controller) runQueue(ctx context.Context, cancel context.CancelFunc) {
 		c.jobs[current].ChannelID = channel.ID
 		c.jobs[current].CompletedAt = &completed
 		c.jobs[current].Error = ""
+		c.jobs[current].Staged = nil
 		clearResume(&c.jobs[current])
 		c.queueRevision++
 		c.notifyLocked()
@@ -345,6 +319,103 @@ func (c *Controller) runQueue(ctx context.Context, cancel context.CancelFunc) {
 			c.finishActiveJob(job.ID)
 		}
 	}
+}
+
+func (c *Controller) handleTransferAttemptError(
+	ctx context.Context,
+	job model.Job,
+	jobElapsed time.Duration,
+	err error,
+	cancelCurrent bool,
+	cancelAll bool,
+	jobContextCancelled bool,
+) bool {
+	_ = diagnostics.Logf(
+		"job_attempt_end id=%s success=false elapsed=%s error_type=%T cancelled=%t outcome_unknown=%t",
+		job.ID,
+		formatElapsed(jobElapsed),
+		err,
+		errors.Is(err, context.Canceled),
+		errors.Is(err, tgtransport.ErrSendOutcomeUnknown),
+	)
+	if errors.Is(err, errQueueJobCancelled) || errors.Is(err, errQueueJobNotRunnable) {
+		c.finishActiveJob(job.ID)
+		return true
+	}
+	if errors.Is(err, tgtransport.ErrSendOutcomeUnknown) {
+		c.mu.Lock()
+		if current := findJobIndexLocked(c.jobs, job.ID); current >= 0 {
+			c.jobs[current].State = model.JobConfirming
+			c.jobs[current].BytesPerSecond = 0
+			c.jobs[current].Error = "消息可能已经送达；请先检查频道，再选择“已发送”或“重试”"
+			c.lastError = c.jobs[current].Error
+		}
+		// An unknown outcome must stay visible for manual confirmation;
+		// never delete it merely because the user clicked Remove.
+		delete(c.pendingRemoval, job.ID)
+		c.queueRevision++
+		c.notifyLocked()
+		c.mu.Unlock()
+		if persistErr := c.persist(); persistErr != nil {
+			c.setPersistenceError(persistErr)
+		}
+		return false
+	}
+	if errors.Is(err, errQueuePaused) {
+		jobContextCancelled = true
+	}
+	if errors.Is(err, errQueuePersistenceLost) {
+		c.clearPendingRemoval(job.ID)
+		_ = c.failJob(job.ID, err)
+		return false
+	}
+	if jobContextCancelled || cancelCurrent || cancelAll || ctx.Err() != nil {
+		c.mu.Lock()
+		current := findJobIndexLocked(c.jobs, job.ID)
+		if current >= 0 {
+			if cancelCurrent || cancelAll {
+				c.jobs[current].State = model.JobCancelled
+				c.jobs[current].Error = ""
+			} else {
+				c.jobs[current].State = model.JobInterrupted
+				if c.paused || c.pauseRequested {
+					c.jobs[current].Error = "队列已暂停，可重新开始当前任务"
+				} else {
+					c.jobs[current].Error = "程序关闭或连接中断，可重新开始上传"
+				}
+			}
+			c.jobs[current].BytesPerSecond = 0
+			c.queueRevision++
+			c.notifyLocked()
+		}
+		c.mu.Unlock()
+		if persistErr := c.persist(); persistErr != nil {
+			c.clearPendingRemoval(job.ID)
+			c.setPersistenceError(persistErr)
+			c.finishActiveJob(job.ID)
+			return false
+		} else if c.finishActiveJobUnlessPending(job.ID) {
+			if removeErr := c.removeAfterTerminalPersist(job.ID); removeErr != nil {
+				c.setPersistenceError(removeErr)
+			}
+			c.finishActiveJob(job.ID)
+		}
+		return ctx.Err() == nil
+	}
+	if persistErr := c.failJob(job.ID, err); persistErr != nil {
+		c.clearPendingRemoval(job.ID)
+		c.finishActiveJob(job.ID)
+		return false
+	}
+	if c.finishActiveJobUnlessPending(job.ID) {
+		if removeErr := c.removeAfterTerminalPersist(job.ID); removeErr != nil {
+			c.setPersistenceError(removeErr)
+			c.finishActiveJob(job.ID)
+			return false
+		}
+		c.finishActiveJob(job.ID)
+	}
+	return true
 }
 
 // finishActiveJobUnlessPending atomically closes an active job only when a
@@ -375,6 +446,7 @@ func (c *Controller) finishActiveJob(id string) {
 
 func (c *Controller) clearActiveJobLocked(id string) {
 	c.activeID = ""
+	c.activeBatch = nil
 	c.activeCancel = nil
 	c.activeAttempt = 0
 	c.retryWaitActive = false
@@ -444,18 +516,71 @@ func (c *Controller) currentGateway() tgtransport.Gateway {
 	return c.gateway
 }
 
-func (c *Controller) nextJob() (model.Job, model.Channel, bool) {
+type workKind uint8
+
+const (
+	workNone workKind = iota
+	workUploadSingle
+	workStageAlbumMember
+	workSendAlbum
+)
+
+type queueWork struct {
+	kind    workKind
+	job     model.Job
+	channel model.Channel
+	groupID string
+}
+
+func (c *Controller) nextWork(supportsAlbum bool) queueWork {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	if c.paused || c.pauseRequested {
-		return model.Job{}, model.Channel{}, false
+		return queueWork{kind: workNone}
 	}
-	for _, job := range c.jobs {
-		if job.State == model.JobQueued || job.State == model.JobInterrupted {
-			return job, c.channel, true
+	var first *model.Job
+	for i := range c.jobs {
+		if c.jobs[i].State == model.JobQueued || c.jobs[i].State == model.JobInterrupted {
+			first = &c.jobs[i]
+			break
 		}
 	}
-	return model.Job{}, model.Channel{}, false
+	if first == nil {
+		return queueWork{kind: workNone}
+	}
+	if first.GroupID == "" || !supportsAlbum {
+		return queueWork{
+			kind:    workUploadSingle,
+			job:     *first,
+			channel: c.channel,
+		}
+	}
+	members := collectRunnableGroupLocked(c.jobs, first.GroupID)
+	if len(members) == 0 {
+		return queueWork{kind: workNone}
+	}
+	if len(members) == 1 && members[0].Staged == nil {
+		return queueWork{
+			kind:    workUploadSingle,
+			job:     members[0],
+			channel: c.channel,
+		}
+	}
+	for _, member := range members {
+		if member.Staged == nil {
+			return queueWork{
+				kind:    workStageAlbumMember,
+				job:     member,
+				channel: c.channel,
+				groupID: first.GroupID,
+			}
+		}
+	}
+	return queueWork{
+		kind:    workSendAlbum,
+		channel: c.channel,
+		groupID: first.GroupID,
+	}
 }
 
 func captionFromFilename(name string) string {

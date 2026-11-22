@@ -471,11 +471,11 @@ func TestAddFolderMarksDuplicatesAndSkipsThemByDefault(t *testing.T) {
 		}
 	}
 	// Index 0 is a duplicate and 99 is out of range; only index 4 is added.
-	message, err := h.service.AddCandidates(scan.Token, []int{0, 4, 4, 99}, false)
+	message, err := h.service.AddCandidates(scan.Token, []int{0, 4, 4, 99}, false, false)
 	if err != nil || message != "已添加 1 个视频" {
 		t.Fatalf("AddCandidates = %q, %v", message, err)
 	}
-	if _, err := h.service.AddCandidates(scan.Token, []int{3}, false); err == nil {
+	if _, err := h.service.AddCandidates(scan.Token, []int{3}, false, false); err == nil {
 		t.Fatal("a scan token must be single-use")
 	}
 	if got := len(h.controller.Snapshot().Jobs); got != 4 {
@@ -512,7 +512,7 @@ func TestReplacingDuplicatesRequeuesThemAsNewEntries(t *testing.T) {
 	if len(scan.Candidates) != 2 || !scan.Candidates[0].Duplicate || scan.Candidates[0].DuplicateState != string(model.JobCancelled) {
 		t.Fatalf("unexpected scan: %+v", scan.Candidates)
 	}
-	message, err := h.service.AddCandidates(scan.Token, []int{0, 1}, true)
+	message, err := h.service.AddCandidates(scan.Token, []int{0, 1}, true, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -570,7 +570,7 @@ func TestEntriesInFlightAreNeverReplaced(t *testing.T) {
 	if scan.Candidates[0].Replaceable || !scan.Candidates[1].Replaceable {
 		t.Fatalf("only the waiting entry is replaceable: %+v", scan.Candidates)
 	}
-	message, err := h.service.AddCandidates(scan.Token, []int{0, 1}, true)
+	message, err := h.service.AddCandidates(scan.Token, []int{0, 1}, true, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -927,4 +927,231 @@ func TestDueScheduleIsNotLostWhenAttemptsOverlap(t *testing.T) {
 		})
 		h.service.Shutdown(true)
 	}
+}
+
+type albumFakeClient struct {
+	*fakeClient
+	stage func(context.Context, tgtransport.UploadRequest, func(model.Progress)) (model.StagedMedia, error)
+	send  func(context.Context, model.Channel, []tgtransport.AlbumItem) ([]int, error)
+}
+
+func (c *albumFakeClient) StageVideo(ctx context.Context, req tgtransport.UploadRequest, progress func(model.Progress)) (model.StagedMedia, error) {
+	if c.stage != nil {
+		return c.stage(ctx, req, progress)
+	}
+	return model.StagedMedia{DocumentID: req.RandomID, AccessHash: 1}, nil
+}
+
+func (c *albumFakeClient) SendAlbum(ctx context.Context, ch model.Channel, items []tgtransport.AlbumItem) ([]int, error) {
+	if c.send != nil {
+		return c.send(ctx, ch, items)
+	}
+	ids := make([]int, len(items))
+	for i := range items {
+		ids[i] = 100 + i
+	}
+	return ids, nil
+}
+
+func TestAddCandidatesMergeAndJobViews(t *testing.T) {
+	t.Run("merge splits at MaxAlbumSize and skips oversize", func(t *testing.T) {
+		h := newHarness(t, nil)
+		h.connect()
+		// demo.MaxUploadBytes is 2000 MiB; write 11 normal + 1 oversize sparse MP4.
+		samples := make([]demo.Sample, 12)
+		for i := 0; i < 11; i++ {
+			samples[i] = demo.Sample{Name: fmt.Sprintf("clip-%02d.mp4", i+1), Size: 4096}
+		}
+		samples[11] = demo.Sample{Name: "clip-12-oversize.mp4", Size: demo.MaxUploadBytes + 1024}
+		folder := filepath.Join(h.root, "merge-batch")
+		if err := demo.WriteSamples(folder, samples); err != nil {
+			t.Fatal(err)
+		}
+		scan, err := h.service.ScanPaths([]string{folder})
+		if err != nil {
+			t.Fatal(err)
+		}
+		indexes := make([]int, len(scan.Candidates))
+		for i := range indexes {
+			indexes[i] = i
+		}
+		raw, err := h.call("addCandidates", map[string]any{
+			"token":             scan.Token,
+			"indexes":           indexes,
+			"replaceDuplicates": false,
+			"merge":             true,
+		})
+		if err != nil {
+			t.Fatalf("Handle(addCandidates) error = %v", err)
+		}
+		msgMap := raw.(map[string]string)
+		if msgMap["message"] != "已添加 12 个视频；合并为 1 条消息，另 1 个单独发送" {
+			t.Fatalf("message = %q", msgMap["message"])
+		}
+		h.waitForSnapshot(12)
+
+		initRaw, err := h.call("init", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		initView := initRaw.(InitView)
+		views := initView.Jobs.Upsert
+		if len(views) != 12 {
+			t.Fatalf("init returned %d views, want 12", len(views))
+		}
+		for i := 0; i < 10; i++ {
+			if views[i].GroupID == "" || views[i].GroupID != views[0].GroupID {
+				t.Fatalf("view %d GroupID = %q, want %q", i, views[i].GroupID, views[0].GroupID)
+			}
+		}
+		if views[10].GroupID != "" {
+			t.Fatalf("trailing 11th view GroupID = %q, want empty", views[10].GroupID)
+		}
+		if views[11].GroupID != "" || views[11].State != string(model.JobOversize) {
+			t.Fatalf("oversize view = %+v", views[11])
+		}
+	})
+
+	t.Run("JobView propagates Staged and clears it after SendAlbum", func(t *testing.T) {
+		root := t.TempDir()
+		paths := coreapp.Paths{
+			Root:     root,
+			Settings: filepath.Join(root, "settings.json"),
+			Queue:    filepath.Join(root, "queue.json"),
+			Session:  filepath.Join(root, "session.enc"),
+		}
+		controller := coreapp.NewController(queue.NewStore(paths.Queue), mover.New())
+		if err := controller.Load(); err != nil {
+			t.Fatal(err)
+		}
+		releaseSend := make(chan struct{})
+		sending := make(chan struct{})
+		var evMu sync.Mutex
+		var events []emitted
+		svc, err := New(Options{
+			Controller: controller,
+			Paths:      paths,
+			Secrets:    demo.NewSecrets(),
+			Host:       &fakeHost{},
+			NewClient: func(cfg tgtransport.Config, _ tgtransport.Events) (Client, error) {
+				fc := newFakeClient(cfg)
+				close(fc.ready)
+				return &albumFakeClient{
+					fakeClient: fc,
+					send: func(ctx context.Context, _ model.Channel, items []tgtransport.AlbumItem) ([]int, error) {
+						close(sending)
+						<-releaseSend
+						return []int{501, 502}, nil
+					},
+				}, nil
+			},
+			PreventSleep: func() (platform.SleepGuard, error) { return noSleep{}, nil },
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { svc.Shutdown(true) })
+		svc.SetEmitter(func(name string, payload any) {
+			evMu.Lock()
+			events = append(events, emitted{name, payload})
+			evMu.Unlock()
+		})
+		if err := svc.updateSettings(func(settings *coreapp.Settings) { settings.APIID = 42 }); err != nil {
+			t.Fatal(err)
+		}
+		svc.Start()
+
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) && svc.State().Connection.Status != "connected" {
+			time.Sleep(5 * time.Millisecond)
+		}
+		if svc.State().Connection.Status != "connected" {
+			t.Fatalf("connection status = %q", svc.State().Connection.Status)
+		}
+		if err := controller.SetChannel(demo.Channel); err != nil {
+			t.Fatal(err)
+		}
+
+		folder := filepath.Join(root, "two-videos")
+		if err := demo.WriteSamples(folder, []demo.Sample{
+			{Name: "a.mp4", Size: 4096},
+			{Name: "b.mp4", Size: 4096},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		scan, err := svc.ScanPaths([]string{folder})
+		if err != nil {
+			t.Fatal(err)
+		}
+		msg, err := svc.AddCandidates(scan.Token, []int{0, 1}, false, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if msg != "已添加 2 个视频；合并为 1 条消息" {
+			t.Fatalf("message = %q", msg)
+		}
+		if _, err := svc.Handle("init", nil); err != nil {
+			t.Fatal(err)
+		}
+		deadline = time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			svc.mu.Lock()
+			ready := svc.stats.Runnable && svc.snapshot.Channel.ID != 0 && len(svc.snapshot.Jobs) == 2
+			svc.mu.Unlock()
+			if ready {
+				break
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		if err := svc.StartUploads(); err != nil {
+			t.Fatal(err)
+		}
+		<-sending
+
+		seenStaged := false
+		deadline = time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) && !seenStaged {
+			evMu.Lock()
+			for _, ev := range events {
+				if ev.name != "jobs" {
+					continue
+				}
+				delta, ok := ev.payload.(*JobsDelta)
+				if !ok {
+					continue
+				}
+				for _, v := range delta.Upsert {
+					if v.Staged && v.GroupID != "" {
+						seenStaged = true
+					}
+				}
+			}
+			evMu.Unlock()
+			if !seenStaged {
+				time.Sleep(5 * time.Millisecond)
+			}
+		}
+		if !seenStaged {
+			t.Fatal("timed out waiting for Staged=true in JobView delta")
+		}
+
+		close(releaseSend)
+		deadline = time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			snap := controller.Snapshot()
+			if !snap.Running && snap.Jobs[0].State == model.JobSent && snap.Jobs[1].State == model.JobSent {
+				break
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		initRaw, err := svc.Handle("init", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, v := range initRaw.(InitView).Jobs.Upsert {
+			if v.Staged {
+				t.Fatalf("sent view still marked Staged: %+v", v)
+			}
+		}
+	})
 }
