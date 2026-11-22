@@ -32,18 +32,50 @@ func waitForUploadRetry(ctx context.Context, delay time.Duration) error {
 	}
 }
 
+type transferResult struct {
+	messageID int
+	staged    model.StagedMedia
+}
+
 func (c *Controller) uploadJobWithRetry(
 	ctx context.Context,
 	job model.Job,
 	channel model.Channel,
 	cancel context.CancelFunc,
 ) (int, error) {
+	result, err := c.transferJobWithRetry(ctx, job, channel, cancel, false)
+	if err != nil {
+		return 0, err
+	}
+	return result.messageID, nil
+}
+
+func (c *Controller) stageJobWithRetry(
+	ctx context.Context,
+	job model.Job,
+	channel model.Channel,
+	cancel context.CancelFunc,
+) (model.StagedMedia, error) {
+	result, err := c.transferJobWithRetry(ctx, job, channel, cancel, true)
+	if err != nil {
+		return model.StagedMedia{}, err
+	}
+	return result.staged, nil
+}
+
+func (c *Controller) transferJobWithRetry(
+	ctx context.Context,
+	job model.Job,
+	channel model.Channel,
+	cancel context.CancelFunc,
+	stage bool,
+) (transferResult, error) {
 	for retryIndex := 0; ; retryIndex++ {
 		if err := ctx.Err(); err != nil {
-			return 0, err
+			return transferResult{}, err
 		}
 		if c.queuePaused() {
-			return 0, errQueuePaused
+			return transferResult{}, errQueuePaused
 		}
 		if retryIndex == 0 && c.beforeUploadAttempt != nil {
 			c.beforeUploadAttempt(job)
@@ -54,11 +86,11 @@ func (c *Controller) uploadJobWithRetry(
 		// attempts independent of each other.
 		file, metadata, err := openVerifiedJob(job)
 		if err != nil {
-			return 0, err
+			return transferResult{}, err
 		}
 		if err := ctx.Err(); err != nil {
 			_ = file.Close()
-			return 0, err
+			return transferResult{}, err
 		}
 
 		now := time.Now()
@@ -66,7 +98,7 @@ func (c *Controller) uploadJobWithRetry(
 		if err := ctx.Err(); err != nil {
 			c.mu.Unlock()
 			_ = file.Close()
-			return 0, err
+			return transferResult{}, err
 		}
 		// Pause may have been requested after the file check. Re-check while
 		// holding the same mutex used by Pause so no new request starts between
@@ -74,13 +106,13 @@ func (c *Controller) uploadJobWithRetry(
 		if c.paused || c.pauseRequested {
 			c.mu.Unlock()
 			_ = file.Close()
-			return 0, errQueuePaused
+			return transferResult{}, errQueuePaused
 		}
 		currentIndex := findJobIndexLocked(c.jobs, job.ID)
 		if currentIndex < 0 {
 			c.mu.Unlock()
 			_ = file.Close()
-			return 0, errQueueJobNotRunnable
+			return transferResult{}, errQueueJobNotRunnable
 		}
 		current := &c.jobs[currentIndex]
 		validState := retryIndex == 0 && (current.State == model.JobQueued || current.State == model.JobInterrupted) ||
@@ -90,16 +122,16 @@ func (c *Controller) uploadJobWithRetry(
 			if currentState == model.JobCancelled {
 				c.mu.Unlock()
 				_ = file.Close()
-				return 0, errQueueJobCancelled
+				return transferResult{}, errQueueJobCancelled
 			}
 			if retryIndex == 0 {
 				c.mu.Unlock()
 				_ = file.Close()
-				return 0, errQueueJobNotRunnable
+				return transferResult{}, errQueueJobNotRunnable
 			}
 			c.mu.Unlock()
 			_ = file.Close()
-			return 0, fmt.Errorf("任务状态已变为 %s，停止上传", currentState)
+			return transferResult{}, fmt.Errorf("任务状态已变为 %s，停止上传", currentState)
 		}
 		// Continue a partial upload of this file whenever there is one.
 		resume := resumeToken(current)
@@ -125,10 +157,10 @@ func (c *Controller) uploadJobWithRetry(
 		c.queueRevision++
 		c.notifyLocked()
 		c.mu.Unlock()
-		_ = diagnostics.Logf("upload_attempt_start id=%s attempt=%d retry=%d", job.ID, attemptID, retryIndex)
+		_ = diagnostics.Logf("upload_attempt_start id=%s attempt=%d retry=%d stage=%t", job.ID, attemptID, retryIndex, stage)
 		if err := c.persist(); err != nil {
 			_ = file.Close()
-			return 0, fmt.Errorf("%w：保存上传状态失败：%v", errQueuePersistenceLost, err)
+			return transferResult{}, fmt.Errorf("%w：保存上传状态失败：%v", errQueuePersistenceLost, err)
 		}
 		// Persist can overlap a Pause or CancelAll call. Treat this locked check
 		// as the attempt's start boundary: an intent recorded before it prevents
@@ -145,18 +177,18 @@ func (c *Controller) uploadJobWithRetry(
 		c.mu.Unlock()
 		if ctxErr != nil {
 			_ = file.Close()
-			return 0, ctxErr
+			return transferResult{}, ctxErr
 		}
 		if paused {
 			_ = file.Close()
-			return 0, errQueuePaused
+			return transferResult{}, errQueuePaused
 		}
 
 		gateway := c.currentGateway()
 		if gateway == nil {
 			err = tgtransport.ErrNotConnected
 		} else {
-			messageID, uploadErr := gateway.UploadVideo(ctx, tgtransport.UploadRequest{
+			request := tgtransport.UploadRequest{
 				Channel:  channel,
 				Path:     job.Path,
 				File:     file,
@@ -171,18 +203,34 @@ func (c *Controller) uploadJobWithRetry(
 				OnRepair: func(done, total int64) {
 					c.applyRepairProgress(job.ID, attemptID, done, total)
 				},
-				BeforeSend: func() error {
-					return c.prepareSendForAttempt(job.ID, attemptID)
-				},
-			}, func(progress model.Progress) {
+			}
+			onProgress := func(progress model.Progress) {
 				c.applyProgressForAttempt(job.ID, attemptID, progress)
-			})
-			err = uploadErr
-			if err == nil {
-				// A read-only file close failure after Telegram confirmed the send
-				// must not turn a successful message into a retryable failure.
-				_ = file.Close()
-				return messageID, nil
+			}
+			if stage {
+				albumGateway, ok := gateway.(tgtransport.AlbumGateway)
+				if !ok {
+					err = errors.New("当前传输层不支持合并上传")
+				} else {
+					var staged model.StagedMedia
+					staged, err = albumGateway.StageVideo(ctx, request, onProgress)
+					if err == nil {
+						_ = file.Close()
+						return transferResult{staged: staged}, nil
+					}
+				}
+			} else {
+				request.BeforeSend = func() error {
+					return c.prepareSendForAttempt(job.ID, attemptID)
+				}
+				var messageID int
+				messageID, err = gateway.UploadVideo(ctx, request, onProgress)
+				if err == nil {
+					// A read-only file close failure after Telegram confirmed the send
+					// must not turn a successful message into a retryable failure.
+					_ = file.Close()
+					return transferResult{messageID: messageID}, nil
+				}
 			}
 		}
 		_ = file.Close()
@@ -193,13 +241,13 @@ func (c *Controller) uploadJobWithRetry(
 		c.mu.Unlock()
 
 		if !isRetryableUploadError(ctx, err) {
-			return 0, err
+			return transferResult{}, err
 		}
 		if retryIndex >= len(c.uploadRetryDelays) {
 			if len(c.uploadRetryDelays) == 0 {
-				return 0, err
+				return transferResult{}, err
 			}
-			return 0, fmt.Errorf("自动重试 %d 次后仍失败：%w", len(c.uploadRetryDelays), err)
+			return transferResult{}, fmt.Errorf("自动重试 %d 次后仍失败：%w", len(c.uploadRetryDelays), err)
 		}
 
 		delay := c.uploadRetryDelays[retryIndex]
@@ -212,7 +260,7 @@ func (c *Controller) uploadJobWithRetry(
 			err,
 		)
 		if err := c.waitBeforeUploadRetry(ctx, job.ID, err, delay, retryIndex+1); err != nil {
-			return 0, err
+			return transferResult{}, err
 		}
 	}
 }

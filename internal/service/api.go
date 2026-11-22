@@ -97,11 +97,12 @@ func (s *Service) Handle(method string, params json.RawMessage) (any, error) {
 			Token             string `json:"token"`
 			Indexes           []int  `json:"indexes"`
 			ReplaceDuplicates bool   `json:"replaceDuplicates"`
+			Merge             bool   `json:"merge"`
 		}](params)
 		if err != nil {
 			return nil, err
 		}
-		return message(s.AddCandidates(input.Token, input.Indexes, input.ReplaceDuplicates))
+		return message(s.AddCandidates(input.Token, input.Indexes, input.ReplaceDuplicates, input.Merge))
 	case "discardScan":
 		input, err := decode[struct {
 			Token string `json:"token"`

@@ -2756,18 +2756,7 @@ func testChannel() model.Channel {
 }
 
 func cloneJobs(jobs []model.Job) []model.Job {
-	copyJobs := append([]model.Job(nil), jobs...)
-	for i := range copyJobs {
-		if jobs[i].StartedAt != nil {
-			started := *jobs[i].StartedAt
-			copyJobs[i].StartedAt = &started
-		}
-		if jobs[i].CompletedAt != nil {
-			completed := *jobs[i].CompletedAt
-			copyJobs[i].CompletedAt = &completed
-		}
-	}
-	return copyJobs
+	return cloneJobsForPersistence(jobs)
 }
 
 func allJobsState(jobs []model.Job, state model.JobState) bool {

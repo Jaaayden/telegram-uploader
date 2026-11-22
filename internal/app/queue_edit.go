@@ -2,6 +2,8 @@ package app
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -47,6 +49,14 @@ func (c *Controller) Scan(folder string, maxBytes int64) error {
 	}
 }
 
+// AddResult summarizes how many candidates were added to the queue and how
+// they were grouped for sending.
+type AddResult struct {
+	Added   int
+	Groups  int
+	Singles int
+}
+
 // AddJobs appends scanned candidates to the durable queue, including while an
 // upload is active. Candidates are de-duplicated by normalized absolute path. An
 // existing path always wins, so a previously sent/failed job keeps its ID,
@@ -57,11 +67,23 @@ func (c *Controller) Scan(folder string, maxBytes int64) error {
 // new group is appended after the existing queue. Positions are rebuilt for
 // the complete queue after every successful append.
 func (c *Controller) AddJobs(candidates []model.Job) (int, error) {
+	result, err := c.addJobs(candidates, false)
+	return result.Added, err
+}
+
+// AddMergedJobs appends candidates like AddJobs, grouping newly queued videos
+// into consecutive albums of up to model.MaxAlbumSize (10) items. Oversize
+// videos and a single remaining trailing video stay ungrouped.
+func (c *Controller) AddMergedJobs(candidates []model.Job) (AddResult, error) {
+	return c.addJobs(candidates, true)
+}
+
+func (c *Controller) addJobs(candidates []model.Job, merge bool) (AddResult, error) {
 	if len(candidates) == 0 {
-		return 0, nil
+		return AddResult{}, nil
 	}
 	if !c.opMu.TryLock() {
-		return 0, errors.New("扫描或移动操作正在进行，请稍后重试")
+		return AddResult{}, errors.New("扫描或移动操作正在进行，请稍后重试")
 	}
 	defer c.opMu.Unlock()
 	for {
@@ -77,6 +99,7 @@ func (c *Controller) AddJobs(candidates []model.Job) (int, error) {
 		paths := make(map[string]struct{}, len(current)+len(candidates))
 		ids := make(map[string]struct{}, len(current)+len(candidates))
 		randomIDs := make(map[int64]struct{}, len(current)+len(candidates))
+		existingGroups := make(map[string]struct{}, len(current))
 		for _, job := range current {
 			if key := jobPathKey(job.Path); key != "" {
 				paths[key] = struct{}{}
@@ -87,45 +110,76 @@ func (c *Controller) AddJobs(candidates []model.Job) (int, error) {
 			if job.RandomID != 0 {
 				randomIDs[job.RandomID] = struct{}{}
 			}
+			if job.GroupID != "" {
+				existingGroups[job.GroupID] = struct{}{}
+			}
 		}
-		added := 0
+		var result AddResult
+		var queuedIndices []int
 		for _, candidate := range candidates {
 			if strings.TrimSpace(candidate.Path) == "" {
-				return 0, errors.New("追加任务失败：文件路径不能为空")
+				return AddResult{}, errors.New("追加任务失败：文件路径不能为空")
 			}
 			key := jobPathKey(candidate.Path)
 			if _, exists := paths[key]; exists {
 				continue
 			}
 			if strings.TrimSpace(candidate.ID) == "" {
-				return 0, fmt.Errorf("追加任务 %q 失败：Job ID 不能为空", candidate.Name)
+				return AddResult{}, fmt.Errorf("追加任务 %q 失败：Job ID 不能为空", candidate.Name)
 			}
 			if _, exists := ids[candidate.ID]; exists {
-				return 0, fmt.Errorf("追加任务 %q 失败：Job ID 重复", candidate.Name)
+				return AddResult{}, fmt.Errorf("追加任务 %q 失败：Job ID 重复", candidate.Name)
 			}
 			if candidate.RandomID == 0 {
-				return 0, fmt.Errorf("追加任务 %q 失败：Telegram RandomID 不能为空", candidate.Name)
+				return AddResult{}, fmt.Errorf("追加任务 %q 失败：Telegram RandomID 不能为空", candidate.Name)
 			}
 			if _, exists := randomIDs[candidate.RandomID]; exists {
-				return 0, fmt.Errorf("追加任务 %q 失败：Telegram RandomID 重复", candidate.Name)
+				return AddResult{}, fmt.Errorf("追加任务 %q 失败：Telegram RandomID 重复", candidate.Name)
 			}
 			if strings.TrimSpace(candidate.Name) == "" || candidate.Size < 0 {
-				return 0, errors.New("追加任务失败：文件名或大小无效")
+				return AddResult{}, errors.New("追加任务失败：文件名或大小无效")
 			}
 			if candidate.State == "" {
 				candidate.State = model.JobQueued
 			}
 			if candidate.State != model.JobQueued && candidate.State != model.JobOversize {
-				return 0, fmt.Errorf("追加任务 %q 失败：不允许的初始状态 %q", candidate.Name, candidate.State)
+				return AddResult{}, fmt.Errorf("追加任务 %q 失败：不允许的初始状态 %q", candidate.Name, candidate.State)
+			}
+			if merge {
+				candidate.GroupID = ""
+				candidate.Staged = nil
+			}
+			if candidate.State == model.JobQueued {
+				queuedIndices = append(queuedIndices, len(nextJobs))
 			}
 			nextJobs = append(nextJobs, candidate)
 			paths[key] = struct{}{}
 			ids[candidate.ID] = struct{}{}
 			randomIDs[candidate.RandomID] = struct{}{}
-			added++
+			result.Added++
 		}
-		if added == 0 {
-			return 0, nil
+		if result.Added == 0 {
+			return AddResult{}, nil
+		}
+		if merge {
+			for start := 0; start < len(queuedIndices); start += model.MaxAlbumSize {
+				end := min(start+model.MaxAlbumSize, len(queuedIndices))
+				chunk := queuedIndices[start:end]
+				if len(chunk) < 2 {
+					nextJobs[chunk[0]].GroupID = ""
+					result.Singles++
+					continue
+				}
+				groupID, err := newGroupID(existingGroups)
+				if err != nil {
+					return AddResult{}, err
+				}
+				existingGroups[groupID] = struct{}{}
+				for _, idx := range chunk {
+					nextJobs[idx].GroupID = groupID
+				}
+				result.Groups++
+			}
 		}
 		reindexJobs(nextJobs)
 		if err := c.persistCandidate(nextJobs, channel, paused, revision); err != nil {
@@ -133,10 +187,23 @@ func (c *Controller) AddJobs(candidates []model.Job) (int, error) {
 				continue
 			}
 			c.setPersistenceError(err)
-			return 0, err
+			return AddResult{}, err
 		}
 		if c.commitCandidate(nextJobs, folder, revision) {
-			return added, nil
+			return result, nil
+		}
+	}
+}
+
+func newGroupID(existing map[string]struct{}) (string, error) {
+	var raw [8]byte
+	for {
+		if _, err := rand.Read(raw[:]); err != nil {
+			return "", fmt.Errorf("生成合并组标识失败：%w", err)
+		}
+		id := "grp-" + hex.EncodeToString(raw[:])
+		if _, exists := existing[id]; !exists {
+			return id, nil
 		}
 	}
 }
@@ -176,6 +243,44 @@ func (c *Controller) requestPendingRemovalLocked(id string) context.CancelFunc {
 // selected set means every active job is selected (the ClearQueue case).
 // c.mu must be held by the caller.
 func (c *Controller) requestActiveRemovalLocked(selected map[string]struct{}) ([]string, context.CancelFunc) {
+	if len(c.activeBatch) > 0 {
+		var pending []string
+		for _, id := range c.activeBatch {
+			if id == "" {
+				continue
+			}
+			if selected != nil {
+				if _, ok := selected[id]; !ok {
+					continue
+				}
+			}
+			index := findJobIndexLocked(c.jobs, id)
+			if index < 0 {
+				continue
+			}
+			state := c.jobs[index].State
+			if !pendingRemovalEligibleState(state) && !(state == model.JobQueued && c.retryWaitActive) {
+				continue
+			}
+			if c.pendingRemoval == nil {
+				c.pendingRemoval = make(map[string]struct{})
+			}
+			c.pendingRemoval[id] = struct{}{}
+			pending = append(pending, id)
+		}
+		if len(pending) == 0 {
+			return nil, nil
+		}
+		var cancel context.CancelFunc
+		// Never interrupt an in-flight SendAlbum RPC; let the quick RPC finish
+		// and remove cleanly after its terminal state is persisted. Only cancel
+		// when waiting on retry backoff.
+		if c.retryWaitActive {
+			cancel = c.activeCancel
+		}
+		c.notifyLocked()
+		return pending, cancel
+	}
 	id := c.activeID
 	if id == "" {
 		return nil, nil
@@ -219,7 +324,7 @@ func (c *Controller) RemoveJobs(ids []string) (RemovalResult, error) {
 		folder := c.folder
 		nextJobs, removed := filteredJobs(current, func(job model.Job) bool {
 			_, selectedJob := selected[job.ID]
-			return selectedJob && isRemovableJobState(job.State) && job.ID != c.activeID
+			return selectedJob && isRemovableJobState(job.State) && !c.isActiveLocked(job.ID)
 		})
 		if removed == 0 {
 			pending, cancel := c.requestActiveRemovalLocked(selected)
@@ -275,7 +380,7 @@ func (c *Controller) ClearQueue() (RemovalResult, error) {
 		paused := c.paused
 		folder := c.folder
 		nextJobs, removed := filteredJobs(current, func(job model.Job) bool {
-			return isRemovableJobState(job.State) && job.ID != c.activeID
+			return isRemovableJobState(job.State) && !c.isActiveLocked(job.ID)
 		})
 		if removed == 0 {
 			pending, cancel := c.requestActiveRemovalLocked(nil)
@@ -377,7 +482,7 @@ func (c *Controller) ResetJobs(mode ResetMode, ids []string) (int, error) {
 		channel := c.channel
 		paused := c.paused
 		folder := c.folder
-		activeID := c.activeID
+		activeSet := c.activeIDSetLocked()
 		pendingRemoval := make(map[string]struct{}, len(c.pendingRemoval))
 		for id := range c.pendingRemoval {
 			pendingRemoval[id] = struct{}{}
@@ -388,8 +493,9 @@ func (c *Controller) ResetJobs(mode ResetMode, ids []string) (int, error) {
 		resetCount := 0
 		for i := range nextJobs {
 			job := &nextJobs[i]
+			_, isActive := activeSet[job.ID]
 			_, pending := pendingRemoval[job.ID]
-			if job.ID == activeID || pending || !matchesResetMode(*job, mode, selected) {
+			if isActive || pending || !matchesResetMode(*job, mode, selected) {
 				continue
 			}
 			job.State = model.JobQueued
@@ -520,8 +626,26 @@ func cloneJobsForPersistence(jobs []model.Job) []model.Job {
 			completed := *jobs[i].CompletedAt
 			copyJobs[i].CompletedAt = &completed
 		}
+		if jobs[i].UploadPartsAt != nil {
+			partsAt := *jobs[i].UploadPartsAt
+			copyJobs[i].UploadPartsAt = &partsAt
+		}
+		if jobs[i].Staged != nil {
+			copyJobs[i].Staged = cloneStagedMedia(jobs[i].Staged)
+		}
 	}
 	return copyJobs
+}
+
+func cloneStagedMedia(staged *model.StagedMedia) *model.StagedMedia {
+	if staged == nil {
+		return nil
+	}
+	copyStaged := *staged
+	if staged.FileReference != nil {
+		copyStaged.FileReference = append([]byte(nil), staged.FileReference...)
+	}
+	return &copyStaged
 }
 
 // commitCandidate publishes a candidate only if the revision used to persist
@@ -652,8 +776,9 @@ func (c *Controller) ApplyUploadLimit(maxBytes int64) error {
 				continue
 			}
 			if job.Size > maxBytes {
-				if job.State != model.JobOversize || job.Uploaded != 0 {
+				if job.State != model.JobOversize || job.Uploaded != 0 || job.GroupID != "" || job.Staged != nil {
 					job.State = model.JobOversize
+					job.GroupID = ""
 					resetPendingJobProgress(job)
 					changed = true
 				}
@@ -689,6 +814,7 @@ func resetPendingJobProgress(job *model.Job) {
 	job.StartedAt = nil
 	job.CompletedAt = nil
 	job.MoveDestination = ""
+	job.Staged = nil
 	clearResume(job)
 }
 
@@ -720,10 +846,20 @@ func (c *Controller) SetChannel(channel model.Channel) error {
 			c.mu.RUnlock()
 			return errors.New("上传进行中，不能切换频道")
 		}
+		prevChannel := c.channel
 		jobs := cloneJobsForPersistence(c.jobs)
 		paused := c.paused
 		revision := c.queueRevision
 		c.mu.RUnlock()
+		if channel.ID != prevChannel.ID {
+			for i := range jobs {
+				job := &jobs[i]
+				if (job.State == model.JobQueued || job.State == model.JobInterrupted) && job.Staged != nil {
+					job.Staged = nil
+					job.Uploaded = 0
+				}
+			}
+		}
 		if err := c.persistCandidate(jobs, channel, paused, revision); err != nil {
 			if errors.Is(err, errQueueChanged) {
 				continue
@@ -737,6 +873,7 @@ func (c *Controller) SetChannel(channel model.Channel) error {
 			continue
 		}
 		c.channel = channel
+		c.jobs = cloneJobsForPersistence(jobs)
 		c.queueRevision++
 		c.lastError = ""
 		c.notifyLocked()

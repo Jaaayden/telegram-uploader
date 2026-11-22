@@ -40,6 +40,10 @@ func (c *Controller) CancelJob(id string) error {
 		c.mu.Unlock()
 		return errors.New("该任务正在取消并删除")
 	}
+	if len(c.activeBatch) > 0 && c.isActiveLocked(id) {
+		c.mu.Unlock()
+		return errors.New("该任务正在合并提交中，不能单独取消")
+	}
 	if (c.jobs[index].State == model.JobUploading || c.jobs[index].State == model.JobSending) && c.activeID == id {
 		if c.activeCancel == nil {
 			c.mu.Unlock()
@@ -57,6 +61,10 @@ func (c *Controller) CancelJob(id string) error {
 		before := c.jobs[index]
 		c.jobs[index].State = model.JobCancelled
 		c.jobs[index].Error = ""
+		if c.jobs[index].Staged != nil {
+			c.jobs[index].Staged = nil
+			c.jobs[index].Uploaded = 0
+		}
 		c.queueRevision++
 		revision := c.queueRevision
 		c.notifyLocked()
@@ -75,7 +83,7 @@ func (c *Controller) CancelAll() error {
 	// before the revision-safe cancellation save below completes.
 	c.mu.RLock()
 	var cancelBeforeActive context.CancelFunc
-	if c.running && c.activeID == "" {
+	if c.running && c.activeID == "" && len(c.activeBatch) == 0 {
 		cancelBeforeActive = c.allCancel
 	}
 	c.mu.RUnlock()
@@ -96,6 +104,10 @@ func (c *Controller) CancelAll() error {
 			case model.JobQueued, model.JobInterrupted, model.JobFailed, model.JobSkipped:
 				jobs[i].State = model.JobCancelled
 				jobs[i].Error = ""
+				if jobs[i].Staged != nil {
+					jobs[i].Staged = nil
+					jobs[i].Uploaded = 0
+				}
 			}
 		}
 
@@ -149,7 +161,7 @@ func (c *Controller) Retry(id string) error {
 		c.mu.Unlock()
 		return errors.New("该任务正在取消并删除")
 	}
-	if c.jobs[index].ID == c.activeID && (c.jobs[index].State == model.JobUploading || c.jobs[index].State == model.JobSending) {
+	if c.isActiveLocked(c.jobs[index].ID) && (c.jobs[index].State == model.JobUploading || c.jobs[index].State == model.JobSending) {
 		c.mu.Unlock()
 		return errors.New("当前上传任务不能重试，请先取消")
 	}
@@ -177,10 +189,11 @@ func (c *Controller) Skip(id string) error {
 		c.mu.Unlock()
 		return errors.New("该任务正在取消并删除")
 	}
-	if index >= 0 && c.jobs[index].ID != c.activeID && (c.jobs[index].State == model.JobFailed || c.jobs[index].State == model.JobConfirming) {
+	if index >= 0 && !c.isActiveLocked(c.jobs[index].ID) && (c.jobs[index].State == model.JobFailed || c.jobs[index].State == model.JobConfirming) {
 		before := c.jobs[index]
 		c.jobs[index].State = model.JobSkipped
 		c.jobs[index].Error = ""
+		c.jobs[index].Staged = nil
 		c.queueRevision++
 		revision := c.queueRevision
 		c.notifyLocked()
@@ -205,6 +218,7 @@ func (c *Controller) MarkSent(id string) error {
 		c.jobs[index].Uploaded = c.jobs[index].Size
 		c.jobs[index].CompletedAt = &now
 		c.jobs[index].Error = ""
+		c.jobs[index].Staged = nil
 		c.queueRevision++
 		revision := c.queueRevision
 		c.notifyLocked()
