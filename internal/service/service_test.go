@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -1227,5 +1228,128 @@ func TestReorderJobsAndSetCaptionsRPC(t *testing.T) {
 	}
 	if !viewsByID[jobs[0].ID].CaptionCustom || viewsByID[jobs[0].ID].CustomCaption != "" {
 		t.Fatalf("job 0 view = %+v", viewsByID[jobs[0].ID])
+	}
+}
+
+func TestLogsAndFlexibleMoveRPC(t *testing.T) {
+	h := newHarness(t, nil)
+	h.connect()
+	if err := h.controller.SetChannel(demo.Channel); err != nil {
+		t.Fatal(err)
+	}
+
+	// Make job[0] uploadable and job[1] failed so we can verify both log panel & moveJobs.
+	dir := t.TempDir()
+	path0 := filepath.Join(dir, "ok.mp4")
+	path1 := filepath.Join(dir, "fail.mp4")
+	if err := demo.WriteSamples(dir, []demo.Sample{
+		{Name: "ok.mp4", Size: 64 * 1024},
+		{Name: "fail.mp4", Size: 64 * 1024},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	info0, _ := os.Stat(path0)
+	info1, _ := os.Stat(path1)
+	if _, err := h.controller.AddJobs([]model.Job{
+		{ID: "ok-1", Name: "ok.mp4", Path: path0, Size: info0.Size(), ModTime: info0.ModTime(), State: model.JobQueued, RandomID: 9101},
+		{ID: "fail-1", Name: "fail.mp4", Path: path1, Size: info1.Size(), ModTime: info1.ModTime(), State: model.JobQueued, RandomID: 9102},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	h.waitForSnapshot(2)
+
+	h.client(0).upload = func(ctx context.Context, req tgtransport.UploadRequest, _ func(model.Progress)) (int, error) {
+		time.Sleep(15 * time.Millisecond)
+		if req.RandomID == 9102 {
+			return 0, errors.New("simulated permanent failure")
+		}
+		if err := req.BeforeSend(); err != nil {
+			return 0, err
+		}
+		return 777, nil
+	}
+
+	if _, err := h.call("start", nil); err != nil {
+		t.Fatalf("Handle(start) error = %v", err)
+	}
+	h.eventually("ok-1 sent, fail-1 failed, and logs populated", func() bool {
+		snap := h.controller.Snapshot()
+		return !snap.Running &&
+			snap.Jobs[0].State == model.JobSent &&
+			snap.Jobs[1].State == model.JobFailed &&
+			len(h.service.LogsSnapshot()) >= 3
+	})
+
+	// init returns both job completion stats and logs.
+	initRaw, err := h.call("init", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	initView := initRaw.(InitView)
+	if len(initView.Logs) < 2 {
+		t.Fatalf("initView.Logs = %d, want >= 2", len(initView.Logs))
+	}
+	var okView JobView
+	for _, v := range initView.Jobs.Upsert {
+		if v.ID == "ok-1" {
+			okView = v
+		}
+	}
+	if okView.CompletedAt == 0 || okView.UploadElapsedMs <= 0 || okView.AvgSpeed <= 0 {
+		t.Fatalf("okView missing stats: %+v", okView)
+	}
+
+	// moveJobs on "failed" moves fail-1 to chosen destination.
+	dest := t.TempDir()
+	h.host.folder = dest
+	if _, err := h.call("moveJobs", map[string]any{"mode": "failed"}); err != nil {
+		t.Fatalf("Handle(moveJobs) error = %v", err)
+	}
+	h.eventually("fail-1 moved", func() bool {
+		snap := h.controller.Snapshot()
+		return snap.Jobs[1].State == model.JobMoved &&
+			snap.Jobs[1].Path == filepath.Join(dest, "fail.mp4") &&
+			!h.service.State().Move.Active
+	})
+
+	// deleteLog removes a single log entry.
+	beforeCount := len(h.service.LogsSnapshot())
+	firstID := h.service.LogsSnapshot()[0].ID
+	if _, err := h.call("deleteLog", map[string]any{"id": firstID}); err != nil {
+		t.Fatalf("Handle(deleteLog) error = %v", err)
+	}
+	if got := len(h.service.LogsSnapshot()); got != beforeCount-1 {
+		t.Fatalf("LogsSnapshot len = %d, want %d", got, beforeCount-1)
+	}
+
+	// setPersistLogs(false) flips SettingsView.PersistLogs and prune removes removed job's logs.
+	if _, err := h.call("setPersistLogs", map[string]any{"enabled": false}); err != nil {
+		t.Fatalf("Handle(setPersistLogs) error = %v", err)
+	}
+	stateAfter := h.service.State()
+	if stateAfter.Settings.PersistLogs {
+		t.Fatal("PersistLogs = true, want false")
+	}
+	if _, err := h.call("removeJobs", map[string]any{"ids": []string{"ok-1"}}); err != nil {
+		t.Fatalf("Handle(removeJobs) error = %v", err)
+	}
+	for _, entry := range h.service.LogsSnapshot() {
+		if entry.JobID == "ok-1" {
+			t.Fatalf("log for removed job ok-1 was not pruned in memory-only mode: %+v", entry)
+		}
+	}
+
+	// clearLogs deletes both memory logs and disk app.log.
+	logDir := filepath.Join(h.root, "logs")
+	_ = os.MkdirAll(logDir, 0o700)
+	_ = os.WriteFile(filepath.Join(logDir, "app.log"), []byte("{}\n"), 0o600)
+	if _, err := h.call("clearLogs", nil); err != nil {
+		t.Fatalf("Handle(clearLogs) error = %v", err)
+	}
+	if len(h.service.LogsSnapshot()) != 0 {
+		t.Fatalf("LogsSnapshot not empty after clearLogs: %+v", h.service.LogsSnapshot())
+	}
+	if _, err := os.Stat(filepath.Join(logDir, "app.log")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("app.log still exists after clearLogs: err=%v", err)
 	}
 }

@@ -71,10 +71,28 @@
   let groupCount = 0;
   let dragging = null;
   let dropLine = null;
+  let logs = [];
+  let logFilter = 'all';
 
   const MAX_CAPTION = 1024;
   const PINNED_STATES = new Set(['uploading', 'sending', 'confirming', 'sent', 'moving', 'moved']);
   const EDITABLE_STATES = new Set(['queued', 'interrupted', 'failed', 'cancelled', 'skipped']);
+  const MOVABLE_STATES = new Set(['oversize', 'failed', 'cancelled', 'skipped', 'interrupted', 'queued', 'sent', 'moved']);
+  const ATTENTION_MOVE_STATES = new Set(['oversize', 'failed', 'cancelled', 'skipped']);
+  const LOG_FILTERS = [
+    ['all', '全部', () => true],
+    ['sent', '已完成', (e) => e.kind === 'sent' || e.kind === 'album' || e.kind === 'moved'],
+    ['issue', '异常', (e) => e.kind === 'error' || e.kind === 'warn'],
+    ['summary', '汇总', (e) => e.kind === 'summary'],
+  ];
+  const LOG_KIND_LABEL = {
+    sent: '已上传',
+    album: '合并发送',
+    moved: '已移动',
+    warn: '提示',
+    error: '失败',
+    summary: '本轮汇总',
+  };
 
   const FILTERS = [
     ['all', '全部', () => true],
@@ -116,6 +134,25 @@
     if (delta === 0) return '今天 ' + time;
     if (delta === 1) return '明天 ' + time;
     return (date.getMonth() + 1) + ' 月 ' + date.getDate() + ' 日 ' + time;
+  }
+  function formatClockTime(ms) {
+    if (!(ms > 0)) return '';
+    const d = new Date(ms);
+    const pad = (n) => String(n).padStart(2, '0');
+    const hms = `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+    const now = new Date();
+    if (d.getFullYear() === now.getFullYear() && d.getMonth() === now.getMonth() && d.getDate() === now.getDate()) return hms;
+    return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${hms}`;
+  }
+  function formatDurationMs(ms) {
+    if (!(ms > 0)) return '';
+    if (ms < 1000) return `${Math.max(1, Math.round(ms))}ms`;
+    if (ms < 60000) return `${(ms / 1000).toFixed(1)}s`;
+    const totalSec = Math.round(ms / 1000);
+    const h = Math.floor(totalSec / 3600);
+    const m = Math.floor((totalSec % 3600) / 60);
+    const s = totalSec % 60;
+    return h > 0 ? `${h}h${m}m${s}s` : `${m}m${s}s`;
   }
   function el(tag, props, ...children) {
     const node = document.createElement(tag);
@@ -225,7 +262,7 @@
       case 'queued':
         if (job.staged) return { tone: 'accent', text: '已上传，等待同组合并发送', bar: 1, actions: withCap([['cancel', '取消']]) };
         return { tone: '', text: warn + '等待上传', actions: withCap([['cancel', '取消']]) };
-      case 'oversize': return { tone: 'warn', text: '超过 Bot 的上传上限，不会上传', actions: [] };
+      case 'oversize': return { tone: 'warn', text: '超过 Bot 的上传上限，不会上传', actions: [['move-file', '移动']] };
       case 'uploading': {
         const percent = job.size > 0 ? Math.floor((job.uploaded / job.size) * 100) : 0;
         const rate = job.speed > 0 ? ' · ' + speed(job.speed) : '';
@@ -236,12 +273,23 @@
         tone: 'warn', text: '不确定是否已送达，请到频道里确认' + (job.error ? '（' + job.error + '）' : ''),
         actions: [['mark-sent', '已送达'], ['retry-confirm', '重新上传'], ['skip', '跳过']],
       };
-      case 'sent': return { tone: 'success', text: '已发送', actions: [] };
+      case 'sent': {
+        const parts = ['已发送'];
+        if (job.completedAt > 0) parts.push(formatClockTime(job.completedAt) + ' 完成');
+        if (job.uploadElapsedMs > 0) parts.push('耗时 ' + formatDurationMs(job.uploadElapsedMs));
+        if (job.avgSpeed > 0) parts.push('均速 ' + speed(job.avgSpeed));
+        return { tone: 'success', text: parts.join(' · '), actions: [] };
+      }
       case 'cancelled': return { tone: 'muted', text: '已取消', actions: withCap([['retry', '重试']]) };
-      case 'failed': return { tone: 'danger', text: '失败' + (job.error ? '：' + job.error : ''), actions: withCap([['retry', '重试'], ['skip', '跳过']]) };
+      case 'failed': return { tone: 'danger', text: '失败' + (job.error ? '：' + job.error : ''), actions: withCap([['retry', '重试'], ['move-file', '移动'], ['skip', '跳过']]) };
       case 'skipped': return { tone: 'muted', text: '已跳过', actions: withCap([['retry', '重试']]) };
       case 'moving': return { tone: 'accent', text: '正在移动…', actions: [] };
-      case 'moved': return { tone: 'success', text: '已移动到超限文件夹', actions: [] };
+      case 'moved': {
+        const segs = (job.path || '').split(/[\\/]/).filter(Boolean);
+        const dest = segs.length >= 2 ? segs[segs.length - 2] : '';
+        const base = dest ? `已移动到 ${dest}` : '已移动到目标文件夹';
+        return { tone: 'success', text: job.completedAt > 0 ? `${base} · ${formatClockTime(job.completedAt)}` : base, actions: [] };
+      }
       case 'interrupted': {
         if (job.staged) {
           return { tone: 'warn', text: '已上传，继续时将随同组合并发送', bar: 1, actions: withCap([['cancel', '取消']]) };
@@ -280,6 +328,7 @@
     counts = Object.fromEntries(FILTERS.map(([key]) => [key, 0]));
     counts.runnable = 0; counts.oversize = 0; counts.completed = 0;
     counts.resettable = { cancelled: 0, failed: 0, skipped: 0, all: 0, selected: 0 };
+    counts.movable = { oversize: 0, failed: 0, sent: 0, attention: 0, all: 0, selected: 0 };
     const match = FILTERS.find(([key]) => key === filter)[2];
     const groups = new Map();
     groupMembers.clear();
@@ -310,6 +359,14 @@
         else counts.resettable.failed++;
         if (selected.has(id)) counts.resettable.selected++;
       }
+      if (MOVABLE_STATES.has(job.state)) {
+        counts.movable.all++;
+        if (job.state === 'oversize') counts.movable.oversize++;
+        if (job.state === 'failed') counts.movable.failed++;
+        if (job.state === 'sent') counts.movable.sent++;
+        if (ATTENTION_MOVE_STATES.has(job.state)) counts.movable.attention++;
+        if (selected.has(id)) counts.movable.selected++;
+      }
       if (match(job)) view.push(id);
     }
     groupInfo.clear();
@@ -334,6 +391,7 @@
       renderList();
       renderTransport();
       if (!$('settings').hidden) renderSettings();
+      if (!$('logPanel').hidden) renderLogs();
     });
   }
 
@@ -378,7 +436,7 @@
     else if (order.length && S.connection.status === 'connected' && !S.channel.id) { text = '还没有绑定目标频道。'; action = '绑定频道'; act = 'bind'; }
     else if (S.move.active) {
       const percent = S.move.totalBytes > 0 ? Math.floor((S.move.doneBytes / S.move.totalBytes) * 100) : 0;
-      text = `正在移动超限文件… ${bytes(S.move.doneBytes)} / ${bytes(S.move.totalBytes)}（${percent}%）`; action = '取消移动'; act = 'cancel-move';
+      text = `正在移动${S.move.label || '文件'}… ${bytes(S.move.doneBytes)} / ${bytes(S.move.totalBytes)}（${percent}%）`; action = '取消移动'; act = 'cancel-move';
     } else if (S.connection.floodWaitUntil > Date.now()) {
       text = 'Telegram 要求稍等一会儿，到 ' + clock(S.connection.floodWaitUntil) + ' 后自动继续。';
     }
@@ -413,9 +471,10 @@
     $('resetCount').hidden = counts.resettable.all === 0;
     $('resetCount').textContent = String(counts.resettable.all);
 
-    $('moveOversizeBtn').hidden = counts.oversize === 0;
-    $('moveOversizeBtn').disabled = S.queue.running || busy || counts.oversize === 0;
-    $('oversizeCount').textContent = String(counts.oversize);
+    const problemMoveCount = counts.movable.oversize + counts.movable.failed;
+    $('moveBtn').disabled = S.queue.running || busy || counts.movable.all === 0;
+    $('moveBadge').hidden = problemMoveCount === 0;
+    $('moveBadge').textContent = String(problemMoveCount);
 
     $('cleanBtn').disabled = order.length === 0 || busy;
 
@@ -434,6 +493,7 @@
         bar.querySelector(`[data-act="${act}"]`).disabled = busy || selMovable === 0;
       }
       bar.querySelector('[data-act="reset-selected"]').disabled = busy || counts.resettable.selected === 0;
+      bar.querySelector('[data-act="move-selected"]').disabled = S.queue.running || busy || counts.movable.selected === 0;
       bar.querySelector('[data-act="remove-selected"]').disabled = busy;
     }
     $('addBtn').disabled = S.scanning || busy;
@@ -532,7 +592,7 @@
     if (node.dataset.actions !== signature) {
       node.dataset.actions = signature;
       parts.actions.replaceChildren(...info.actions.map(([act, label]) =>
-        el('button', { class: 'btn small' + (act === 'cancel' || act === 'skip' || act === 'edit-caption' ? ' ghost' : ''), type: 'button', text: label, 'data-act': act })));
+        el('button', { class: 'btn small' + (act === 'cancel' || act === 'skip' || act === 'edit-caption' || act === 'move-file' ? ' ghost' : ''), type: 'button', text: label, 'data-act': act })));
     }
   }
 
@@ -610,9 +670,10 @@
     }
   }
 
-  // ---------- settings panel ----------
+  // ---------- settings panel & upload log panel ----------
   let formLoaded = false;
   function openSettings(section) {
+    $('logPanel').hidden = true;
     $('settings').hidden = false;
     $('scrim').hidden = false;
     if (!formLoaded) loadForm();
@@ -621,8 +682,72 @@
   }
   function closeSettings() {
     $('settings').hidden = true;
-    $('scrim').hidden = true;
+    if ($('logPanel').hidden) $('scrim').hidden = true;
     formLoaded = false;
+  }
+  function openLogPanel() {
+    $('settings').hidden = true;
+    formLoaded = false;
+    $('logPanel').hidden = false;
+    $('scrim').hidden = false;
+    renderLogs();
+  }
+  function closeLogPanel() {
+    $('logPanel').hidden = true;
+    if ($('settings').hidden) $('scrim').hidden = true;
+  }
+  function closeDrawers() {
+    closeSettings();
+    closeLogPanel();
+    $('scrim').hidden = true;
+  }
+  function renderLogBadge() {
+    const badge = $('logsCount');
+    badge.hidden = logs.length === 0;
+    badge.textContent = String(logs.length);
+  }
+  function renderLogs() {
+    renderLogBadge();
+    if (!S) return;
+    const persist = !!S.settings.persistLogs;
+    $('logPersistCheck').checked = persist;
+    $('logPersistHint').textContent = persist
+      ? '日志会写入本机 logs/app.log（重启后保留），可随时清除。'
+      : '当前仅在面板内存中保留，不写入磁盘 app.log；删除队列条目、关闭应用或点击清除即消失。';
+
+    const tabs = $('logFilters');
+    if (!tabs.children.length) {
+      for (const [key, label] of LOG_FILTERS) {
+        tabs.append(el('button', { class: 'tab', type: 'button', 'data-log-filter': key },
+          el('span', { text: label }), el('span', { class: 'count' })));
+      }
+    }
+    for (const tab of tabs.children) {
+      const key = tab.dataset.logFilter;
+      const pred = LOG_FILTERS.find(([k]) => k === key)[2];
+      const count = logs.filter(pred).length;
+      tab.classList.toggle('active', key === logFilter);
+      tab.lastChild.textContent = count || (key === 'all' ? '0' : '');
+    }
+
+    const activePred = LOG_FILTERS.find(([k]) => k === logFilter)[2];
+    const shown = logs.filter(activePred).slice().reverse();
+    $('logCopyBtn').disabled = shown.length === 0;
+    $('logClearBtn').disabled = logs.length === 0 && !persist;
+
+    const container = $('logList');
+    if (!shown.length) {
+      container.replaceChildren(el('div', { class: 'log-empty', text: logs.length ? '这个分类下没有日志。' : '还没有上传日志。上传或移动完成后会在这里显示时间、耗时和平均速度。' }));
+      return;
+    }
+    container.replaceChildren(...shown.map((entry) =>
+      el('div', { class: 'log-item' },
+        el('div', { class: 'log-item-head' },
+          el('span', { class: 'log-tag ' + (entry.kind || ''), text: LOG_KIND_LABEL[entry.kind] || entry.kind || '记录' }),
+          el('span', { class: 'log-time', text: formatClockTime(entry.timeMs) }),
+          entry.name ? el('span', { class: 'log-name', text: entry.name, title: entry.name }) : null,
+          el('button', { class: 'icon-btn log-del', type: 'button', title: '删除这条日志', 'aria-label': '删除这条日志', text: '✕', onclick: () => run('deleteLog', { id: entry.id }) })),
+        el('div', { class: 'log-summary', text: entry.summary }))));
   }
   function loadForm() {
     const s = S.settings;
@@ -714,6 +839,7 @@
     $('updateStatus').textContent = status;
     $('fAutoUpdate').checked = s.autoUpdateCheck;
     $('fAutoUpdate').disabled = !u.supported;
+    $('fPersistLogs').checked = !!s.persistLogs;
   }
 
   async function setLimit(kbps) {
@@ -950,6 +1076,27 @@
         el('div', { class: 'modal-foot' }, el('button', { class: 'btn', text: '关闭', onclick: () => close(null) })));
     });
     if (mode) await run('resetJobs', { mode, ids: mode === 'selected' ? [...selected] : [] });
+  }
+
+  async function moveDialog() {
+    const m = counts.movable;
+    const mode = await openModal((box, close) => {
+      const option = (label, count, value) => el('button', { class: 'menu-item', type: 'button', disabled: count === 0, onclick: () => close(value) },
+        el('span', { text: label }), el('span', { class: 'count', text: String(count) }));
+      box.append(
+        el('div', { class: 'modal-head', text: '移动视频文件到指定文件夹' }),
+        el('div', { class: 'modal-body plain' },
+          el('p', { text: '将对应条目的源文件移动到新的文件夹，并保留队列记录，不覆盖目标目录里的同名文件。' }),
+          el('div', { class: 'option-list' },
+            option('所选任务', m.selected, 'selected'),
+            option('超限的视频', m.oversize, 'oversize'),
+            option('失败的任务', m.failed, 'failed'),
+            option('需处理的任务（超限 / 失败 / 已取消 / 已跳过）', m.attention, 'attention'),
+            option('已发送的视频', m.sent, 'sent'),
+            option('全部可移动的任务', m.all, 'all'))),
+        el('div', { class: 'modal-foot' }, el('button', { class: 'btn', text: '关闭', onclick: () => close(null) })));
+    });
+    if (mode) await run('moveJobs', { mode, ids: mode === 'selected' ? [...selected] : [] });
   }
 
   async function removeSelected() {
@@ -1222,7 +1369,9 @@
       recompute();
     },
     'reset-dialog': resetDialog,
-    'move-oversize': () => run('moveOversize'),
+    'move-dialog': moveDialog,
+    'move-selected': () => run('moveJobs', { mode: 'selected', ids: order.filter((id) => selected.has(id) && MOVABLE_STATES.has((jobs.get(id) || {}).state)) }),
+    'move-oversize': () => run('moveJobs', { mode: 'oversize', ids: [] }),
     'pause-after': () => run('pause', { finishCurrent: true }),
     'edit-captions': () => captionDialog(order.filter((id) => selected.has(id))),
     'move-up': () => reorderSelected('up'),
@@ -1247,6 +1396,7 @@
   async function rowAction(act, id) {
     switch (act) {
       case 'edit-caption': return captionDialog([id]);
+      case 'move-file': return run('moveJobs', { mode: 'selected', ids: [id] });
       case 'cancel': return run('cancelJob', { id });
       case 'retry': return run('retryJob', { id });
       case 'skip': return run('skipJob', { id });
@@ -1311,6 +1461,17 @@
         break;
       case 'scan': chooseCandidates(payload); break;
       case 'confirm-quit': confirmQuit(payload); break;
+      case 'log':
+        logs.push(payload);
+        if (logs.length > 500) logs.shift();
+        renderLogBadge();
+        if (!$('logPanel').hidden) renderLogs();
+        break;
+      case 'logs-reset':
+        logs = payload || [];
+        renderLogBadge();
+        if (!$('logPanel').hidden) renderLogs();
+        break;
     }
   }
 
@@ -1349,7 +1510,31 @@
     $('connChip').onclick = () => openSettings('secConnection');
     $('settingsBtn').onclick = () => openSettings();
     $('settingsClose').onclick = closeSettings;
-    $('scrim').onclick = closeSettings;
+    $('logsPanelBtn').onclick = openLogPanel;
+    $('logPanelClose').onclick = closeLogPanel;
+    $('logOpenDirBtn').onclick = () => run('openLogs');
+    $('logCopyBtn').onclick = () => {
+      const pred = LOG_FILTERS.find(([k]) => k === logFilter)[2];
+      const text = logs.filter(pred).slice().reverse().map((e) =>
+        `[${formatClockTime(e.timeMs)}] [${LOG_KIND_LABEL[e.kind] || e.kind}]${e.name ? ' ' + e.name + ' :' : ''} ${e.summary}`).join('\n');
+      if (text) copyText(text);
+    };
+    $('logClearBtn').onclick = async () => {
+      const ok = await confirmBox({
+        title: '清除全部上传日志？',
+        body: '会立即清空当前日志面板里的所有记录，并删除本机磁盘上的 app.log 及轮转历史文件（不影响上传队列和频道消息）。',
+        ok: '清除日志', danger: true,
+      });
+      if (ok) await run('clearLogs');
+    };
+    $('logPersistCheck').onchange = () => run('setPersistLogs', { enabled: $('logPersistCheck').checked });
+    $('logFilters').addEventListener('click', (event) => {
+      const tab = event.target.closest('[data-log-filter]');
+      if (!tab) return;
+      logFilter = tab.dataset.logFilter;
+      renderLogs();
+    });
+    $('scrim').onclick = closeDrawers;
     $('updateBadge').onclick = () => openSettings('secUpdate');
     $('limitChip').onclick = () => { buildLimitMenu(); $('limitPopover').hidden = !$('limitPopover').hidden; };
     $('cleanBtn').onclick = () => { buildCleanMenu(); $('cleanMenu').hidden = !$('cleanMenu').hidden; };
@@ -1374,6 +1559,7 @@
     $('limitForm').onsubmit = submitLimit('limitInput');
     $('fProxyEnabled').onchange = () => { $('proxyFields').hidden = !$('fProxyEnabled').checked; };
     $('fAutoUpdate').onchange = () => run('setAutoUpdateCheck', { enabled: $('fAutoUpdate').checked });
+    $('fPersistLogs').onchange = () => run('setPersistLogs', { enabled: $('fPersistLogs').checked });
     $('connForm').onsubmit = async (event) => {
       event.preventDefault();
       const secret = (id) => ($(id).value.trim() ? $(id).value.trim() : null);
@@ -1519,11 +1705,11 @@
         if (dragging) { stopDrag(false); return; }
         if ($('modalRoot').children.length) return;
         if (!$('limitPopover').hidden || !$('cleanMenu').hidden || !$('addMenu').hidden) { $('limitPopover').hidden = true; $('cleanMenu').hidden = true; $('addMenu').hidden = true; }
-        else if (!$('settings').hidden) closeSettings();
+        else if (!$('settings').hidden || !$('logPanel').hidden) closeDrawers();
         else if (selected.size) { selected.clear(); recompute(); }
         return;
       }
-      if (typing || $('modalRoot').children.length || !$('settings').hidden) return;
+      if (typing || $('modalRoot').children.length || !$('settings').hidden || !$('logPanel').hidden) return;
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'a') {
         event.preventDefault();
         for (const id of view) selected.add(id);
@@ -1582,8 +1768,10 @@
       try { init = await call('init'); break; } catch { await new Promise((resolve) => setTimeout(resolve, 500)); }
     }
     S = init.state;
+    logs = init.logs || [];
     ready = true;
     applyJobs(init.jobs);
+    renderLogBadge();
     $('app').hidden = false;
     recompute();
     for (const notice of init.notices) toast('info', notice);

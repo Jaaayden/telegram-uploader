@@ -36,11 +36,15 @@ func TestStoreRoundTrip(t *testing.T) {
 			SupportsStreaming:  true,
 			TruncatedMediaData: true,
 		},
-		StartedAt:     &started,
-		CompletedAt:   &completed,
-		GroupID:       "grp-1",
-		CustomCaption: "custom caption",
-		CaptionCustom: true,
+		StartedAt:       &started,
+		CompletedAt:     &completed,
+		UploadElapsedMs: 60000,
+		AvgSpeed:        1234.5,
+		MoveDestination: "/archive/a.mp4",
+		MoveFromState:   model.JobFailed,
+		GroupID:         "grp-1",
+		CustomCaption:   "custom caption",
+		CaptionCustom:   true,
 		Staged: &model.StagedMedia{
 			DocumentID:    12345,
 			AccessHash:    67890,
@@ -305,6 +309,8 @@ func equalJobs(a, b []model.Job) bool {
 			a[i].State != b[i].State || a[i].Uploaded != b[i].Uploaded || a[i].RandomID != b[i].RandomID ||
 			a[i].MessageID != b[i].MessageID || a[i].ChannelID != b[i].ChannelID || a[i].Metadata != b[i].Metadata ||
 			a[i].Error != b[i].Error || !sameTime(a[i].StartedAt, b[i].StartedAt) || !sameTime(a[i].CompletedAt, b[i].CompletedAt) ||
+			a[i].UploadElapsedMs != b[i].UploadElapsedMs || a[i].AvgSpeed != b[i].AvgSpeed ||
+			a[i].MoveDestination != b[i].MoveDestination || a[i].MoveFromState != b[i].MoveFromState ||
 			a[i].GroupID != b[i].GroupID || !sameStaged(a[i].Staged, b[i].Staged) ||
 			a[i].CustomCaption != b[i].CustomCaption || a[i].CaptionCustom != b[i].CaptionCustom {
 			return false

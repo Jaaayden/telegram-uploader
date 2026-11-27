@@ -161,6 +161,7 @@ func (c *Controller) runQueue(ctx context.Context, cancel context.CancelFunc) {
 			c.mu.Unlock()
 		}
 		stopped := time.Now()
+		avgQueueSpeed := transferRate(stats.bytes, stats.elapsed)
 		_ = diagnostics.Logf(
 			"queue_stop finished_at=%q run_elapsed=%s sent=%d sent_bytes=%d upload_time=%s avg_speed=%s",
 			formatLocalTime(stopped),
@@ -168,8 +169,24 @@ func (c *Controller) runQueue(ctx context.Context, cancel context.CancelFunc) {
 			stats.jobs,
 			stats.bytes,
 			formatElapsed(stats.elapsed),
-			formatRate(transferRate(stats.bytes, stats.elapsed)),
+			formatRate(avgQueueSpeed),
 		)
+		if stats.jobs > 0 {
+			c.emitLog(model.LogEntry{
+				TimeMs:    stopped.UnixMilli(),
+				Kind:      "summary",
+				SentBytes: stats.bytes,
+				ElapsedMs: stats.elapsed.Milliseconds(),
+				AvgSpeed:  avgQueueSpeed,
+				Summary: fmt.Sprintf(
+					"本轮上传结束：共 %d 个视频（%s），上传耗时 %s，平均速度 %s",
+					stats.jobs,
+					formatBytesCompact(stats.bytes),
+					formatElapsed(stats.elapsed),
+					formatRate(avgQueueSpeed),
+				),
+			})
+		}
 	}()
 
 	for {
@@ -273,6 +290,8 @@ func (c *Controller) runQueue(ctx context.Context, cancel context.CancelFunc) {
 		}
 
 		completed := time.Now()
+		avgSpeed := transferRate(sentBytes, jobElapsed)
+		elapsedMs := jobElapsed.Milliseconds()
 		stats.add(sentBytes, jobElapsed)
 		_ = diagnostics.Logf(
 			"job_sent id=%s name=%q message_id=%d size=%d sent_bytes=%d finished_at=%q elapsed=%s avg_speed=%s",
@@ -283,8 +302,23 @@ func (c *Controller) runQueue(ctx context.Context, cancel context.CancelFunc) {
 			sentBytes,
 			formatLocalTime(completed),
 			formatElapsed(jobElapsed),
-			formatRate(transferRate(sentBytes, jobElapsed)),
+			formatRate(avgSpeed),
 		)
+		c.emitLog(model.LogEntry{
+			TimeMs:    completed.UnixMilli(),
+			Kind:      "sent",
+			JobID:     job.ID,
+			Name:      job.Name,
+			Size:      job.Size,
+			SentBytes: sentBytes,
+			ElapsedMs: elapsedMs,
+			AvgSpeed:  avgSpeed,
+			Summary: fmt.Sprintf(
+				"上传完成 · 耗时 %s · 均速 %s",
+				formatElapsed(jobElapsed),
+				formatRate(avgSpeed),
+			),
+		})
 		c.mu.Lock()
 		current := findJobIndexLocked(c.jobs, job.ID)
 		if current < 0 {
@@ -296,6 +330,8 @@ func (c *Controller) runQueue(ctx context.Context, cancel context.CancelFunc) {
 		c.jobs[current].MessageID = messageID
 		c.jobs[current].ChannelID = channel.ID
 		c.jobs[current].CompletedAt = &completed
+		c.jobs[current].UploadElapsedMs = elapsedMs
+		c.jobs[current].AvgSpeed = avgSpeed
 		c.jobs[current].Error = ""
 		c.jobs[current].Staged = nil
 		clearResume(&c.jobs[current])
@@ -359,6 +395,15 @@ func (c *Controller) handleTransferAttemptError(
 		if persistErr := c.persist(); persistErr != nil {
 			c.setPersistenceError(persistErr)
 		}
+		c.emitLog(model.LogEntry{
+			TimeMs:    time.Now().UnixMilli(),
+			Kind:      "warn",
+			JobID:     job.ID,
+			Name:      job.Name,
+			Size:      job.Size,
+			ElapsedMs: jobElapsed.Milliseconds(),
+			Summary:   "提交结果不确定，请先检查频道（耗时 " + formatElapsed(jobElapsed) + "）",
+		})
 		return false
 	}
 	if errors.Is(err, errQueuePaused) {
@@ -400,8 +445,30 @@ func (c *Controller) handleTransferAttemptError(
 			}
 			c.finishActiveJob(job.ID)
 		}
+		warnText := "已暂停/中断（耗时 " + formatElapsed(jobElapsed) + "）"
+		if cancelCurrent || cancelAll {
+			warnText = "已取消（耗时 " + formatElapsed(jobElapsed) + "）"
+		}
+		c.emitLog(model.LogEntry{
+			TimeMs:    time.Now().UnixMilli(),
+			Kind:      "warn",
+			JobID:     job.ID,
+			Name:      job.Name,
+			Size:      job.Size,
+			ElapsedMs: jobElapsed.Milliseconds(),
+			Summary:   warnText,
+		})
 		return ctx.Err() == nil
 	}
+	c.emitLog(model.LogEntry{
+		TimeMs:    time.Now().UnixMilli(),
+		Kind:      "error",
+		JobID:     job.ID,
+		Name:      job.Name,
+		Size:      job.Size,
+		ElapsedMs: jobElapsed.Milliseconds(),
+		Summary:   "上传失败（耗时 " + formatElapsed(jobElapsed) + "）：" + err.Error(),
+	})
 	if persistErr := c.failJob(job.ID, err); persistErr != nil {
 		c.clearPendingRemoval(job.ID)
 		c.finishActiveJob(job.ID)

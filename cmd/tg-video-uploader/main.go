@@ -88,7 +88,10 @@ func run(opts options) int {
 	if err != nil {
 		return fatal("初始化应用目录失败", err)
 	}
-	session, diagnosticErr := diagnostics.Start(paths.Root)
+	initialSettings, _ := coreapp.LoadSettings(paths.Settings)
+	session, diagnosticErr := diagnostics.StartWithOptions(paths.Root, diagnostics.Options{
+		DisableAppLog: initialSettings.DisableLogPersistence,
+	})
 	if diagnosticErr != nil {
 		// Diagnostics must never become a startup dependency.
 		fmt.Fprintln(os.Stderr, "初始化诊断日志失败：", diagnosticErr)

@@ -380,3 +380,94 @@ func readState(t *testing.T, path string) runState {
 	}
 	return state
 }
+
+func TestStartWithDisableAppLogDoesNotCreateAppLog(t *testing.T) {
+	session, err := StartWithOptions(t.TempDir(), Options{DisableAppLog: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := Logf("should not persist to disk"); err != nil {
+		t.Fatalf("Logf() error = %v", err)
+	}
+	if err := session.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(session.AppLogPath()); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("app.log exists despite DisableAppLog=true, err=%v", err)
+	}
+}
+
+func TestSetAppLogEnabledTogglesDiskWrites(t *testing.T) {
+	session, err := StartWithOptions(t.TempDir(), Options{DisableAppLog: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = session.Close() }()
+
+	if err := session.Logf("suppressed-1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(session.AppLogPath()); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("app.log should not exist yet, err=%v", err)
+	}
+
+	if err := session.SetAppLogEnabled(true); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.Logf("persisted-line"); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.SetAppLogEnabled(false); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.Logf("suppressed-2"); err != nil {
+		t.Fatal(err)
+	}
+
+	data, err := os.ReadFile(session.AppLogPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	if !strings.Contains(text, "persisted-line") {
+		t.Fatalf("persisted-line missing from app.log: %s", text)
+	}
+	if strings.Contains(text, "suppressed-1") || strings.Contains(text, "suppressed-2") {
+		t.Fatalf("suppressed records leaked into app.log: %s", text)
+	}
+}
+
+func TestClearAppLogsRemovesActiveAndRotatedFiles(t *testing.T) {
+	session, err := Start(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = session.Close() }()
+
+	if err := session.Logf("before-clear"); err != nil {
+		t.Fatal(err)
+	}
+	backup1 := session.AppLogPath() + ".1"
+	if err := os.WriteFile(backup1, []byte("rotated\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.ClearAppLogs(); err != nil {
+		t.Fatalf("ClearAppLogs() error = %v", err)
+	}
+	for _, path := range []string{session.AppLogPath(), backup1} {
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("%s still exists after ClearAppLogs(), err=%v", path, err)
+		}
+	}
+	if err := session.Logf("after-clear"); err != nil {
+		t.Fatalf("Logf() after clear error = %v", err)
+	}
+	data, err := os.ReadFile(session.AppLogPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	if strings.Contains(text, "before-clear") || !strings.Contains(text, "after-clear") {
+		t.Fatalf("unexpected app.log content after clear: %s", text)
+	}
+}

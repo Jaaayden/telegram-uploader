@@ -155,6 +155,10 @@ func (c *Controller) runSendAlbum(
 		if err == nil {
 			completed := time.Now()
 			share := sendElapsed / time.Duration(len(batchIDs))
+			memberStats := make(map[string]struct {
+				elapsedMs int64
+				avgSpeed  float64
+			}, len(members))
 			for i, member := range members {
 				msgID := 0
 				if i < len(messageIDs) {
@@ -167,6 +171,12 @@ func (c *Controller) runSendAlbum(
 					jobElapsed = metric.elapsed + share
 					delete(stagedMetrics, member.ID)
 				}
+				avgSpeed := transferRate(sentBytes, jobElapsed)
+				elapsedMs := jobElapsed.Milliseconds()
+				memberStats[member.ID] = struct {
+					elapsedMs int64
+					avgSpeed  float64
+				}{elapsedMs: elapsedMs, avgSpeed: avgSpeed}
 				stats.add(sentBytes, jobElapsed)
 				_ = diagnostics.Logf(
 					"job_sent id=%s name=%q message_id=%d size=%d sent_bytes=%d finished_at=%q elapsed=%s avg_speed=%s",
@@ -177,10 +187,32 @@ func (c *Controller) runSendAlbum(
 					sentBytes,
 					formatLocalTime(completed),
 					formatElapsed(jobElapsed),
-					formatRate(transferRate(sentBytes, jobElapsed)),
+					formatRate(avgSpeed),
 				)
+				c.emitLog(model.LogEntry{
+					TimeMs:    completed.UnixMilli(),
+					Kind:      "sent",
+					JobID:     member.ID,
+					Name:      member.Name,
+					Size:      member.Size,
+					SentBytes: sentBytes,
+					ElapsedMs: elapsedMs,
+					AvgSpeed:  avgSpeed,
+					Summary: fmt.Sprintf(
+						"合并成员上传完成 · 耗时 %s · 均速 %s",
+						formatElapsed(jobElapsed),
+						formatRate(avgSpeed),
+					),
+				})
 			}
 			_ = diagnostics.Logf("album_sent group=%s count=%d elapsed=%s", groupID, len(batchIDs), formatElapsed(sendElapsed))
+			c.emitLog(model.LogEntry{
+				TimeMs:    completed.UnixMilli(),
+				Kind:      "album",
+				Name:      members[0].Name,
+				ElapsedMs: sendElapsed.Milliseconds(),
+				Summary:   fmt.Sprintf("合并发送成功：共 %d 个视频（提交耗时 %s）", len(batchIDs), formatElapsed(sendElapsed)),
+			})
 
 			c.mu.Lock()
 			for i, id := range batchIDs {
@@ -192,12 +224,15 @@ func (c *Controller) runSendAlbum(
 				if i < len(messageIDs) {
 					msgID = messageIDs[i]
 				}
+				ms := memberStats[id]
 				c.jobs[idx].State = model.JobSent
 				c.jobs[idx].Uploaded = c.jobs[idx].Size
 				c.jobs[idx].BytesPerSecond = 0
 				c.jobs[idx].MessageID = msgID
 				c.jobs[idx].ChannelID = channel.ID
 				c.jobs[idx].CompletedAt = &completed
+				c.jobs[idx].UploadElapsedMs = ms.elapsedMs
+				c.jobs[idx].AvgSpeed = ms.avgSpeed
 				c.jobs[idx].Error = ""
 				c.jobs[idx].Note = ""
 				c.jobs[idx].Staged = nil
@@ -247,6 +282,13 @@ func (c *Controller) runSendAlbum(
 			if persistErr := c.persist(); persistErr != nil {
 				c.setPersistenceError(persistErr)
 			}
+			c.emitLog(model.LogEntry{
+				TimeMs:    time.Now().UnixMilli(),
+				Kind:      "warn",
+				Name:      members[0].Name,
+				ElapsedMs: sendElapsed.Milliseconds(),
+				Summary:   fmt.Sprintf("合并消息（%d 个视频）提交结果不确定，请先检查频道", len(batchIDs)),
+			})
 			return false
 		}
 
@@ -374,11 +416,15 @@ func (c *Controller) runSendAlbum(
 }
 
 func (c *Controller) revertBatchBeforeSubmit(batchIDs []string, cancelAll, paused, ctxCancelled bool) {
+	var firstName string
 	c.mu.Lock()
 	for _, id := range batchIDs {
 		idx := findJobIndexLocked(c.jobs, id)
 		if idx < 0 {
 			continue
+		}
+		if firstName == "" {
+			firstName = c.jobs[idx].Name
 		}
 		c.jobs[idx].Note = ""
 		c.jobs[idx].BytesPerSecond = 0
@@ -403,6 +449,18 @@ func (c *Controller) revertBatchBeforeSubmit(batchIDs []string, cancelAll, pause
 	c.queueRevision++
 	c.notifyLocked()
 	c.mu.Unlock()
+	if cancelAll || ctxCancelled {
+		summary := fmt.Sprintf("合并消息（%d 个视频）已暂停/中断", len(batchIDs))
+		if cancelAll {
+			summary = fmt.Sprintf("合并消息（%d 个视频）已取消", len(batchIDs))
+		}
+		c.emitLog(model.LogEntry{
+			TimeMs:  time.Now().UnixMilli(),
+			Kind:    "warn",
+			Name:    firstName,
+			Summary: summary,
+		})
+	}
 	if persistErr := c.persist(); persistErr != nil {
 		c.clearPendingRemovalsForIDs(batchIDs)
 		c.finishActiveBatch()
@@ -479,11 +537,17 @@ func (c *Controller) waitBeforeAlbumRetry(
 }
 
 func (c *Controller) failAlbumBatchAndContinue(batchIDs []string, err error) bool {
+	var firstName string
+	wasCancelAll := false
 	c.mu.Lock()
+	wasCancelAll = c.cancelAllRequested
 	for _, id := range batchIDs {
 		idx := findJobIndexLocked(c.jobs, id)
 		if idx < 0 {
 			continue
+		}
+		if firstName == "" {
+			firstName = c.jobs[idx].Name
 		}
 		cancelled := c.jobs[idx].State == model.JobCancelled || c.cancelAllRequested
 		if cancelled {
@@ -506,6 +570,21 @@ func (c *Controller) failAlbumBatchAndContinue(batchIDs []string, err error) boo
 	c.queueRevision++
 	c.notifyLocked()
 	c.mu.Unlock()
+	if wasCancelAll {
+		c.emitLog(model.LogEntry{
+			TimeMs:  time.Now().UnixMilli(),
+			Kind:    "warn",
+			Name:    firstName,
+			Summary: fmt.Sprintf("合并消息（%d 个视频）已取消", len(batchIDs)),
+		})
+	} else {
+		c.emitLog(model.LogEntry{
+			TimeMs:  time.Now().UnixMilli(),
+			Kind:    "error",
+			Name:    firstName,
+			Summary: fmt.Sprintf("合并发送失败（%d 个视频）：%v", len(batchIDs), err),
+		})
+	}
 	if persistErr := c.persist(); persistErr != nil {
 		c.clearPendingRemovalsForIDs(batchIDs)
 		c.finishActiveBatch()

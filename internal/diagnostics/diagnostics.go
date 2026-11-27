@@ -43,6 +43,11 @@ var (
 	ErrAlreadyStarted = errors.New("diagnostics: another session is already active")
 )
 
+// Options configures optional diagnostics session behavior.
+type Options struct {
+	DisableAppLog bool
+}
+
 // Session represents one process run.  A session owns the app log and the
 // run-specific crash file until Close is called.
 type Session struct {
@@ -56,6 +61,7 @@ type Session struct {
 	metadata  runMetadata
 
 	previousRunUnclean bool
+	appLogDisabled     bool
 	logger             *rotatingLogger
 	crash              *os.File
 
@@ -107,6 +113,12 @@ var (
 // The active app log is root/logs/app.log.  The crash output is written to a
 // unique root/logs/crash-<run-id>.log file for this run.
 func Start(root string) (*Session, error) {
+	return StartWithOptions(root, Options{})
+}
+
+// StartWithOptions creates the diagnostics directory below root and starts a
+// new run with the provided options.
+func StartWithOptions(root string, opts Options) (*Session, error) {
 	if strings.TrimSpace(root) == "" {
 		return nil, errors.New("diagnostics: root directory is empty")
 	}
@@ -139,20 +151,27 @@ func Start(root string) (*Session, error) {
 		PID:     os.Getpid(),
 	}
 
-	logger, err := newRotatingLogger(filepath.Join(logsDir, "app.log"))
-	if err != nil {
-		return nil, fmt.Errorf("diagnostics: open app log: %w", err)
+	var logger *rotatingLogger
+	if !opts.DisableAppLog {
+		logger, err = newRotatingLogger(filepath.Join(logsDir, "app.log"))
+		if err != nil {
+			return nil, fmt.Errorf("diagnostics: open app log: %w", err)
+		}
 	}
 
 	crashPath := filepath.Join(logsDir, "crash-"+runID+".log")
 	crash, err := os.OpenFile(crashPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
-		_ = logger.Close()
+		if logger != nil {
+			_ = logger.Close()
+		}
 		return nil, fmt.Errorf("diagnostics: create crash log: %w", err)
 	}
 	if err := protectFile(crashPath); err != nil {
 		_ = crash.Close()
-		_ = logger.Close()
+		if logger != nil {
+			_ = logger.Close()
+		}
 		_ = os.Remove(crashPath)
 		return nil, fmt.Errorf("diagnostics: protect crash log: %w", err)
 	}
@@ -167,13 +186,16 @@ func Start(root string) (*Session, error) {
 		started:            started,
 		metadata:           metadata,
 		previousRunUnclean: previousUnclean,
+		appLogDisabled:     opts.DisableAppLog,
 		logger:             logger,
 		crash:              crash,
 	}
 
 	if err := activate(session); err != nil {
 		_ = crash.Close()
-		_ = logger.Close()
+		if logger != nil {
+			_ = logger.Close()
+		}
 		_ = os.Remove(crashPath)
 		return nil, fmt.Errorf("diagnostics: install crash output: %w", err)
 	}
@@ -198,14 +220,18 @@ func Start(root string) (*Session, error) {
 	if err != nil {
 		_, _ = deactivate(session)
 		_ = crash.Close()
-		_ = logger.Close()
+		if logger != nil {
+			_ = logger.Close()
+		}
 		_ = os.Remove(crashPath)
 		return nil, fmt.Errorf("diagnostics: write run-start record: %w", err)
 	}
 	if err := writeRunState(statePath, runStateFor(session, false, time.Time{})); err != nil {
 		_, _ = deactivate(session)
 		_ = crash.Close()
-		_ = logger.Close()
+		if logger != nil {
+			_ = logger.Close()
+		}
 		_ = os.Remove(crashPath)
 		return nil, fmt.Errorf("diagnostics: write run state: %w", err)
 	}
@@ -371,6 +397,90 @@ func LogError(err error, format string, args ...any) error {
 	return s.LogError(err, format, args...)
 }
 
+// SetAppLogEnabled enables or disables writing records to app.log for this session.
+func (s *Session) SetAppLogEnabled(enabled bool) error {
+	if s == nil {
+		return ErrNotStarted
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return ErrClosed
+	}
+	s.appLogDisabled = !enabled
+	if !enabled && s.logger != nil {
+		err := s.logger.Close()
+		s.logger = nil
+		return err
+	}
+	return nil
+}
+
+// SetAppLogEnabled enables or disables writing records to app.log on the active session.
+func SetAppLogEnabled(enabled bool) error {
+	s := currentSession()
+	if s == nil {
+		return ErrNotStarted
+	}
+	return s.SetAppLogEnabled(enabled)
+}
+
+// ClearAppLogs closes any open app.log handle and removes app.log and its
+// rotated backups from disk.
+func (s *Session) ClearAppLogs() error {
+	if s == nil {
+		return ErrNotStarted
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return ErrClosed
+	}
+	var errs []error
+	if s.logger != nil {
+		if err := s.logger.Close(); err != nil {
+			errs = append(errs, err)
+		}
+		s.logger = nil
+	}
+	if err := removeAppLogFiles(s.appLog); err != nil {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
+}
+
+// ClearAppLogs deletes app.log and its rotated backups for the active session.
+func ClearAppLogs() error {
+	s := currentSession()
+	if s == nil {
+		return ErrNotStarted
+	}
+	return s.ClearAppLogs()
+}
+
+// ClearAppLogsInDir deletes app.log and rotated backups from logsDir when no
+// session handle is managing them directly.
+func ClearAppLogsInDir(logsDir string) error {
+	if strings.TrimSpace(logsDir) == "" {
+		return nil
+	}
+	return removeAppLogFiles(filepath.Join(logsDir, "app.log"))
+}
+
+func removeAppLogFiles(appLogPath string) error {
+	var errs []error
+	for i := 0; i <= MaxLogBackups; i++ {
+		path := appLogPath
+		if i > 0 {
+			path = fmt.Sprintf("%s.%d", appLogPath, i)
+		}
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
 // PreviousRunUnclean reports the active session's startup finding. It returns
 // false when diagnostics could not be started, keeping this optional feature
 // from affecting application control flow.
@@ -405,6 +515,16 @@ func (s *Session) messageRecord(level, message string) logRecord {
 }
 
 func (s *Session) writeRecordLocked(record logRecord) error {
+	if s.appLogDisabled {
+		return nil
+	}
+	if s.logger == nil {
+		logger, err := newRotatingLogger(s.appLog)
+		if err != nil {
+			return err
+		}
+		s.logger = logger
+	}
 	data, err := json.Marshal(record)
 	if err != nil {
 		return err

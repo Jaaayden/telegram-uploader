@@ -813,7 +813,10 @@ func resetPendingJobProgress(job *model.Job) {
 	job.Error = ""
 	job.StartedAt = nil
 	job.CompletedAt = nil
+	job.UploadElapsedMs = 0
+	job.AvgSpeed = 0
 	job.MoveDestination = ""
+	job.MoveFromState = ""
 	job.Staged = nil
 	clearResume(job)
 }
