@@ -1256,6 +1256,7 @@ func TestLogsAndFlexibleMoveRPC(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	h.waitForSnapshot(2)
 
 	h.client(0).upload = func(ctx context.Context, req tgtransport.UploadRequest, _ func(model.Progress)) (int, error) {
 		time.Sleep(15 * time.Millisecond)
@@ -1306,7 +1307,9 @@ func TestLogsAndFlexibleMoveRPC(t *testing.T) {
 	}
 	h.eventually("fail-1 moved", func() bool {
 		snap := h.controller.Snapshot()
-		return snap.Jobs[1].State == model.JobMoved && snap.Jobs[1].Path == filepath.Join(dest, "fail.mp4")
+		return snap.Jobs[1].State == model.JobMoved &&
+			snap.Jobs[1].Path == filepath.Join(dest, "fail.mp4") &&
+			!h.service.State().Move.Active
 	})
 
 	// deleteLog removes a single log entry.
