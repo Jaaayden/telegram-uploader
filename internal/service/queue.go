@@ -421,6 +421,9 @@ func (s *Service) RemoveJobs(ids []string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	if s.settingsCopy().DisableLogPersistence {
+		s.pruneLogsForRemovedJobs()
+	}
 	current := s.controller.Snapshot()
 	existing := make(map[string]struct{}, len(current.Jobs))
 	for index := range current.Jobs {
@@ -459,6 +462,9 @@ func (s *Service) RemoveCompleted() (string, error) {
 	if err != nil {
 		return "", err
 	}
+	if s.settingsCopy().DisableLogPersistence {
+		s.pruneLogsForRemovedJobs()
+	}
 	return fmt.Sprintf("已删除 %d 个已完成的条目", result.Removed), nil
 }
 
@@ -467,6 +473,9 @@ func (s *Service) ClearQueue() (string, error) {
 	result, err := s.controller.ClearQueue()
 	if err != nil {
 		return "", err
+	}
+	if s.settingsCopy().DisableLogPersistence {
+		s.pruneLogsForRemovedJobs()
 	}
 	current := s.controller.Snapshot()
 	pending := make(map[string]struct{}, len(result.PendingRemovalIDs))
@@ -547,6 +556,46 @@ func (s *Service) SetCaptions(edits []coreapp.CaptionEdit) (string, error) {
 // MoveOversize lets the user choose a destination and moves every oversize
 // file there in the background. Progress is reported through the state.
 func (s *Service) MoveOversize() error {
+	return s.MoveJobs("oversize", nil)
+}
+
+// MoveJobs lets the user choose a destination folder and moves every matching
+// movable file there in the background.
+func (s *Service) MoveJobs(mode string, ids []string) error {
+	var (
+		moveMode   coreapp.MoveMode
+		pickerText string
+		label      string
+	)
+	switch mode {
+	case "selected":
+		moveMode = coreapp.MoveSelected
+		pickerText = "选择存放所选视频的文件夹"
+		label = "所选文件"
+	case "oversize", "":
+		moveMode = coreapp.MoveOversize
+		pickerText = "选择存放超限视频的文件夹"
+		label = "超限文件"
+	case "failed":
+		moveMode = coreapp.MoveFailed
+		pickerText = "选择存放失败视频的文件夹"
+		label = "失败文件"
+	case "sent":
+		moveMode = coreapp.MoveSent
+		pickerText = "选择存放已发送视频的文件夹"
+		label = "已发送文件"
+	case "attention":
+		moveMode = coreapp.MoveAttention
+		pickerText = "选择存放待处理视频的文件夹"
+		label = "待处理文件"
+	case "all":
+		moveMode = coreapp.MoveAllMovable
+		pickerText = "选择移动视频的目标文件夹"
+		label = "视频文件"
+	default:
+		return errors.New("不支持的移动方式")
+	}
+
 	s.mu.Lock()
 	if s.moveActive {
 		s.mu.Unlock()
@@ -554,11 +603,11 @@ func (s *Service) MoveOversize() error {
 	}
 	if s.snapshot.Running {
 		s.mu.Unlock()
-		return errors.New("上传进行中，不能移动超限文件")
+		return errors.New("上传进行中，不能移动文件")
 	}
 	s.mu.Unlock()
 
-	destination, err := s.host.PickFolder("选择存放超限视频的文件夹")
+	destination, err := s.host.PickFolder(pickerText)
 	if err != nil {
 		return err
 	}
@@ -577,13 +626,14 @@ func (s *Service) MoveOversize() error {
 	s.moveActive = true
 	s.moveCancel = cancel
 	s.moveDone, s.moveTotal = 0, 0
+	s.moveLabel = label
 	s.workers.Add(1)
 	s.mu.Unlock()
 	s.invalidate()
 
 	go func() {
 		defer s.workers.Done()
-		err := s.controller.MoveOversize(ctx, destination, func(progress model.Progress) {
+		moved, err := s.controller.MoveJobs(ctx, moveMode, ids, destination, func(progress model.Progress) {
 			s.mu.Lock()
 			s.moveDone, s.moveTotal = progress.BytesDone, progress.BytesTotal
 			s.mu.Unlock()
@@ -594,12 +644,17 @@ func (s *Service) MoveOversize() error {
 		s.mu.Lock()
 		s.moveActive = false
 		s.moveCancel = nil
+		s.moveLabel = ""
 		s.mu.Unlock()
 		switch {
 		case err == nil:
-			s.toast("success", "超限文件已全部移动")
+			s.toast("success", fmt.Sprintf("已移动 %d 个%s", moved, label))
 		case errors.Is(err, context.Canceled):
-			s.toast("info", "文件移动已取消")
+			if moved > 0 {
+				s.toast("info", fmt.Sprintf("文件移动已取消（已移动 %d 个）", moved))
+			} else {
+				s.toast("info", "文件移动已取消")
+			}
 		default:
 			s.toast("error", "移动失败："+err.Error())
 		}

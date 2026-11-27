@@ -132,6 +132,7 @@ type Controller struct {
 	// beforeUploadAttempt is a deterministic test seam for the narrow interval
 	// after queue selection and before the job is reserved as active.
 	beforeUploadAttempt func(model.Job)
+	logSink             func(model.LogEntry)
 }
 
 var defaultUploadRetryDelays = []time.Duration{
@@ -169,6 +170,23 @@ func (c *Controller) SetGateway(gateway tgtransport.Gateway) {
 	c.mu.Lock()
 	c.gateway = gateway
 	c.mu.Unlock()
+}
+
+// SetLogSink registers a listener invoked whenever an upload, error, move, or
+// queue summary produces a user-facing activity log entry.
+func (c *Controller) SetLogSink(sink func(model.LogEntry)) {
+	c.mu.Lock()
+	c.logSink = sink
+	c.mu.Unlock()
+}
+
+func (c *Controller) emitLog(entry model.LogEntry) {
+	c.mu.RLock()
+	sink := c.logSink
+	c.mu.RUnlock()
+	if sink != nil {
+		sink(entry)
+	}
 }
 
 func (c *Controller) Updates() <-chan Snapshot { return c.updates }
@@ -268,26 +286,35 @@ func reconcileMovingJobs(jobs []model.Job) bool {
 			continue
 		}
 		changed = true
+		restoreState := job.MoveFromState
+		if restoreState == "" {
+			restoreState = model.JobOversize
+		}
 		sourceExists, sourceErr := regularFileExists(job.Path)
 		destinationExists, destinationErr := regularFileExists(job.MoveDestination)
 		switch {
 		case sourceErr != nil || destinationErr != nil:
 			job.State = model.JobFailed
+			job.MoveFromState = ""
 			job.Error = "恢复上次文件移动时无法检查源文件或目标文件"
 		case sourceExists && !destinationExists:
-			job.State = model.JobOversize
+			job.State = restoreState
 			job.MoveDestination = ""
+			job.MoveFromState = ""
 			job.Error = "上次移动在完成前中断，源文件仍然安全保留"
 		case !sourceExists && destinationExists:
 			job.State = model.JobMoved
 			job.Path = job.MoveDestination
 			job.MoveDestination = ""
+			job.MoveFromState = ""
 			job.Error = ""
 		case sourceExists && destinationExists:
-			job.State = model.JobOversize
+			job.State = restoreState
+			job.MoveFromState = ""
 			job.Error = "上次移动中断后源文件和目标文件都存在；未自动删除任何一份"
 		default:
 			job.State = model.JobFailed
+			job.MoveFromState = ""
 			job.Error = "上次移动中断，源文件和目标文件都不存在"
 		}
 	}

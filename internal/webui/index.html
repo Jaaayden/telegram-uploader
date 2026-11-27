@@ -46,6 +46,7 @@ window.addEventListener('error', function (event) {
         </div>
       </div>
       <button id="updateBadge" class="chip accent" type="button" hidden></button>
+      <button id="logsPanelBtn" class="btn ghost" type="button" title="查看上传日志">日志 <span id="logsCount" class="count" hidden></span></button>
       <button id="settingsBtn" class="btn ghost" type="button">
         <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M8.3 2h3.4l.5 2.2c.5.2.9.4 1.300.7l2.100-.7 1.700 3-1.600 1.500a6 6 0 0 1 0 1.500l1.600 1.500-1.700 3-2.100-.7c-.4.3-.8.5-1.300.7l-.5 2.200H8.300l-.5-2.200a6 6 0 0 1-1.300-.7l-2.100.7-1.700-3 1.600-1.500a6 6 0 0 1 0-1.500L2.700 7.200l1.700-3 2.100.7c.4-.3.8-.5 1.300-.7L8.300 2Zm1.700 5.500a2.500 2.500 0 1 0 0 5 2.500 2.500 0 0 0 0-5Z"/></svg>
         设置
@@ -64,7 +65,7 @@ window.addEventListener('error', function (event) {
       <div class="toolbar-right">
         <button id="selectAllBtn" class="btn ghost" type="button" data-act="toggle-select-all">全选</button>
         <button id="resetBtn" class="btn ghost" type="button" data-act="reset-dialog">重置任务 <span id="resetCount" class="count" hidden></span></button>
-        <button id="moveOversizeBtn" class="btn ghost" type="button" data-act="move-oversize" hidden>移动超限 <span id="oversizeCount" class="count"></span></button>
+        <button id="moveBtn" class="btn ghost" type="button" data-act="move-dialog">移动文件 <span id="moveBadge" class="count" hidden></span></button>
         <div class="popover-anchor">
           <button id="cleanBtn" class="btn ghost" type="button" title="清理队列条目">清理 ▾</button>
           <div id="cleanMenu" class="popover menu right" hidden></div>
@@ -94,6 +95,7 @@ window.addEventListener('error', function (event) {
           <button class="btn small" data-act="move-bottom" type="button">置底</button>
         </div>
         <button class="btn small" data-act="reset-selected" type="button">重置为待上传</button>
+        <button class="btn small" data-act="move-selected" type="button">移动文件</button>
         <button class="btn small danger" data-act="remove-selected" type="button">从队列删除</button>
         <button class="btn small ghost" data-act="select-none" type="button">取消选择</button>
       </div>
@@ -201,6 +203,7 @@ window.addEventListener('error', function (event) {
       <div id="updateProgress" class="bar" hidden><div id="updateBar" class="bar-fill"></div></div>
       <pre id="updateNotes" class="notes" hidden></pre>
       <label class="check"><input id="fAutoUpdate" type="checkbox"><span>自动检查更新</span></label>
+      <label class="check"><input id="fPersistLogs" type="checkbox"><span>持久化保存上传日志到磁盘（app.log）</span></label>
       <div class="row wrap">
         <button class="btn small ghost" type="button" data-link="repository">源码仓库</button>
         <button class="btn small ghost" type="button" data-link="releases">发布页面</button>
@@ -209,6 +212,25 @@ window.addEventListener('error', function (event) {
       <p class="hint">日志只保存在本机，不会自动上传；把 crash 日志发给别人之前请先检查内容。</p>
     </section>
   </div>
+</aside>
+<aside id="logPanel" class="panel log-panel" hidden aria-label="上传日志">
+  <div class="panel-head">
+    <h2>上传日志</h2>
+    <div class="row">
+      <button id="logCopyBtn" class="btn small" type="button">复制全部</button>
+      <button id="logClearBtn" class="btn small ghost danger" type="button">清除日志</button>
+      <button id="logPanelClose" class="icon-btn" type="button" aria-label="关闭上传日志">✕</button>
+    </div>
+  </div>
+  <div class="log-controls">
+    <div id="logFilters" class="tabs" role="tablist"></div>
+    <div class="log-persist-row">
+      <label class="check"><input id="logPersistCheck" type="checkbox"><span>持久化保存到磁盘（app.log）</span></label>
+      <button id="logOpenDirBtn" class="btn small ghost" type="button">打开日志目录</button>
+    </div>
+    <div id="logPersistHint" class="hint"></div>
+  </div>
+  <div id="logList" class="panel-body log-list"></div>
 </aside>
 <div id="scrim" class="scrim" hidden></div>
 

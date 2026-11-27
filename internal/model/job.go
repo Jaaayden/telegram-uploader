@@ -51,7 +51,10 @@ type Job struct {
 	Error           string        `json:"error,omitempty"`
 	StartedAt       *time.Time    `json:"started_at,omitempty"`
 	CompletedAt     *time.Time    `json:"completed_at,omitempty"`
+	UploadElapsedMs int64         `json:"upload_elapsed_ms,omitempty"`
+	AvgSpeed        float64       `json:"avg_speed,omitempty"`
 	MoveDestination string        `json:"move_destination,omitempty"`
+	MoveFromState   JobState      `json:"move_from_state,omitempty"`
 	// Note is a transient remark about the attempt in progress. It is never
 	// persisted and only meaningful while the job is being sent.
 	Note string `json:"-"`
@@ -110,4 +113,19 @@ type Channel struct {
 	ID         int64  `json:"id"`
 	AccessHash int64  `json:"access_hash"`
 	Title      string `json:"title"`
+}
+
+// LogEntry is one user-facing upload or move activity record shown in the
+// in-app Upload Log panel.
+type LogEntry struct {
+	ID        string  `json:"id"`
+	TimeMs    int64   `json:"timeMs"`
+	Kind      string  `json:"kind"`
+	JobID     string  `json:"jobId,omitempty"`
+	Name      string  `json:"name,omitempty"`
+	Size      int64   `json:"size,omitempty"`
+	SentBytes int64   `json:"sentBytes,omitempty"`
+	ElapsedMs int64   `json:"elapsedMs,omitempty"`
+	AvgSpeed  float64 `json:"avgSpeed,omitempty"`
+	Summary   string  `json:"summary"`
 }

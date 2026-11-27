@@ -9,13 +9,15 @@ import (
 
 	coreapp "github.com/Jaaayden/telegram-uploader/internal/app"
 	"github.com/Jaaayden/telegram-uploader/internal/buildinfo"
+	"github.com/Jaaayden/telegram-uploader/internal/model"
 )
 
 // InitView is the answer to "init": the complete state and queue.
 type InitView struct {
-	State   StateView  `json:"state"`
-	Jobs    *JobsDelta `json:"jobs"`
-	Notices []string   `json:"notices"`
+	State   StateView        `json:"state"`
+	Jobs    *JobsDelta       `json:"jobs"`
+	Notices []string         `json:"notices"`
+	Logs    []model.LogEntry `json:"logs"`
 }
 
 type idParams struct {
@@ -181,9 +183,35 @@ func (s *Service) Handle(method string, params json.RawMessage) (any, error) {
 		return message(s.SetCaptions(input.Edits))
 	case "moveOversize":
 		return nil, s.MoveOversize()
+	case "moveJobs":
+		input, err := decode[struct {
+			Mode string   `json:"mode"`
+			IDs  []string `json:"ids"`
+		}](params)
+		if err != nil {
+			return nil, err
+		}
+		return nil, s.MoveJobs(input.Mode, input.IDs)
 	case "cancelMove":
 		s.CancelMove()
 		return nil, nil
+	case "clearLogs":
+		return nil, s.ClearLogs()
+	case "deleteLog":
+		input, err := decode[idParams](params)
+		if err != nil {
+			return nil, err
+		}
+		s.DeleteLog(input.ID)
+		return nil, nil
+	case "setPersistLogs":
+		input, err := decode[struct {
+			Enabled bool `json:"enabled"`
+		}](params)
+		if err != nil {
+			return nil, err
+		}
+		return nil, s.SetPersistLogs(input.Enabled)
 
 	// Schedule.
 	case "setSchedule":
@@ -249,7 +277,7 @@ func (s *Service) initFrontEnd() InitView {
 		notices = []string{}
 	}
 	s.markHealthyStart()
-	return InitView{State: state, Jobs: jobs, Notices: notices}
+	return InitView{State: state, Jobs: jobs, Notices: notices, Logs: s.LogsSnapshot()}
 }
 
 func (s *Service) openLogs() error {

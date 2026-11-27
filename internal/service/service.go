@@ -148,6 +148,10 @@ type Service struct {
 	moveCancel context.CancelFunc
 	moveDone   int64
 	moveTotal  int64
+	moveLabel  string
+
+	logs   []model.LogEntry
+	logSeq uint64
 
 	sleepGuard platform.SleepGuard
 
@@ -204,6 +208,10 @@ func New(options Options) (*Service, error) {
 	s.snapshot = s.controller.Snapshot()
 	s.stats = computeStats(s.snapshot.Jobs)
 	s.loadSecrets()
+	if !s.settings.DisableLogPersistence {
+		s.loadPersistedLogs()
+	}
+	s.controller.SetLogSink(s.appendLog)
 	return s, nil
 }
 

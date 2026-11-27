@@ -34,8 +34,11 @@ type JobView struct {
 	Staged bool `json:"staged,omitempty"`
 	// CustomCaption and CaptionCustom carry manual caption overrides (including
 	// an explicit empty caption when CaptionCustom is true and CustomCaption is "").
-	CustomCaption string `json:"customCaption,omitempty"`
-	CaptionCustom bool   `json:"captionCustom,omitempty"`
+	CustomCaption   string  `json:"customCaption,omitempty"`
+	CaptionCustom   bool    `json:"captionCustom,omitempty"`
+	CompletedAt     int64   `json:"completedAt,omitempty"`
+	UploadElapsedMs int64   `json:"uploadElapsedMs,omitempty"`
+	AvgSpeed        float64 `json:"avgSpeed,omitempty"`
 }
 
 // JobsDelta carries only what changed since the previous delta. Order is nil
@@ -81,22 +84,29 @@ func jobView(job model.Job, removing bool) JobView {
 	if job.State == model.JobSending {
 		note = job.Note
 	}
+	var completedAt int64
+	if job.CompletedAt != nil {
+		completedAt = job.CompletedAt.UnixMilli()
+	}
 	return JobView{
-		Note:          note,
-		ID:            job.ID,
-		Name:          job.Name,
-		Path:          job.Path,
-		Size:          job.Size,
-		State:         string(job.State),
-		Uploaded:      job.Uploaded,
-		Error:         job.Error,
-		MessageID:     job.MessageID,
-		Truncated:     job.Metadata.TruncatedMediaData,
-		Removing:      removing,
-		GroupID:       job.GroupID,
-		Staged:        job.Staged != nil && (job.State == model.JobQueued || job.State == model.JobInterrupted),
-		CustomCaption: job.CustomCaption,
-		CaptionCustom: job.CaptionCustom,
+		Note:            note,
+		ID:              job.ID,
+		Name:            job.Name,
+		Path:            job.Path,
+		Size:            job.Size,
+		State:           string(job.State),
+		Uploaded:        job.Uploaded,
+		Error:           job.Error,
+		MessageID:       job.MessageID,
+		Truncated:       job.Metadata.TruncatedMediaData,
+		Removing:        removing,
+		GroupID:         job.GroupID,
+		Staged:          job.Staged != nil && (job.State == model.JobQueued || job.State == model.JobInterrupted),
+		CustomCaption:   job.CustomCaption,
+		CaptionCustom:   job.CaptionCustom,
+		CompletedAt:     completedAt,
+		UploadElapsedMs: job.UploadElapsedMs,
+		AvgSpeed:        job.AvgSpeed,
 	}
 }
 
@@ -198,6 +208,7 @@ type SettingsView struct {
 	Concurrency      int    `json:"concurrency"`
 	LimitKBps        int    `json:"limitKBps"`
 	AutoUpdateCheck  bool   `json:"autoUpdateCheck"`
+	PersistLogs      bool   `json:"persistLogs"`
 	LastFolder       string `json:"lastFolder"`
 	// Problem explains why stored settings or credentials could not be read.
 	Problem string `json:"problem,omitempty"`
@@ -242,9 +253,10 @@ type ScheduleView struct {
 }
 
 type MoveView struct {
-	Active     bool  `json:"active"`
-	DoneBytes  int64 `json:"doneBytes"`
-	TotalBytes int64 `json:"totalBytes"`
+	Active     bool   `json:"active"`
+	DoneBytes  int64  `json:"doneBytes"`
+	TotalBytes int64  `json:"totalBytes"`
+	Label      string `json:"label,omitempty"`
 }
 
 // State assembles the current state. It is cheap: no queue rows are copied.
@@ -273,6 +285,7 @@ func (s *Service) State() StateView {
 			Concurrency:      s.settings.UploadConcurrency,
 			LimitKBps:        s.settings.UploadLimitKBps,
 			AutoUpdateCheck:  !s.settings.DisableUpdateCheck,
+			PersistLogs:      !s.settings.DisableLogPersistence,
 			LastFolder:       s.settings.LastFolder,
 		},
 		Connection: s.connectionViewLocked(),
@@ -288,7 +301,7 @@ func (s *Service) State() StateView {
 			ETASeconds:     int64(s.snapshot.ETA / time.Second),
 			LastError:      s.snapshot.LastError,
 		},
-		Move:     MoveView{Active: s.moveActive, DoneBytes: s.moveDone, TotalBytes: s.moveTotal},
+		Move:     MoveView{Active: s.moveActive, DoneBytes: s.moveDone, TotalBytes: s.moveTotal, Label: s.moveLabel},
 		Update:   s.updateViewLocked(),
 		Scanning: s.scanning,
 	}

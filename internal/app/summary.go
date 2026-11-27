@@ -65,3 +65,20 @@ func formatElapsed(d time.Duration) string {
 func formatLocalTime(t time.Time) string {
 	return t.Local().Format("2006-01-02 15:04:05 -07:00")
 }
+
+func formatBytesCompact(bytes int64) string {
+	if bytes <= 0 {
+		return "0 B"
+	}
+	units := []string{"B", "KiB", "MiB", "GiB", "TiB"}
+	value := float64(bytes)
+	unit := 0
+	for value >= 1024 && unit < len(units)-1 {
+		value /= 1024
+		unit++
+	}
+	if unit == 0 {
+		return fmt.Sprintf("%d B", bytes)
+	}
+	return fmt.Sprintf("%.2f %s", value, units[unit])
+}

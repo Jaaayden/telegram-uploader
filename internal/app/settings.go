@@ -61,6 +61,10 @@ type Settings struct {
 	// DisableUpdateCheck turns off the automatic update check. It is stored
 	// negated so that older settings files keep the default (checking enabled).
 	DisableUpdateCheck bool `json:"disable_update_check,omitempty"`
+	// DisableLogPersistence keeps upload activity logs in memory only and
+	// stops writing app.log to disk. Stored negated so older settings keep
+	// disk logs enabled.
+	DisableLogPersistence bool `json:"disable_log_persistence,omitempty"`
 }
 
 // MaxUploadLimitKBps bounds the configurable limit (about 1 GiB/s) so a typo
